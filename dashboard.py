@@ -18,6 +18,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import List
@@ -26,7 +27,7 @@ import customtkinter as ctk
 from PIL import Image, ImageGrab
 from tkinter import filedialog, messagebox
 
-from content_generation import analyze_audience_screenshot
+from content_generation import analyze_audience_screenshot, call_image_model, call_text_model
 from group_upload_workflow import (
     load_upload_batch_settings,
     parse_serials_text,
@@ -393,6 +394,7 @@ class CommandCenterApp(ctk.CTk):
         self.prompt_audience_preview_image: ctk.CTkImage | None = None
         self.prompt_audience_image_data_url: str | None = None
         self.prompt_audience_analysis_busy = False
+        self.prompt_api_test_busy = False
         self._syncing_task_mode = False
         self.quick_basic_card: ctk.CTkFrame | None = None
         self.gen_title_box: ctk.CTkTextbox | None = None
@@ -1189,6 +1191,12 @@ class CommandCenterApp(ctk.CTk):
         self._labeled_entry(api_row3, "图片 Model", self.image_model_var, width=220, placeholder="gemini-3-pro-image-preview")
         self._labeled_entry(api_row3, "图片并发", self.image_concurrency_var, width=100, placeholder="3")
 
+        api_test_row = ctk.CTkFrame(api, fg_color="transparent")
+        api_test_row.pack(fill="x", padx=14, pady=(0, 12))
+        ctk.CTkButton(api_test_row, text="测试文本连通性", width=130, command=lambda: self._test_prompt_api_connectivity("text")).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(api_test_row, text="测试图片连通性", width=130, fg_color="#334155", command=lambda: self._test_prompt_api_connectivity("image")).pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(api_test_row, text="只测试当前表单，不会保存模板。测试结果会写到状态栏和日志。", text_color="#9aa0aa").pack(side="left")
+
         content = self._section_card(
             scroll,
             "步骤 3：内容模板（你网页那套字段）",
@@ -1648,6 +1656,88 @@ class CommandCenterApp(ctk.CTk):
             self._append_log(f"[提示词] 已自动识别受众截图: {audience_summary}")
         else:
             self.prompt_status_var.set("截图已识别，但没有提取到可用的目标受众摘要")
+
+    def _test_prompt_api_connectivity(self, kind: str) -> None:
+        if self.prompt_api_test_busy:
+            messagebox.showinfo("正在测试", "已有一项 API 连通性测试在进行中，请稍等。")
+            return
+
+        preset = clone_json(self._current_api_preset())
+        is_image = kind == "image"
+        label = "图片" if is_image else "文本"
+        if is_image:
+            missing = []
+            if not str(preset.get("imageBaseUrl") or "").strip():
+                missing.append("图片 Base URL")
+            if not str(preset.get("imageApiKey") or preset.get("apiKey") or "").strip():
+                missing.append("图片 API Key")
+            if not str(preset.get("imageModel") or "").strip():
+                missing.append("图片 Model")
+        else:
+            missing = []
+            if not str(preset.get("baseUrl") or "").strip():
+                missing.append("文本 Base URL")
+            if not str(preset.get("apiKey") or "").strip():
+                missing.append("文本 API Key")
+            if not str(preset.get("model") or "").strip():
+                missing.append("文本 Model")
+        if missing:
+            message = f"请先填写：{', '.join(missing)}"
+            self.prompt_status_var.set(f"{label} API 测试未开始：配置不完整")
+            messagebox.showwarning("配置不完整", message)
+            return
+
+        self.prompt_api_test_busy = True
+        self.prompt_status_var.set(f"正在测试{label} API 连通性...")
+
+        def worker() -> None:
+            started_at = time.perf_counter()
+            try:
+                if is_image:
+                    result = call_image_model(
+                        preset,
+                        "Generate a simple connectivity test image with the text API_IMAGE_OK.",
+                    )
+                    data_url = str(result.get("data_url") or "").strip()
+                    text = str(result.get("text") or "").strip()
+                    if not data_url.startswith("data:image/") and not text:
+                        raise RuntimeError("图片接口返回成功，但没有拿到可用图片或文本结果")
+                    detail = "已收到图片结果" if data_url.startswith("data:image/") else (text[:120] or "已收到文本结果")
+                else:
+                    result = call_text_model(preset, "请只回复：API_TEXT_OK")
+                    detail = str(result or "").strip().replace("\r", " ").replace("\n", " ")
+                    if not detail:
+                        raise RuntimeError("文本接口返回为空")
+                    detail = detail[:160]
+                elapsed = time.perf_counter() - started_at
+                self.after(0, lambda: self._finish_prompt_api_connectivity_test(kind=kind, detail=detail, elapsed=elapsed))
+            except Exception as exc:
+                elapsed = time.perf_counter() - started_at
+                error = str(exc)
+                self.after(0, lambda: self._finish_prompt_api_connectivity_test(kind=kind, error=error, elapsed=elapsed))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_prompt_api_connectivity_test(self, *, kind: str, detail: str = "", error: str = "", elapsed: float = 0.0) -> None:
+        self.prompt_api_test_busy = False
+        label = "图片" if kind == "image" else "文本"
+        elapsed_text = f"{elapsed:.1f}s"
+        if error:
+            self.prompt_status_var.set(f"{label} API 测试失败（{elapsed_text}）")
+            self._append_log(f"[提示词] {label} API 测试失败（{elapsed_text}）: {error}")
+            messagebox.showerror("测试失败", f"{label} API 连通性测试失败。\n耗时：{elapsed_text}\n原因：{error}")
+            return
+
+        if elapsed < 3:
+            quality = "良好"
+        elif elapsed < 8:
+            quality = "一般"
+        else:
+            quality = "较慢"
+        summary = f"{label} API 测试成功（{elapsed_text}，连通性{quality}）"
+        self.prompt_status_var.set(summary)
+        self._append_log(f"[提示词] {summary}: {detail}")
+        messagebox.showinfo("测试成功", f"{summary}\n返回：{detail or '已收到有效结果'}")
 
     def _collect_group_upload_settings(self) -> dict:
         visibility = self.group_upload_visibility_var.get().strip() or "public"
