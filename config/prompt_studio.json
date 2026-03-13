@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "defaultApiPreset": "默认API模板",
+  "defaultContentTemplate": "默认内容模板",
+  "tagBindings": {},
+  "apiPresets": {
+    "默认API模板": {
+      "templateType": "api",
+      "name": "默认API模板",
+      "provider": "openai_compatible",
+      "apiKey": "",
+      "baseUrl": "https://api.deepseek.com/chat/completions",
+      "model": "deepseek-chat",
+      "temperature": "0.9",
+      "maxTokens": "16000",
+      "autoImageEnabled": "0",
+      "imageBaseUrl": "https://yunwu.ai/v1/chat/completions",
+      "imageApiKey": "",
+      "imageModel": "gemini-3-pro-image-preview",
+      "imageConcurrency": "3",
+      "outputLanguage": "zh-TW"
+    }
+  },
+  "contentTemplates": {
+    "默认内容模板": {
+      "templateType": "content",
+      "name": "默认内容模板",
+      "musicGenre": "",
+      "angle": "",
+      "audience": "",
+      "outputLanguage": "zh-TW",
+      "titleCount": "3",
+      "descCount": "1",
+      "thumbCount": "3",
+      "titleMin": "80",
+      "titleMax": "95",
+      "descLen": "300",
+      "tagRange": "10-20",
+      "masterPrompt": "# Role: YouTube 爆款音乐内容策划师 & 视觉总监\n\n## Background & Input\n我已为你提供以下核心参数，请直接基于这些信息输出完整的 YouTube 视频发布方案，核心目标是“高点击率（High CTR）”和“高完播率”：\n- 内容/音乐类型：【音乐类型】\n- 切入角度：【切入角度】\n- 目标群体：【目标群体】\n- 参考爆款标题库：【爆款标题库】\n\n## Output Structure\n\n### Part 1: 爆款标题 (共 【标题数量】 组)\n结合【音乐类型】与【切入角度】，为【目标群体】生成【标题数量】个不同的爆款标题。\n参数要求：\n- 生成数量：【标题数量】 个\n- 字数限制：每个标题字数必须严格控制在 【标题字数区间】 字之间\n- 输出语言：【输出语言】\n\n### Part 2: 标准化简介与标签 (共 【简介数量】 组)\n- 简介数量：【简介数量】\n- 简介默认字数：【简介默认字数】\n- 标签数量区间：【标签数量区间】\n\n### Part 3: 封面设计指令 (共 【缩略图指令数量】 组)\n缩略图指令可以用英文描述场景，但必须明确要求封面文字使用【thumbnail_text_language】。\n请直接开始执行，输出以上三部分内容，不要寒暄。",
+      "titleLibrary": "最怕Rapper唱情歌🎧 一聽就放鬆的中文嘻哈歌單｜深夜靜靜聽・讀書用音樂・Chill 氛圍推薦放空一下的最佳選擇\n【中文R&B歌單】寫給過去的自己：謝謝你，當時撐過了那些沒人知道的夜晚｜療癒系中文原創音樂\n【路過人間】2025最好聽華語歌單 | 讀書・工作・放鬆最佳背景音樂 | 民歌風格原創抒情歌\n【美國鄉村音樂×公路旅行】踏上美妙的公路音樂之旅，行駛在66號公路上，溫暖治愈的鄉村音樂帶你回家"
+    }
+  }
+}

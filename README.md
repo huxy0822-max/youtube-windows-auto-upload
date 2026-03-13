@@ -18,10 +18,7 @@
 
 - `dashboard.py`
 - `启动统一控制台.bat`
-
-如果你或你朋友是用 Codex 在本地协作，这个仓库已经提供了仓库级操作说明：
-
-- `AGENTS.md`
+- `config/prompt_studio.json`
 
 ## 当前目录结构
 

@@ -23,6 +23,20 @@ import customtkinter as ctk
 from tkinter import messagebox
 
 from path_helpers import default_scheduler_config, normalize_scheduler_config
+from prompt_studio import (
+    build_site_preview,
+    clone_json,
+    default_api_preset,
+    default_content_template,
+    guess_cover_names,
+    load_generation_map as load_generation_map_file,
+    load_prompt_studio_config,
+    pick_content_template_name,
+    render_master_prompt,
+    save_generation_map as save_generation_map_file,
+    save_prompt_studio_config,
+    sync_manifest_from_generation_map,
+)
 from utils import get_all_tags, get_tag_info
 
 
@@ -36,6 +50,8 @@ LEGACY_RENDERER = SCRIPT_DIR / "app.py"
 LEGACY_SCHEDULER = SCRIPT_DIR / "scheduler_gui.py"
 SCHEDULER_CONFIG_FILE = SCRIPT_DIR / "scheduler_config.json"
 DASHBOARD_STATE_FILE = SCRIPT_DIR / "dashboard_state.json"
+PROMPT_STUDIO_FILE = SCRIPT_DIR / "config" / "prompt_studio.json"
+CHANNEL_MAPPING_FILE = SCRIPT_DIR / "config" / "channel_mapping.json"
 
 COLOR_MAP = {
     "随机": "random",
@@ -110,13 +126,18 @@ def load_dashboard_state() -> dict:
         "date": datetime.now().strftime("%m%d"),
         "tag": "",
         "upload_tag": "",
+        "generation_tag": "",
+        "generation_channel": "",
+        "prompt_tag": "",
         "song_count": "1",
         "channel": "",
         "audio_workers": 2,
         "video_workers": 2,
+        "render_enabled": True,
         "randomize_effects": True,
         "auto_upload": True,
         "auto_close_browser": True,
+        "auto_sync_manifest": True,
         "spectrum": True,
         "timeline": True,
         "letterbox": "随机",
@@ -136,6 +157,8 @@ def load_dashboard_state() -> dict:
         "text_pos": "底部居中",
         "text_size": "60",
         "text_style": "随机",
+        "api_preset_name": "默认API模板",
+        "content_template_name": "默认内容模板",
     }
     if DASHBOARD_STATE_FILE.exists():
         try:
@@ -171,6 +194,40 @@ def open_folder(path: str) -> None:
     os.startfile(str(target))
 
 
+def resolve_local_path(path_text: str) -> Path:
+    path = Path(path_text)
+    return path if path.is_absolute() else (SCRIPT_DIR / path)
+
+
+def open_target(path: str | Path) -> None:
+    target = Path(path)
+    if target.suffix:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.exists():
+            target.write_text("", encoding="utf-8")
+    else:
+        target.mkdir(parents=True, exist_ok=True)
+    os.startfile(str(target))
+
+
+def load_channel_name_map() -> dict[str, str]:
+    if not CHANNEL_MAPPING_FILE.exists():
+        return {}
+    try:
+        with open(CHANNEL_MAPPING_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+
+    result: dict[str, str] = {}
+    for info in data.get("channels", {}).values():
+        serial = info.get("serial_number")
+        name = str(info.get("channel_name") or "").strip()
+        if serial is not None:
+            result[str(serial)] = name
+    return result
+
+
 class CommandCenterApp(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -179,15 +236,31 @@ class CommandCenterApp(ctk.CTk):
         self.minsize(1060, 760)
 
         self.scheduler_cfg = load_scheduler_config()
+        self.prompt_cfg = load_prompt_studio_config(PROMPT_STUDIO_FILE)
+        self.channel_name_map = load_channel_name_map()
         self.ui_state = load_dashboard_state()
         self.process: subprocess.Popen | None = None
         self.log_thread: threading.Thread | None = None
         self.manual_widgets: List[ctk.CTkBaseClass] = []
+        self.api_preset_menu: ctk.CTkOptionMenu | None = None
+        self.content_template_menu: ctk.CTkOptionMenu | None = None
+        self.prompt_master_box: ctk.CTkTextbox | None = None
+        self.prompt_title_library_box: ctk.CTkTextbox | None = None
+        self.prompt_preview_box: ctk.CTkTextbox | None = None
+        self.gen_title_box: ctk.CTkTextbox | None = None
+        self.gen_desc_box: ctk.CTkTextbox | None = None
+        self.gen_covers_box: ctk.CTkTextbox | None = None
+        self.gen_ab_titles_box: ctk.CTkTextbox | None = None
 
         self._build_variables()
         self._build_ui()
         self._load_tags()
         self._sync_upload_channels()
+        self._sync_generation_channels()
+        self._refresh_preset_menus()
+        self._load_api_preset()
+        self._load_content_template()
+        self._load_generation_entry(silent=True)
         self._apply_randomize_state()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -195,13 +268,18 @@ class CommandCenterApp(ctk.CTk):
         self.date_var = ctk.StringVar(value=self.ui_state["date"])
         self.tag_var = ctk.StringVar(value=self.ui_state["tag"])
         self.upload_tag_var = ctk.StringVar(value=self.ui_state["upload_tag"] or self.ui_state["tag"])
+        self.generation_tag_var = ctk.StringVar(value=self.ui_state["generation_tag"] or self.ui_state["upload_tag"] or self.ui_state["tag"])
+        self.prompt_tag_var = ctk.StringVar(value=self.ui_state["prompt_tag"] or self.ui_state["tag"])
         self.song_count_var = ctk.StringVar(value=self.ui_state["song_count"])
         self.channel_var = ctk.StringVar(value=self.ui_state["channel"])
+        self.generation_channel_var = ctk.StringVar(value=self.ui_state["generation_channel"])
         self.audio_workers_var = ctk.IntVar(value=int(self.ui_state["audio_workers"]))
         self.video_workers_var = ctk.IntVar(value=int(self.ui_state["video_workers"]))
+        self.render_enabled_var = ctk.BooleanVar(value=bool(self.ui_state["render_enabled"]))
         self.randomize_effects_var = ctk.BooleanVar(value=bool(self.ui_state["randomize_effects"]))
         self.auto_upload_var = ctk.BooleanVar(value=bool(self.ui_state["auto_upload"]))
         self.auto_close_browser_var = ctk.BooleanVar(value=bool(self.ui_state["auto_close_browser"]))
+        self.auto_sync_manifest_var = ctk.BooleanVar(value=bool(self.ui_state["auto_sync_manifest"]))
         self.spectrum_var = ctk.BooleanVar(value=bool(self.ui_state["spectrum"]))
         self.timeline_var = ctk.BooleanVar(value=bool(self.ui_state["timeline"]))
         self.letterbox_var = ctk.StringVar(value=self.ui_state["letterbox"])
@@ -226,6 +304,34 @@ class CommandCenterApp(ctk.CTk):
         self.output_dir_var = ctk.StringVar(value=self.scheduler_cfg.get("output_root", ""))
         self.ffmpeg_var = ctk.StringVar(value=self.scheduler_cfg.get("ffmpeg_bin") or "ffmpeg")
         self.status_var = ctk.StringVar(value="就绪")
+        self.prompt_status_var = ctk.StringVar(value="提示词模板未修改")
+        self.generation_status_var = ctk.StringVar(value="等待加载 generation_map")
+        self.api_preset_name_var = ctk.StringVar(value=self.ui_state["api_preset_name"])
+        self.content_template_name_var = ctk.StringVar(value=self.ui_state["content_template_name"])
+        self.api_provider_var = ctk.StringVar(value="")
+        self.api_key_var = ctk.StringVar(value="")
+        self.api_base_url_var = ctk.StringVar(value="")
+        self.api_model_var = ctk.StringVar(value="")
+        self.api_temperature_var = ctk.StringVar(value="0.9")
+        self.api_max_tokens_var = ctk.StringVar(value="16000")
+        self.api_auto_image_var = ctk.StringVar(value="0")
+        self.image_base_url_var = ctk.StringVar(value="")
+        self.image_api_key_var = ctk.StringVar(value="")
+        self.image_model_var = ctk.StringVar(value="")
+        self.image_concurrency_var = ctk.StringVar(value="3")
+        self.content_music_genre_var = ctk.StringVar(value="")
+        self.content_angle_var = ctk.StringVar(value="")
+        self.content_audience_var = ctk.StringVar(value="")
+        self.content_output_language_var = ctk.StringVar(value="zh-TW")
+        self.content_title_count_var = ctk.StringVar(value="3")
+        self.content_desc_count_var = ctk.StringVar(value="1")
+        self.content_thumb_count_var = ctk.StringVar(value="3")
+        self.content_title_min_var = ctk.StringVar(value="80")
+        self.content_title_max_var = ctk.StringVar(value="95")
+        self.content_desc_len_var = ctk.StringVar(value="300")
+        self.content_tag_range_var = ctk.StringVar(value="10-20")
+        self.generation_is_ypp_var = ctk.BooleanVar(value=False)
+        self.generation_set_var = ctk.StringVar(value="1")
 
     def _build_ui(self) -> None:
         top = ctk.CTkFrame(self, corner_radius=16)
@@ -244,12 +350,16 @@ class CommandCenterApp(ctk.CTk):
         self.tabs.pack(fill="both", expand=True, padx=12, pady=12)
         self.tabs.add("快捷开始")
         self.tabs.add("上传")
+        self.tabs.add("提示词")
+        self.tabs.add("当日内容")
         self.tabs.add("高级视觉")
         self.tabs.add("路径配置")
         self.tabs.add("日志")
 
         self._build_quick_tab(self.tabs.tab("快捷开始"))
         self._build_upload_tab(self.tabs.tab("上传"))
+        self._build_prompt_tab(self.tabs.tab("提示词"))
+        self._build_generation_tab(self.tabs.tab("当日内容"))
         self._build_advanced_tab(self.tabs.tab("高级视觉"))
         self._build_paths_tab(self.tabs.tab("路径配置"))
         self._build_log_tab(self.tabs.tab("日志"))
@@ -266,9 +376,17 @@ class CommandCenterApp(ctk.CTk):
 
         row2 = ctk.CTkFrame(parent, fg_color="transparent")
         row2.pack(fill="x", padx=10, pady=8)
+        ctk.CTkSwitch(row2, text="启用渲染模块", variable=self.render_enabled_var).pack(side="left", padx=(0, 16))
+        ctk.CTkSwitch(row2, text="启用上传模块", variable=self.auto_upload_var).pack(side="left", padx=(0, 16))
         ctk.CTkSwitch(row2, text="全随机视觉（推荐）", variable=self.randomize_effects_var, command=self._apply_randomize_state).pack(side="left", padx=(0, 16))
-        ctk.CTkSwitch(row2, text="渲染后自动上传", variable=self.auto_upload_var).pack(side="left", padx=(0, 16))
         ctk.CTkSwitch(row2, text="上传后自动关闭浏览器", variable=self.auto_close_browser_var).pack(side="left", padx=(0, 16))
+
+        row2b = ctk.CTkFrame(parent, fg_color="transparent")
+        row2b.pack(fill="x", padx=10, pady=(0, 8))
+        ctk.CTkSwitch(row2b, text="保存后同步 upload_manifest", variable=self.auto_sync_manifest_var).pack(side="left", padx=(0, 16))
+        ctk.CTkButton(row2b, text="打开提示词页", width=120, fg_color="#334155", command=lambda: self.tabs.set("提示词")).pack(side="left", padx=(0, 10))
+        ctk.CTkButton(row2b, text="打开当日内容页", width=120, fg_color="#334155", command=lambda: self.tabs.set("当日内容")).pack(side="left", padx=(0, 10))
+        ctk.CTkButton(row2b, text="保存工作台", width=120, fg_color="#475569", command=self._save_workspace_state).pack(side="left", padx=(0, 10))
 
         row3 = ctk.CTkFrame(parent, fg_color="transparent")
         row3.pack(fill="x", padx=10, pady=8)
@@ -280,14 +398,14 @@ class CommandCenterApp(ctk.CTk):
 
         note = ctk.CTkLabel(
             parent,
-            text="日常推荐：选标签和日期后，直接点“开始流水线”。如果只想先出片不上传，就点“仅渲染”。",
+            text="日常推荐：先配置提示词模板，再检查当天标题/简介/封面，最后回这里执行当前流程。",
             text_color="#9aa0aa",
         )
         note.pack(anchor="w", padx=14, pady=(4, 12))
 
         actions = ctk.CTkFrame(parent, fg_color="transparent")
         actions.pack(fill="x", padx=10, pady=(0, 12))
-        ctk.CTkButton(actions, text="开始流水线", height=42, command=lambda: self._run_scheduler(render_only=False)).pack(fill="x", pady=(0, 10))
+        ctk.CTkButton(actions, text="开始当前流程", height=42, command=self._run_current_flow).pack(fill="x", pady=(0, 10))
         ctk.CTkButton(actions, text="仅渲染", height=40, fg_color="#475569", command=lambda: self._run_scheduler(render_only=True)).pack(fill="x", pady=(0, 10))
         ctk.CTkButton(actions, text="打开旧版高级调度器", height=38, fg_color="#334155", command=lambda: self._launch_tool(LEGACY_SCHEDULER)).pack(fill="x", pady=(0, 10))
         ctk.CTkButton(actions, text="打开旧版渲染工作站", height=38, fg_color="#334155", command=lambda: self._launch_tool(LEGACY_RENDERER)).pack(fill="x")
@@ -315,6 +433,151 @@ class CommandCenterApp(ctk.CTk):
 
         ctk.CTkButton(parent, text="开始单频道上传", height=42, command=self._run_upload_only).pack(fill="x", padx=10, pady=(0, 10))
         ctk.CTkButton(parent, text="打开上传记录目录", height=38, fg_color="#475569", command=lambda: open_folder(str(SCRIPT_DIR / "upload_records"))).pack(fill="x", padx=10)
+
+    def _build_prompt_tab(self, parent) -> None:
+        scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=8, pady=8)
+
+        header = ctk.CTkFrame(scroll)
+        header.pack(fill="x", padx=10, pady=(10, 8))
+        ctk.CTkLabel(header, text="提示词 / API 模板", font=ctk.CTkFont(size=22, weight="bold")).pack(anchor="w", padx=14, pady=(12, 4))
+        ctk.CTkLabel(
+            header,
+            text="字段参考你那个网页版站点：文本模型、图片模型、主提示词、标题库、标题/简介/缩略图数量都在这里。",
+            text_color="#9aa0aa",
+        ).pack(anchor="w", padx=14, pady=(0, 12))
+
+        top = ctk.CTkFrame(scroll, fg_color="transparent")
+        top.pack(fill="x", padx=10, pady=(0, 8))
+        self.prompt_tag_menu = ctk.CTkOptionMenu(top, variable=self.prompt_tag_var, values=["加载中..."], width=180, command=lambda _: self._apply_bound_content_template())
+        self.prompt_tag_menu.pack(side="left", padx=(0, 10))
+        self.api_preset_menu = ctk.CTkOptionMenu(top, variable=self.api_preset_name_var, values=["默认API模板"], width=200, command=lambda _: self._load_api_preset())
+        self.api_preset_menu.pack(side="left", padx=(0, 10))
+        self.content_template_menu = ctk.CTkOptionMenu(top, variable=self.content_template_name_var, values=["默认内容模板"], width=220, command=lambda _: self._load_content_template())
+        self.content_template_menu.pack(side="left", padx=(0, 10))
+        ctk.CTkButton(top, text="绑定当前分组到内容模板", width=150, command=self._bind_tag_to_content_template).pack(side="left", padx=(0, 10))
+        ctk.CTkButton(top, text="打开配置文件", width=110, fg_color="#334155", command=lambda: open_target(PROMPT_STUDIO_FILE)).pack(side="left")
+
+        api = ctk.CTkFrame(scroll)
+        api.pack(fill="x", padx=10, pady=(0, 8))
+        ctk.CTkLabel(api, text="文本 / 图片 API 模板", font=ctk.CTkFont(size=18, weight="bold")).pack(anchor="w", padx=14, pady=(12, 8))
+        api_row1 = ctk.CTkFrame(api, fg_color="transparent")
+        api_row1.pack(fill="x", padx=10, pady=(0, 8))
+        ctk.CTkEntry(api_row1, textvariable=self.api_provider_var, width=160, placeholder_text="provider").pack(side="left", padx=(0, 10))
+        ctk.CTkEntry(api_row1, textvariable=self.api_base_url_var, placeholder_text="text base url").pack(side="left", fill="x", expand=True, padx=(0, 10))
+        ctk.CTkEntry(api_row1, textvariable=self.api_model_var, width=220, placeholder_text="text model").pack(side="left")
+
+        api_row2 = ctk.CTkFrame(api, fg_color="transparent")
+        api_row2.pack(fill="x", padx=10, pady=(0, 8))
+        ctk.CTkEntry(api_row2, textvariable=self.api_key_var, placeholder_text="text api key").pack(side="left", fill="x", expand=True, padx=(0, 10))
+        ctk.CTkEntry(api_row2, textvariable=self.api_temperature_var, width=90, placeholder_text="temp").pack(side="left", padx=(0, 10))
+        ctk.CTkEntry(api_row2, textvariable=self.api_max_tokens_var, width=120, placeholder_text="max tokens").pack(side="left", padx=(0, 10))
+        ctk.CTkEntry(api_row2, textvariable=self.api_auto_image_var, width=120, placeholder_text="auto image 0/1").pack(side="left")
+
+        api_row3 = ctk.CTkFrame(api, fg_color="transparent")
+        api_row3.pack(fill="x", padx=10, pady=(0, 12))
+        ctk.CTkEntry(api_row3, textvariable=self.image_base_url_var, placeholder_text="image base url").pack(side="left", fill="x", expand=True, padx=(0, 10))
+        ctk.CTkEntry(api_row3, textvariable=self.image_api_key_var, placeholder_text="image api key").pack(side="left", fill="x", expand=True, padx=(0, 10))
+        ctk.CTkEntry(api_row3, textvariable=self.image_model_var, width=220, placeholder_text="image model").pack(side="left", padx=(0, 10))
+        ctk.CTkEntry(api_row3, textvariable=self.image_concurrency_var, width=90, placeholder_text="并发").pack(side="left")
+
+        content = ctk.CTkFrame(scroll)
+        content.pack(fill="x", padx=10, pady=(0, 8))
+        ctk.CTkLabel(content, text="内容模板（网页版字段）", font=ctk.CTkFont(size=18, weight="bold")).pack(anchor="w", padx=14, pady=(12, 8))
+        content_row1 = ctk.CTkFrame(content, fg_color="transparent")
+        content_row1.pack(fill="x", padx=10, pady=(0, 8))
+        ctk.CTkEntry(content_row1, textvariable=self.content_music_genre_var, placeholder_text="内容/音乐类型").pack(side="left", fill="x", expand=True, padx=(0, 10))
+        ctk.CTkEntry(content_row1, textvariable=self.content_angle_var, placeholder_text="切入角度").pack(side="left", fill="x", expand=True, padx=(0, 10))
+        ctk.CTkEntry(content_row1, textvariable=self.content_audience_var, placeholder_text="目标群体").pack(side="left", fill="x", expand=True)
+
+        content_row2 = ctk.CTkFrame(content, fg_color="transparent")
+        content_row2.pack(fill="x", padx=10, pady=(0, 8))
+        ctk.CTkEntry(content_row2, textvariable=self.content_output_language_var, width=120, placeholder_text="语言").pack(side="left", padx=(0, 10))
+        ctk.CTkEntry(content_row2, textvariable=self.content_title_count_var, width=90, placeholder_text="标题数").pack(side="left", padx=(0, 10))
+        ctk.CTkEntry(content_row2, textvariable=self.content_desc_count_var, width=90, placeholder_text="简介数").pack(side="left", padx=(0, 10))
+        ctk.CTkEntry(content_row2, textvariable=self.content_thumb_count_var, width=90, placeholder_text="缩略图数").pack(side="left", padx=(0, 10))
+        ctk.CTkEntry(content_row2, textvariable=self.content_title_min_var, width=90, placeholder_text="标题最小").pack(side="left", padx=(0, 10))
+        ctk.CTkEntry(content_row2, textvariable=self.content_title_max_var, width=90, placeholder_text="标题最大").pack(side="left", padx=(0, 10))
+        ctk.CTkEntry(content_row2, textvariable=self.content_desc_len_var, width=100, placeholder_text="简介字数").pack(side="left", padx=(0, 10))
+        ctk.CTkEntry(content_row2, textvariable=self.content_tag_range_var, width=120, placeholder_text="标签区间").pack(side="left")
+
+        ctk.CTkLabel(content, text="主提示词（可直接参考网页版）").pack(anchor="w", padx=14, pady=(0, 6))
+        self.prompt_master_box = ctk.CTkTextbox(content, height=160)
+        self.prompt_master_box.pack(fill="x", padx=14, pady=(0, 10))
+        ctk.CTkLabel(content, text="对标标题库").pack(anchor="w", padx=14, pady=(0, 6))
+        self.prompt_title_library_box = ctk.CTkTextbox(content, height=120)
+        self.prompt_title_library_box.pack(fill="x", padx=14, pady=(0, 12))
+
+        actions = ctk.CTkFrame(scroll)
+        actions.pack(fill="x", padx=10, pady=(0, 8))
+        ctk.CTkButton(actions, text="保存 API 模板", command=self._save_api_preset).pack(side="left", padx=(0, 10), pady=12)
+        ctk.CTkButton(actions, text="保存内容模板", command=self._save_content_template).pack(side="left", padx=(0, 10), pady=12)
+        ctk.CTkButton(actions, text="预览当前主提示词", fg_color="#334155", command=self._preview_prompt_bundle).pack(side="left", padx=(0, 10), pady=12)
+        ctk.CTkLabel(actions, textvariable=self.prompt_status_var, text_color="#9aa0aa").pack(side="right", padx=12)
+
+        preview = ctk.CTkFrame(scroll)
+        preview.pack(fill="both", expand=True, padx=10, pady=(0, 12))
+        ctk.CTkLabel(preview, text="送给模型前的预览", font=ctk.CTkFont(size=18, weight="bold")).pack(anchor="w", padx=14, pady=(12, 8))
+        self.prompt_preview_box = ctk.CTkTextbox(preview, height=240)
+        self.prompt_preview_box.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+
+    def _build_generation_tab(self, parent) -> None:
+        scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=8, pady=8)
+
+        header = ctk.CTkFrame(scroll)
+        header.pack(fill="x", padx=10, pady=(10, 8))
+        ctk.CTkLabel(header, text="当日标题 / 简介 / 封面", font=ctk.CTkFont(size=22, weight="bold")).pack(anchor="w", padx=14, pady=(12, 4))
+        ctk.CTkLabel(
+            header,
+            text="这里直接改 workspace/base_image/<tag>/generation_map.json。保存后可顺手同步 upload_manifest，避免上传时还吃旧标题。",
+            text_color="#9aa0aa",
+        ).pack(anchor="w", padx=14, pady=(0, 12))
+
+        top = ctk.CTkFrame(scroll, fg_color="transparent")
+        top.pack(fill="x", padx=10, pady=(0, 8))
+        self.generation_tag_menu = ctk.CTkOptionMenu(top, variable=self.generation_tag_var, values=["加载中..."], width=220, command=lambda _: self._sync_generation_channels())
+        self.generation_tag_menu.pack(side="left", padx=(0, 10))
+        ctk.CTkEntry(top, textvariable=self.date_var, width=120, placeholder_text="MMDD / 3.12").pack(side="left", padx=(0, 10))
+        self.generation_channel_menu = ctk.CTkOptionMenu(top, variable=self.generation_channel_var, values=[""], width=220)
+        self.generation_channel_menu.pack(side="left", padx=(0, 10))
+        ctk.CTkButton(top, text="加载当前频道", width=110, command=self._load_generation_entry).pack(side="left", padx=(0, 10))
+        ctk.CTkButton(top, text="打开底图目录", width=110, fg_color="#334155", command=self._open_generation_tag_dir).pack(side="left")
+
+        meta = ctk.CTkFrame(scroll, fg_color="transparent")
+        meta.pack(fill="x", padx=10, pady=(0, 8))
+        ctk.CTkSwitch(meta, text="该频道视为 YPP", variable=self.generation_is_ypp_var).pack(side="left", padx=(0, 16))
+        ctk.CTkSwitch(meta, text="保存后自动同步 manifest", variable=self.auto_sync_manifest_var).pack(side="left", padx=(0, 16))
+        ctk.CTkEntry(meta, textvariable=self.generation_set_var, width=100, placeholder_text="套数").pack(side="left", padx=(0, 16))
+        ctk.CTkLabel(meta, textvariable=self.generation_status_var, text_color="#9aa0aa", wraplength=560, justify="left").pack(side="left", fill="x", expand=True)
+
+        title_frame = ctk.CTkFrame(scroll)
+        title_frame.pack(fill="x", padx=10, pady=(0, 8))
+        ctk.CTkLabel(title_frame, text="标题", font=ctk.CTkFont(size=18, weight="bold")).pack(anchor="w", padx=14, pady=(12, 6))
+        self.gen_title_box = ctk.CTkTextbox(title_frame, height=90)
+        self.gen_title_box.pack(fill="x", padx=14, pady=(0, 14))
+
+        desc_frame = ctk.CTkFrame(scroll)
+        desc_frame.pack(fill="x", padx=10, pady=(0, 8))
+        ctk.CTkLabel(desc_frame, text="简介", font=ctk.CTkFont(size=18, weight="bold")).pack(anchor="w", padx=14, pady=(12, 6))
+        self.gen_desc_box = ctk.CTkTextbox(desc_frame, height=180)
+        self.gen_desc_box.pack(fill="x", padx=14, pady=(0, 14))
+
+        side = ctk.CTkFrame(scroll)
+        side.pack(fill="x", padx=10, pady=(0, 8))
+        ctk.CTkLabel(side, text="封面文件名（每行一个）", font=ctk.CTkFont(size=18, weight="bold")).pack(anchor="w", padx=14, pady=(12, 6))
+        self.gen_covers_box = ctk.CTkTextbox(side, height=100)
+        self.gen_covers_box.pack(fill="x", padx=14, pady=(0, 10))
+        ctk.CTkLabel(side, text="AB 标题（每行一个）", font=ctk.CTkFont(size=18, weight="bold")).pack(anchor="w", padx=14, pady=(0, 6))
+        self.gen_ab_titles_box = ctk.CTkTextbox(side, height=100)
+        self.gen_ab_titles_box.pack(fill="x", padx=14, pady=(0, 14))
+
+        actions = ctk.CTkFrame(scroll)
+        actions.pack(fill="x", padx=10, pady=(0, 12))
+        ctk.CTkButton(actions, text="自动匹配封面文件", command=self._guess_generation_covers).pack(side="left", padx=(0, 10), pady=12)
+        ctk.CTkButton(actions, text="保存当前频道", command=self._save_generation_entry).pack(side="left", padx=(0, 10), pady=12)
+        ctk.CTkButton(actions, text="仅同步 manifest", fg_color="#334155", command=self._sync_current_manifest_only).pack(side="left", padx=(0, 10), pady=12)
+        ctk.CTkButton(actions, text="把当前内容带去提示词预览", fg_color="#475569", command=self._push_generation_to_prompt_preview).pack(side="left", padx=(0, 10), pady=12)
 
     def _build_advanced_tab(self, parent) -> None:
         tip = ctk.CTkLabel(
@@ -356,6 +619,8 @@ class CommandCenterApp(ctk.CTk):
         self._path_row(parent, "输出目录", self.output_dir_var)
         self._path_row(parent, "FFmpeg", self.ffmpeg_var)
         ctk.CTkButton(parent, text="保存路径配置", command=self._save_scheduler_paths).pack(anchor="w", padx=14, pady=12)
+        ctk.CTkButton(parent, text="打开 prompt_studio.json", fg_color="#334155", command=lambda: open_target(PROMPT_STUDIO_FILE)).pack(anchor="w", padx=14, pady=(0, 8))
+        ctk.CTkButton(parent, text="打开 config 文件夹", fg_color="#334155", command=lambda: open_target(SCRIPT_DIR / "config")).pack(anchor="w", padx=14)
 
     def _build_log_tab(self, parent) -> None:
         toolbar = ctk.CTkFrame(parent, fg_color="transparent")
@@ -386,16 +651,28 @@ class CommandCenterApp(ctk.CTk):
         values = ["全部标签", *tags] if tags else ["全部标签"]
         self.tag_menu.configure(values=values)
         self.upload_tag_menu.configure(values=tags or [""])
+        if hasattr(self, "generation_tag_menu") and self.generation_tag_menu is not None:
+            self.generation_tag_menu.configure(values=tags or [""])
+        if hasattr(self, "prompt_tag_menu") and self.prompt_tag_menu is not None:
+            self.prompt_tag_menu.configure(values=tags or [""])
         if self.tag_var.get() not in values:
             self.tag_var.set(values[1] if len(values) > 1 else values[0])
         if self.upload_tag_var.get() not in (tags or [""]):
             self.upload_tag_var.set(self.tag_var.get() if self.tag_var.get() != "全部标签" else (tags[0] if tags else ""))
+        if self.generation_tag_var.get() not in (tags or [""]):
+            self.generation_tag_var.set(self.upload_tag_var.get() or (tags[0] if tags else ""))
+        if self.prompt_tag_var.get() not in (tags or [""]):
+            self.prompt_tag_var.set(self.tag_var.get() if self.tag_var.get() != "全部标签" else (tags[0] if tags else ""))
         self._sync_upload_channels()
+        self._sync_generation_channels()
 
     def _sync_tag_to_upload(self) -> None:
         if self.tag_var.get() and self.tag_var.get() != "全部标签":
             self.upload_tag_var.set(self.tag_var.get())
+            self.generation_tag_var.set(self.tag_var.get())
+            self.prompt_tag_var.set(self.tag_var.get())
             self._sync_upload_channels()
+            self._sync_generation_channels()
 
     def _sync_upload_channels(self) -> None:
         tag = self.upload_tag_var.get().strip()
@@ -404,6 +681,21 @@ class CommandCenterApp(ctk.CTk):
         self.channel_menu.configure(values=channels or [""])
         if self.channel_var.get() not in channels:
             self.channel_var.set(channels[0] if channels else "")
+
+    def _sync_generation_channels(self) -> None:
+        tag = self.generation_tag_var.get().strip()
+        info = get_tag_info(tag) if tag else None
+        channels = [str(x) for x in info.get("all_serials", [])] if info else []
+        tag_dir = resolve_local_path(self.scheduler_cfg.get("base_image_dir", "workspace/base_image")) / tag
+        generation_map_path = tag_dir / "generation_map.json"
+        generation_map = load_generation_map_file(generation_map_path)
+        for serial in generation_map.get("channels", {}).keys():
+            if str(serial) not in channels:
+                channels.append(str(serial))
+        channels = sorted(channels, key=lambda item: int(item)) if channels else []
+        self.generation_channel_menu.configure(values=channels or [""])
+        if self.generation_channel_var.get() not in channels:
+            self.generation_channel_var.set(channels[0] if channels else "")
 
     def _apply_randomize_state(self) -> None:
         state = "disabled" if self.randomize_effects_var.get() else "normal"
@@ -497,13 +789,18 @@ class CommandCenterApp(ctk.CTk):
             "date": self.date_var.get(),
             "tag": self.tag_var.get(),
             "upload_tag": self.upload_tag_var.get(),
+            "generation_tag": self.generation_tag_var.get(),
+            "generation_channel": self.generation_channel_var.get(),
+            "prompt_tag": self.prompt_tag_var.get(),
             "song_count": self.song_count_var.get(),
             "channel": self.channel_var.get(),
             "audio_workers": int(self.audio_workers_var.get()),
             "video_workers": int(self.video_workers_var.get()),
+            "render_enabled": bool(self.render_enabled_var.get()),
             "randomize_effects": bool(self.randomize_effects_var.get()),
             "auto_upload": bool(self.auto_upload_var.get()),
             "auto_close_browser": bool(self.auto_close_browser_var.get()),
+            "auto_sync_manifest": bool(self.auto_sync_manifest_var.get()),
             "spectrum": bool(self.spectrum_var.get()),
             "timeline": bool(self.timeline_var.get()),
             "letterbox": self.letterbox_var.get(),
@@ -523,7 +820,284 @@ class CommandCenterApp(ctk.CTk):
             "text_pos": self.text_pos_var.get(),
             "text_size": self.text_size_var.get(),
             "text_style": self.text_style_var.get(),
+            "api_preset_name": self.api_preset_name_var.get(),
+            "content_template_name": self.content_template_name_var.get(),
         }
+
+    def _textbox_get(self, box: ctk.CTkTextbox | None) -> str:
+        if box is None:
+            return ""
+        return box.get("1.0", "end").strip()
+
+    def _textbox_set(self, box: ctk.CTkTextbox | None, text: str) -> None:
+        if box is None:
+            return
+        box.delete("1.0", "end")
+        if text:
+            box.insert("1.0", text)
+
+    def _save_workspace_state(self) -> None:
+        save_dashboard_state(self._collect_state())
+        self.status_var.set("当前工作台配置已保存")
+        self._append_log("已保存当前工作台配置。")
+
+    def _run_current_flow(self) -> None:
+        if self.render_enabled_var.get():
+            self._run_scheduler(render_only=not self.auto_upload_var.get())
+            return
+        if self.auto_upload_var.get():
+            self._run_upload_only()
+            return
+        messagebox.showwarning("没有启用模块", "请至少开启一个模块：渲染 或 上传。")
+
+    def _refresh_preset_menus(self) -> None:
+        api_names = sorted(self.prompt_cfg.get("apiPresets", {}).keys()) or [default_api_preset()["name"]]
+        content_names = sorted(self.prompt_cfg.get("contentTemplates", {}).keys()) or [default_content_template()["name"]]
+        if self.api_preset_menu is not None:
+            self.api_preset_menu.configure(values=api_names)
+        if self.content_template_menu is not None:
+            self.content_template_menu.configure(values=content_names)
+        if self.api_preset_name_var.get() not in api_names:
+            self.api_preset_name_var.set(api_names[0])
+        if self.content_template_name_var.get() not in content_names:
+            self.content_template_name_var.set(pick_content_template_name(self.prompt_cfg, self.prompt_tag_var.get().strip()))
+
+    def _apply_bound_content_template(self) -> None:
+        target_name = pick_content_template_name(self.prompt_cfg, self.prompt_tag_var.get().strip())
+        if target_name in self.prompt_cfg.get("contentTemplates", {}):
+            self.content_template_name_var.set(target_name)
+            self._load_content_template()
+
+    def _current_api_preset(self) -> dict:
+        return {
+            "templateType": "api",
+            "name": self.api_preset_name_var.get().strip() or "默认API模板",
+            "provider": self.api_provider_var.get().strip(),
+            "apiKey": self.api_key_var.get().strip(),
+            "baseUrl": self.api_base_url_var.get().strip(),
+            "model": self.api_model_var.get().strip(),
+            "temperature": self.api_temperature_var.get().strip(),
+            "maxTokens": self.api_max_tokens_var.get().strip(),
+            "autoImageEnabled": self.api_auto_image_var.get().strip(),
+            "imageBaseUrl": self.image_base_url_var.get().strip(),
+            "imageApiKey": self.image_api_key_var.get().strip(),
+            "imageModel": self.image_model_var.get().strip(),
+            "imageConcurrency": self.image_concurrency_var.get().strip(),
+            "outputLanguage": self.content_output_language_var.get().strip(),
+        }
+
+    def _current_content_template(self) -> dict:
+        return {
+            "templateType": "content",
+            "name": self.content_template_name_var.get().strip() or "默认内容模板",
+            "musicGenre": self.content_music_genre_var.get().strip(),
+            "angle": self.content_angle_var.get().strip(),
+            "audience": self.content_audience_var.get().strip(),
+            "outputLanguage": self.content_output_language_var.get().strip(),
+            "titleCount": self.content_title_count_var.get().strip(),
+            "descCount": self.content_desc_count_var.get().strip(),
+            "thumbCount": self.content_thumb_count_var.get().strip(),
+            "titleMin": self.content_title_min_var.get().strip(),
+            "titleMax": self.content_title_max_var.get().strip(),
+            "descLen": self.content_desc_len_var.get().strip(),
+            "tagRange": self.content_tag_range_var.get().strip(),
+            "masterPrompt": self._textbox_get(self.prompt_master_box),
+            "titleLibrary": self._textbox_get(self.prompt_title_library_box),
+        }
+
+    def _load_api_preset(self) -> None:
+        preset_name = self.api_preset_name_var.get().strip()
+        preset = clone_json(self.prompt_cfg.get("apiPresets", {}).get(preset_name, default_api_preset(preset_name or "默认API模板")))
+        self.api_preset_name_var.set(preset.get("name", "默认API模板"))
+        self.api_provider_var.set(preset.get("provider", "openai_compatible"))
+        self.api_key_var.set(preset.get("apiKey", ""))
+        self.api_base_url_var.set(preset.get("baseUrl", ""))
+        self.api_model_var.set(preset.get("model", ""))
+        self.api_temperature_var.set(str(preset.get("temperature", "0.9")))
+        self.api_max_tokens_var.set(str(preset.get("maxTokens", "16000")))
+        self.api_auto_image_var.set(str(preset.get("autoImageEnabled", "0")))
+        self.image_base_url_var.set(preset.get("imageBaseUrl", ""))
+        self.image_api_key_var.set(preset.get("imageApiKey", ""))
+        self.image_model_var.set(preset.get("imageModel", ""))
+        self.image_concurrency_var.set(str(preset.get("imageConcurrency", "3")))
+        self.prompt_status_var.set(f"已加载 API 模板：{self.api_preset_name_var.get()}")
+
+    def _load_content_template(self) -> None:
+        template_name = self.content_template_name_var.get().strip()
+        template = clone_json(self.prompt_cfg.get("contentTemplates", {}).get(template_name, default_content_template(template_name or "默认内容模板")))
+        self.content_template_name_var.set(template.get("name", "默认内容模板"))
+        self.content_music_genre_var.set(template.get("musicGenre", ""))
+        self.content_angle_var.set(template.get("angle", ""))
+        self.content_audience_var.set(template.get("audience", ""))
+        self.content_output_language_var.set(template.get("outputLanguage", "zh-TW"))
+        self.content_title_count_var.set(str(template.get("titleCount", "3")))
+        self.content_desc_count_var.set(str(template.get("descCount", "1")))
+        self.content_thumb_count_var.set(str(template.get("thumbCount", "3")))
+        self.content_title_min_var.set(str(template.get("titleMin", "80")))
+        self.content_title_max_var.set(str(template.get("titleMax", "95")))
+        self.content_desc_len_var.set(str(template.get("descLen", "300")))
+        self.content_tag_range_var.set(str(template.get("tagRange", "10-20")))
+        self._textbox_set(self.prompt_master_box, template.get("masterPrompt", ""))
+        self._textbox_set(self.prompt_title_library_box, template.get("titleLibrary", ""))
+        self.prompt_status_var.set(f"已加载内容模板：{self.content_template_name_var.get()}")
+
+    def _save_api_preset(self) -> None:
+        preset = self._current_api_preset()
+        self.prompt_cfg.setdefault("apiPresets", {})
+        self.prompt_cfg["apiPresets"][preset["name"]] = preset
+        save_prompt_studio_config(PROMPT_STUDIO_FILE, self.prompt_cfg)
+        self._refresh_preset_menus()
+        self.api_preset_name_var.set(preset["name"])
+        self.prompt_status_var.set(f"已保存 API 模板：{preset['name']}")
+        self._append_log(f"[提示词] 已保存 API 模板：{preset['name']}")
+
+    def _save_content_template(self) -> None:
+        template = self._current_content_template()
+        self.prompt_cfg.setdefault("contentTemplates", {})
+        self.prompt_cfg["contentTemplates"][template["name"]] = template
+        save_prompt_studio_config(PROMPT_STUDIO_FILE, self.prompt_cfg)
+        self._refresh_preset_menus()
+        self.content_template_name_var.set(template["name"])
+        self.prompt_status_var.set(f"已保存内容模板：{template['name']}")
+        self._append_log(f"[提示词] 已保存内容模板：{template['name']}")
+
+    def _bind_tag_to_content_template(self) -> None:
+        tag = self.prompt_tag_var.get().strip()
+        template_name = self.content_template_name_var.get().strip()
+        if not tag:
+            messagebox.showerror("缺少标签", "请先选择一个分组标签。")
+            return
+        if not template_name:
+            messagebox.showerror("缺少模板", "请先选择一个内容模板。")
+            return
+        self.prompt_cfg.setdefault("tagBindings", {})
+        self.prompt_cfg["tagBindings"][tag] = template_name
+        save_prompt_studio_config(PROMPT_STUDIO_FILE, self.prompt_cfg)
+        self.prompt_status_var.set(f"已绑定：{tag} -> {template_name}")
+        self._append_log(f"[提示词] 已绑定 {tag} -> {template_name}")
+
+    def _preview_prompt_bundle(self) -> None:
+        preview = build_site_preview(self._current_content_template(), self._current_api_preset())
+        self._textbox_set(self.prompt_preview_box, preview)
+        self.prompt_status_var.set("已刷新主提示词预览")
+
+    def _generation_tag_dir(self) -> Path:
+        return resolve_local_path(self.scheduler_cfg.get("base_image_dir", "workspace/base_image")) / self.generation_tag_var.get().strip()
+
+    def _generation_map_path(self) -> Path:
+        return self._generation_tag_dir() / "generation_map.json"
+
+    def _output_root_path(self) -> Path:
+        return resolve_local_path(self.scheduler_cfg.get("output_root", "workspace/AutoTask"))
+
+    def _open_generation_tag_dir(self) -> None:
+        open_target(self._generation_tag_dir())
+
+    def _load_generation_entry(self, silent: bool = False) -> None:
+        try:
+            date_mmdd = normalize_mmdd(self.date_var.get())
+        except Exception as e:
+            if not silent:
+                messagebox.showerror("日期错误", str(e))
+            return
+        tag = self.generation_tag_var.get().strip()
+        channel = self.generation_channel_var.get().strip()
+        if not tag or not channel:
+            return
+        generation_map = load_generation_map_file(self._generation_map_path())
+        channel_info = generation_map.setdefault("channels", {}).setdefault(channel, {"is_ypp": False, "days": {}})
+        day_info = channel_info.get("days", {}).get(date_mmdd, {})
+        self.generation_is_ypp_var.set(bool(channel_info.get("is_ypp", False)))
+        self.generation_set_var.set(str(day_info.get("set", 1)))
+        self._textbox_set(self.gen_title_box, day_info.get("title", ""))
+        self._textbox_set(self.gen_desc_box, day_info.get("description", ""))
+        covers = day_info.get("covers", []) or guess_cover_names(self._generation_tag_dir(), date_mmdd, int(channel))
+        self._textbox_set(self.gen_covers_box, "\n".join(covers))
+        self._textbox_set(self.gen_ab_titles_box, "\n".join(day_info.get("ab_titles", [])))
+        channel_name = self.channel_name_map.get(channel, "")
+        self.generation_status_var.set(f"{tag} / {channel}{(' / ' + channel_name) if channel_name else ''} / {date_mmdd}")
+        if not silent:
+            self._append_log(f"[generation_map] 已加载 {tag} / {channel} / {date_mmdd}")
+
+    def _guess_generation_covers(self) -> None:
+        try:
+            date_mmdd = normalize_mmdd(self.date_var.get())
+        except Exception as e:
+            messagebox.showerror("日期错误", str(e))
+            return
+        tag = self.generation_tag_var.get().strip()
+        channel = self.generation_channel_var.get().strip()
+        if not tag or not channel:
+            return
+        covers = guess_cover_names(self._generation_tag_dir(), date_mmdd, int(channel))
+        self._textbox_set(self.gen_covers_box, "\n".join(covers))
+        self.generation_status_var.set(f"已自动匹配封面：{', '.join(covers) if covers else '未找到'}")
+
+    def _save_generation_entry(self) -> None:
+        try:
+            date_mmdd = normalize_mmdd(self.date_var.get())
+        except Exception as e:
+            messagebox.showerror("日期错误", str(e))
+            return
+        tag = self.generation_tag_var.get().strip()
+        channel = self.generation_channel_var.get().strip()
+        if not tag or not channel:
+            messagebox.showerror("缺少目标", "请先选择分组和频道。")
+            return
+
+        generation_map = load_generation_map_file(self._generation_map_path())
+        channel_info = generation_map.setdefault("channels", {}).setdefault(channel, {"is_ypp": False, "days": {}})
+        channel_info["is_ypp"] = bool(self.generation_is_ypp_var.get())
+        channel_info.setdefault("days", {})
+        channel_info["days"][date_mmdd] = {
+            "title": self._textbox_get(self.gen_title_box),
+            "description": self._textbox_get(self.gen_desc_box),
+            "covers": [line.strip() for line in self._textbox_get(self.gen_covers_box).splitlines() if line.strip()],
+            "ab_titles": [line.strip() for line in self._textbox_get(self.gen_ab_titles_box).splitlines() if line.strip()],
+            "set": int(self.generation_set_var.get().strip() or "1"),
+        }
+        save_generation_map_file(self._generation_map_path(), generation_map)
+        self.generation_status_var.set(f"已保存 generation_map：{self._generation_map_path()}")
+        self._append_log(f"[generation_map] 已保存 {tag} / {channel} / {date_mmdd}")
+        if self.auto_sync_manifest_var.get():
+            self._sync_current_manifest_only()
+
+    def _sync_current_manifest_only(self) -> None:
+        try:
+            date_mmdd = normalize_mmdd(self.date_var.get())
+        except Exception as e:
+            messagebox.showerror("日期错误", str(e))
+            return
+        tag = self.generation_tag_var.get().strip()
+        if not tag:
+            messagebox.showerror("缺少标签", "请先选择分组。")
+            return
+        generation_map = load_generation_map_file(self._generation_map_path())
+        manifest_path, count = sync_manifest_from_generation_map(
+            generation_map,
+            self._generation_tag_dir(),
+            self._output_root_path(),
+            tag,
+            date_mmdd,
+        )
+        self.generation_status_var.set(f"已同步 manifest：{manifest_path}（{count} 个频道）")
+        self._append_log(f"[manifest] 已同步 {manifest_path}")
+
+    def _push_generation_to_prompt_preview(self) -> None:
+        self.prompt_tag_var.set(self.generation_tag_var.get())
+        bound_template = pick_content_template_name(self.prompt_cfg, self.prompt_tag_var.get().strip())
+        if bound_template in self.prompt_cfg.get("contentTemplates", {}):
+            self.content_template_name_var.set(bound_template)
+            self._load_content_template()
+        preview_text = build_site_preview(self._current_content_template(), self._current_api_preset())
+        title = self._textbox_get(self.gen_title_box)
+        desc = self._textbox_get(self.gen_desc_box)
+        self._textbox_set(
+            self.prompt_preview_box,
+            preview_text + f"\n\n=== 当前 generation_map 内容 ===\n标题: {title}\n\n简介:\n{desc}",
+        )
+        self.tabs.set("提示词")
+        self.prompt_status_var.set("已把当前 generation_map 内容带到提示词预览")
 
     def _run_scheduler(self, *, render_only: bool) -> None:
         try:
