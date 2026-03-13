@@ -5508,6 +5508,7 @@ async def batch_upload(
                     find_window_task(window_plan, tag, serial),
                     default_upload_options=plan_default_options,
                 )
+                is_ypp = bool(ch_manifest.get("is_ypp", serial in ypp_serials))
                 thumbnails = [Path(p) for p in ch_manifest.get("thumbnails", []) if Path(p).exists()]
                 title = ch_manifest.get("title", "默认")
                 channel_name = ch_manifest.get("channel_name") or serial_to_channel_name.get(serial, "未知")
@@ -5650,6 +5651,7 @@ async def batch_upload(
                 find_window_task(window_plan, tag, serial),
                 default_upload_options=plan_default_options,
             )
+            is_ypp = bool(ch_manifest.get("is_ypp", serial in ypp_serials))
             title = ch_manifest.get("title", "Video Title")
             description = ch_manifest.get("description", "")
             tag_list = [str(item).strip() for item in ch_manifest.get("tag_list", []) if str(item).strip()]

@@ -31,6 +31,7 @@ from group_upload_workflow import (
     load_upload_batch_settings,
     parse_serials_text,
     prepare_group_upload_batch,
+    prepare_window_task_upload_batch,
     save_upload_batch_settings,
 )
 from path_helpers import default_scheduler_config, normalize_scheduler_config
@@ -54,6 +55,7 @@ from upload_window_planner import (
     SCOPE_SAME_GROUP,
     build_window_upload_plan,
     derive_tags_and_skip_channels,
+    parse_manual_tasks,
     save_window_upload_plan,
 )
 from utils import get_all_tags, get_tag_info
@@ -143,6 +145,10 @@ GROUP_UPLOAD_CATEGORY_VALUES = [
     "Sports",
     "Travel & Events",
 ]
+TASK_MODE_VALUES = ["upload_only", "render_only", "render_and_upload"]
+UPLOAD_SOURCE_MODE_VALUES = ["render_output", "ready_folder"]
+UPLOAD_METADATA_MODE_VALUES = ["prompt_api", "daily_content"]
+BOOL_OVERRIDE_VALUES = ["default", "yes", "no"]
 
 UPLOAD_ENTRY_MODE_LABELS = {
     "window_plan": "按窗口任务上传",
@@ -211,6 +217,19 @@ def load_dashboard_state() -> dict:
         "prompt_tag": "",
         "batch_tags_text": "",
         "upload_entry_mode": "window_plan",
+        "today_task_mode": "render_and_upload",
+        "upload_source_mode": "render_output",
+        "upload_metadata_mode": "prompt_api",
+        "upload_fill_text": True,
+        "upload_fill_thumbnails": True,
+        "upload_sync_daily_content": True,
+        "upload_picker_tag": "",
+        "upload_window_ypp_override": "default",
+        "upload_window_title_override": "",
+        "upload_window_visibility_override": "",
+        "upload_window_category_override": "",
+        "upload_window_made_for_kids_override": "default",
+        "upload_window_altered_content_override": "default",
         "song_count": "1",
         "channel": "",
         "window_scope_mode": SCOPE_SAME_GROUP,
@@ -341,6 +360,7 @@ class CommandCenterApp(ctk.CTk):
         self.prompt_audience_preview_image: ctk.CTkImage | None = None
         self.prompt_audience_image_data_url: str | None = None
         self.prompt_audience_analysis_busy = False
+        self._syncing_task_mode = False
         self.gen_title_box: ctk.CTkTextbox | None = None
         self.gen_desc_box: ctk.CTkTextbox | None = None
         self.gen_covers_box: ctk.CTkTextbox | None = None
@@ -350,10 +370,13 @@ class CommandCenterApp(ctk.CTk):
         self.multi_group_plan_box: ctk.CTkTextbox | None = None
         self.manual_window_plan_box: ctk.CTkTextbox | None = None
         self.window_plan_preview_box: ctk.CTkTextbox | None = None
+        self.upload_window_buttons_frame: ctk.CTkScrollableFrame | None = None
+        self.upload_picker_tag_menu: ctk.CTkOptionMenu | None = None
         self.group_upload_tag_menu: ctk.CTkOptionMenu | None = None
         self.group_upload_preview_box: ctk.CTkTextbox | None = None
 
         self._build_variables()
+        self._sync_task_mode_to_module_flags(initial=True)
         self._build_ui()
         self._load_tags()
         self._sync_upload_channels()
@@ -376,12 +399,28 @@ class CommandCenterApp(ctk.CTk):
         self.generation_tag_var = ctk.StringVar(value=self.ui_state["generation_tag"] or self.ui_state["upload_tag"] or self.ui_state["tag"])
         self.prompt_tag_var = ctk.StringVar(value=self.ui_state["prompt_tag"] or self.ui_state["tag"])
         self.song_count_var = ctk.StringVar(value=self.ui_state["song_count"])
+        self.today_task_mode_var = ctk.StringVar(value=self.ui_state.get("today_task_mode", "render_and_upload"))
+        self.upload_source_mode_var = ctk.StringVar(value=self.ui_state.get("upload_source_mode", "render_output"))
+        self.upload_metadata_mode_var = ctk.StringVar(value=self.ui_state.get("upload_metadata_mode", "prompt_api"))
         self.upload_entry_mode_var = ctk.StringVar(
             value=normalize_upload_entry_mode(self.ui_state.get("upload_entry_mode", "window_plan"))
         )
         self.channel_var = ctk.StringVar(value=self.ui_state["channel"])
         self.window_scope_mode_var = ctk.StringVar(value=self.ui_state.get("window_scope_mode", SCOPE_SAME_GROUP))
         self.same_group_serials_var = ctk.StringVar(value=self.ui_state.get("same_group_serials_text", ""))
+        self.upload_picker_tag_var = ctk.StringVar(
+            value=self.ui_state.get("upload_picker_tag") or self.ui_state["upload_tag"] or self.ui_state["tag"]
+        )
+        self.upload_window_ypp_override_var = ctk.StringVar(value=self.ui_state.get("upload_window_ypp_override", "default"))
+        self.upload_window_title_override_var = ctk.StringVar(value=self.ui_state.get("upload_window_title_override", ""))
+        self.upload_window_visibility_override_var = ctk.StringVar(value=self.ui_state.get("upload_window_visibility_override", ""))
+        self.upload_window_category_override_var = ctk.StringVar(value=self.ui_state.get("upload_window_category_override", ""))
+        self.upload_window_made_for_kids_override_var = ctk.StringVar(
+            value=self.ui_state.get("upload_window_made_for_kids_override", "default")
+        )
+        self.upload_window_altered_content_override_var = ctk.StringVar(
+            value=self.ui_state.get("upload_window_altered_content_override", "default")
+        )
         self.generation_channel_var = ctk.StringVar(value=self.ui_state["generation_channel"])
         self.audio_workers_var = ctk.IntVar(value=int(self.ui_state["audio_workers"]))
         self.video_workers_var = ctk.IntVar(value=int(self.ui_state["video_workers"]))
@@ -459,6 +498,9 @@ class CommandCenterApp(ctk.CTk):
         self.group_upload_status_var = ctk.StringVar(value="等待载入分组批量上传计划")
         self.window_plan_status_var = ctk.StringVar(value="等待设置今日上传窗口")
         self.quick_upload_mode_status_var = ctk.StringVar(value="当前上传方式：按窗口任务上传")
+        self.upload_fill_text_var = ctk.BooleanVar(value=bool(self.ui_state.get("upload_fill_text", True)))
+        self.upload_fill_thumbnails_var = ctk.BooleanVar(value=bool(self.ui_state.get("upload_fill_thumbnails", True)))
+        self.upload_sync_daily_content_var = ctk.BooleanVar(value=bool(self.ui_state.get("upload_sync_daily_content", True)))
 
         for traced_var in (
             self.date_var,
@@ -470,15 +512,22 @@ class CommandCenterApp(ctk.CTk):
             traced_var.trace_add("write", self._handle_batch_preview_change)
 
         for traced_var in (
+            self.today_task_mode_var,
+            self.upload_source_mode_var,
+            self.upload_metadata_mode_var,
             self.date_var,
             self.tag_var,
             self.upload_tag_var,
+            self.upload_picker_tag_var,
             self.channel_var,
             self.window_scope_mode_var,
             self.same_group_serials_var,
             self.render_enabled_var,
             self.auto_upload_var,
             self.upload_entry_mode_var,
+            self.upload_fill_text_var,
+            self.upload_fill_thumbnails_var,
+            self.upload_sync_daily_content_var,
             self.group_upload_tag_var,
             self.group_upload_source_dir_var,
             self.group_upload_serials_var,
@@ -525,14 +574,170 @@ class CommandCenterApp(ctk.CTk):
         self._build_paths_tab(self.tabs.tab("路径配置"))
         self._build_log_tab(self.tabs.tab("日志"))
 
+    def _sync_task_mode_to_module_flags(self, *, initial: bool = False) -> None:
+        if self._syncing_task_mode:
+            return
+        mode = str(self.today_task_mode_var.get() or "render_and_upload").strip()
+        desired = {
+            "upload_only": (False, True),
+            "render_only": (True, False),
+            "render_and_upload": (True, True),
+        }.get(mode, (True, True))
+        self._syncing_task_mode = True
+        try:
+            if bool(self.render_enabled_var.get()) != desired[0]:
+                self.render_enabled_var.set(desired[0])
+            if bool(self.auto_upload_var.get()) != desired[1]:
+                self.auto_upload_var.set(desired[1])
+        finally:
+            self._syncing_task_mode = False
+        if not initial:
+            self._refresh_quick_upload_mode_summary()
+
+    def _task_mode_label(self) -> str:
+        return {
+            "upload_only": "本日只上传",
+            "render_only": "本日只剪辑",
+            "render_and_upload": "本日剪辑并上传",
+        }.get(str(self.today_task_mode_var.get() or "").strip(), "本日剪辑并上传")
+
+    def _current_upload_entry_mode(self) -> str:
+        source_mode = str(self.upload_source_mode_var.get() or "render_output").strip()
+        normalized = "group_folder" if source_mode == "ready_folder" else "window_plan"
+        if self.upload_entry_mode_var.get() != normalized:
+            self.upload_entry_mode_var.set(normalized)
+        return normalized
+
+    def _bool_override_token(self, value: str) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized == "yes":
+            return "true"
+        if normalized == "no":
+            return "false"
+        return ""
+
+    def _current_upload_tasks(self) -> list[dict]:
+        try:
+            return parse_manual_tasks(self._textbox_get(self.manual_window_plan_box))
+        except Exception:
+            return []
+
+    def _selected_serials_for_picker_tag(self, tag: str) -> set[int]:
+        selected: set[int] = set()
+        for task in self._current_upload_tasks():
+            if str(task.get("tag") or "").strip() == str(tag).strip():
+                selected.add(int(task.get("serial") or 0))
+        return selected
+
+    def _window_button_label(self, tag: str, serial: int) -> str:
+        name = self.channel_name_map.get(str(serial), "")
+        ypp_serials = set((get_tag_info(tag) or {}).get("ypp_serials", []))
+        ypp_mark = " YPP" if serial in ypp_serials else ""
+        return f"{serial}{ypp_mark}" + (f"\n{name}" if name else "")
+
+    def _refresh_upload_window_buttons(self) -> None:
+        if self.upload_window_buttons_frame is None:
+            return
+        for child in self.upload_window_buttons_frame.winfo_children():
+            child.destroy()
+        tag = self.upload_picker_tag_var.get().strip() or self.upload_tag_var.get().strip() or self.tag_var.get().strip()
+        info = get_tag_info(tag) if tag else None
+        if not info:
+            ctk.CTkLabel(self.upload_window_buttons_frame, text="先选一个分组，下面才会出现该组窗口。", text_color="#9aa0aa").pack(anchor="w", padx=8, pady=8)
+            return
+        selected_serials = self._selected_serials_for_picker_tag(tag)
+        row = ctk.CTkFrame(self.upload_window_buttons_frame, fg_color="transparent")
+        row.pack(fill="x", padx=6, pady=6)
+        wrap_count = 0
+        for serial in info.get("all_serials", []):
+            if wrap_count and wrap_count % 5 == 0:
+                row = ctk.CTkFrame(self.upload_window_buttons_frame, fg_color="transparent")
+                row.pack(fill="x", padx=6, pady=6)
+            fg_color = "#2563eb" if serial not in selected_serials else "#16a34a"
+            ctk.CTkButton(
+                row,
+                text=self._window_button_label(tag, serial),
+                width=140,
+                height=52,
+                fg_color=fg_color,
+                command=lambda current_serial=serial, current_tag=tag: self._append_window_task(current_tag, current_serial),
+            ).pack(side="left", padx=(0, 8))
+            wrap_count += 1
+
+    def _build_window_task_line(self, tag: str, serial: int) -> str:
+        tokens = [str(serial), tag]
+        ypp_token = self._bool_override_token(self.upload_window_ypp_override_var.get())
+        if ypp_token:
+            tokens.append(f"is_ypp={ypp_token}")
+        title = self.upload_window_title_override_var.get().strip()
+        if title:
+            tokens.append(f"title={title}")
+        visibility = self.upload_window_visibility_override_var.get().strip()
+        if visibility:
+            tokens.append(f"visibility={visibility}")
+        category = self.upload_window_category_override_var.get().strip()
+        if category:
+            tokens.append(f"category={category}")
+        kids_token = self._bool_override_token(self.upload_window_made_for_kids_override_var.get())
+        if kids_token:
+            tokens.append(f"made_for_kids={kids_token}")
+        altered_token = self._bool_override_token(self.upload_window_altered_content_override_var.get())
+        if altered_token:
+            tokens.append(f"altered_content={altered_token}")
+        return " | ".join(tokens)
+
+    def _append_window_task(self, tag: str, serial: int) -> None:
+        line = self._build_window_task_line(tag, serial)
+        existing_lines = [item.strip() for item in self._textbox_get(self.manual_window_plan_box).splitlines() if item.strip()]
+        prefix = f"{serial} | {tag}"
+        existing_lines = [item for item in existing_lines if not item.startswith(prefix)]
+        existing_lines.append(line)
+        self._textbox_set(self.manual_window_plan_box, "\n".join(existing_lines))
+        self.window_scope_mode_var.set(SCOPE_MANUAL)
+        self.window_plan_status_var.set(f"已加入窗口任务：{tag} / {serial}")
+        self._preview_window_plan(show_error=False)
+        self._refresh_upload_window_buttons()
+
+    def _append_picker_group_windows(self) -> None:
+        tag = self.upload_picker_tag_var.get().strip()
+        info = get_tag_info(tag) if tag else None
+        if not info:
+            messagebox.showwarning("缺少分组", "请先选择一个分组，再加入该组窗口。")
+            return
+        for serial in info.get("all_serials", []):
+            self._append_window_task(tag, serial)
+
+    def _remove_picker_group_windows(self) -> None:
+        tag = self.upload_picker_tag_var.get().strip()
+        if not tag:
+            return
+        lines = [item.strip() for item in self._textbox_get(self.manual_window_plan_box).splitlines() if item.strip()]
+        kept = [item for item in lines if not item.startswith(f"{tag}") and f"| {tag}" not in item]
+        self._textbox_set(self.manual_window_plan_box, "\n".join(kept))
+        self._preview_window_plan(show_error=False)
+        self._refresh_upload_window_buttons()
+
     def _build_quick_tab(self, parent) -> None:
         scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent")
         scroll.pack(fill="both", expand=True, padx=8, pady=8)
 
+        task_mode = self._section_card(
+            scroll,
+            "步骤 1：本次要进行哪些任务",
+            "先决定今天是只上传、只剪辑，还是剪辑完继续上传。这里的“上传”包含标题、简介、标签、缩略图等整条流程。",
+        )
+        task_row = ctk.CTkFrame(task_mode, fg_color="transparent")
+        task_row.pack(fill="x", padx=14, pady=(0, 10))
+        ctk.CTkRadioButton(task_row, text="本日只上传", variable=self.today_task_mode_var, value="upload_only", command=self._sync_task_mode_to_module_flags).pack(side="left", padx=(0, 20))
+        ctk.CTkRadioButton(task_row, text="本日只剪辑", variable=self.today_task_mode_var, value="render_only", command=self._sync_task_mode_to_module_flags).pack(side="left", padx=(0, 20))
+        ctk.CTkRadioButton(task_row, text="本日剪辑并上传", variable=self.today_task_mode_var, value="render_and_upload", command=self._sync_task_mode_to_module_flags).pack(side="left", padx=(0, 20))
+        ctk.CTkSwitch(task_row, text="全随机视觉（推荐）", variable=self.randomize_effects_var, command=self._apply_randomize_state).pack(side="left", padx=(0, 16))
+        ctk.CTkSwitch(task_row, text="上传后自动关闭浏览器", variable=self.auto_close_browser_var).pack(side="left")
+
         basic = self._section_card(
             scroll,
-            "步骤 1：先定今天的任务范围",
-            "先选今天要处理的分组、日期和每个赛道几首歌。这一步决定后面渲染和上传都会读哪里。",
+            "步骤 2：今天的基础范围",
+            "这里保留主分组、日期和每赛道曲数。剪辑流程会读取这里；上传页则负责具体窗口和现成视频来源。",
         )
         basic_row = ctk.CTkFrame(basic, fg_color="transparent")
         basic_row.pack(fill="x", padx=14, pady=(0, 10))
@@ -553,59 +758,16 @@ class CommandCenterApp(ctk.CTk):
 
         workflow = self._section_card(
             scroll,
-            "步骤 2：先确定今天的上传入口",
-            "以后默认先选“按窗口任务上传”。只有现成视频在一个文件夹里时，才去用“同分组现成视频”。多赛道任务清单仍主要服务渲染流水线。",
+            "步骤 3：上传与内容入口",
+            "上传逻辑现在统一放在“上传”页里。那一页会决定你是传渲染产物，还是传现成视频文件夹，以及今天到底传哪些窗口。",
         )
         workflow_row = ctk.CTkFrame(workflow, fg_color="transparent")
         workflow_row.pack(fill="x", padx=14, pady=(0, 8))
-        ctk.CTkSwitch(workflow_row, text="启用渲染模块", variable=self.render_enabled_var).pack(side="left", padx=(0, 16))
-        ctk.CTkSwitch(workflow_row, text="启用上传模块", variable=self.auto_upload_var).pack(side="left", padx=(0, 16))
-        ctk.CTkSwitch(workflow_row, text="全随机视觉（推荐）", variable=self.randomize_effects_var, command=self._apply_randomize_state).pack(side="left", padx=(0, 16))
-        ctk.CTkSwitch(workflow_row, text="上传后自动关闭浏览器", variable=self.auto_close_browser_var).pack(side="left", padx=(0, 16))
-
-        workflow_row2 = ctk.CTkFrame(workflow, fg_color="transparent")
-        workflow_row2.pack(fill="x", padx=14, pady=(0, 8))
-        ctk.CTkSwitch(workflow_row2, text="保存后同步 upload_manifest", variable=self.auto_sync_manifest_var).pack(side="left", padx=(0, 16))
-        ctk.CTkButton(workflow_row2, text="打开提示词页", width=120, fg_color="#334155", command=lambda: self.tabs.set("提示词")).pack(side="left", padx=(0, 10))
-        ctk.CTkButton(workflow_row2, text="打开当日内容页", width=120, fg_color="#334155", command=lambda: self.tabs.set("当日内容")).pack(side="left", padx=(0, 10))
-        ctk.CTkButton(workflow_row2, text="保存工作台", width=120, fg_color="#475569", command=self._save_workspace_state).pack(side="left", padx=(0, 10))
-
-        upload_mode = ctk.CTkFrame(workflow, fg_color="transparent")
-        upload_mode.pack(fill="x", padx=14, pady=(0, 8))
-        ctk.CTkLabel(upload_mode, text="上传方式", text_color="#9aa0aa").pack(anchor="w", pady=(0, 4))
-        radio_row = ctk.CTkFrame(upload_mode, fg_color="transparent")
-        radio_row.pack(fill="x")
-        ctk.CTkRadioButton(radio_row, text="按窗口任务上传", variable=self.upload_entry_mode_var, value="window_plan").pack(side="left", padx=(0, 24))
-        ctk.CTkRadioButton(radio_row, text="单频道上传", variable=self.upload_entry_mode_var, value="single_channel").pack(side="left", padx=(0, 24))
-        ctk.CTkRadioButton(radio_row, text="多赛道任务清单", variable=self.upload_entry_mode_var, value="batch_tags").pack(side="left", padx=(0, 24))
-        ctk.CTkRadioButton(radio_row, text="同分组现成视频", variable=self.upload_entry_mode_var, value="group_folder").pack(side="left")
-
-        scope_card = ctk.CTkFrame(workflow, fg_color="transparent")
-        scope_card.pack(fill="x", padx=14, pady=(0, 8))
-        ctk.CTkLabel(scope_card, text="如果选择“按窗口任务上传”，先回答这三个问题", text_color="#9aa0aa").pack(anchor="w", pady=(0, 4))
-        scope_row = ctk.CTkFrame(scope_card, fg_color="transparent")
-        scope_row.pack(fill="x")
-        ctk.CTkRadioButton(scope_row, text="同一分组的一批窗口", variable=self.window_scope_mode_var, value=SCOPE_SAME_GROUP).pack(side="left", padx=(0, 18))
-        ctk.CTkRadioButton(scope_row, text="多个分组，各自列窗口", variable=self.window_scope_mode_var, value=SCOPE_MULTI_GROUP).pack(side="left", padx=(0, 18))
-        ctk.CTkRadioButton(scope_row, text="逐窗口单独配置", variable=self.window_scope_mode_var, value=SCOPE_MANUAL).pack(side="left")
-
-        scope_row2 = ctk.CTkFrame(scope_card, fg_color="transparent")
-        scope_row2.pack(fill="x", pady=(6, 0))
-        self._labeled_entry(
-            scope_row2,
-            "同组窗口号",
-            self.same_group_serials_var,
-            width=300,
-            placeholder="90,91,92",
-        )
-        ctk.CTkButton(scope_row2, text="预览今日窗口任务", width=140, fg_color="#334155", command=self._preview_window_plan).pack(side="left", padx=(0, 8), pady=(20, 0))
-        ctk.CTkButton(scope_row2, text="打开上传页细配", width=140, fg_color="#475569", command=lambda: self.tabs.set("上传")).pack(side="left", pady=(20, 0))
-
-        mode_actions = ctk.CTkFrame(workflow, fg_color="transparent")
-        mode_actions.pack(fill="x", padx=14, pady=(0, 8))
-        ctk.CTkButton(mode_actions, text="打开当前上传设置页", width=150, fg_color="#334155", command=self._open_active_upload_settings_tab).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(mode_actions, text="仅跑当前上传方式", width=150, fg_color="#475569", command=self._run_selected_upload_mode).pack(side="left")
-        ctk.CTkLabel(mode_actions, textvariable=self.window_plan_status_var, text_color="#9aa0aa").pack(side="right")
+        ctk.CTkSwitch(workflow_row, text="保存后同步 upload_manifest", variable=self.auto_sync_manifest_var).pack(side="left", padx=(0, 16))
+        ctk.CTkButton(workflow_row, text="打开上传页", width=120, fg_color="#2563eb", command=lambda: self.tabs.set("上传")).pack(side="left", padx=(0, 10))
+        ctk.CTkButton(workflow_row, text="打开提示词页", width=120, fg_color="#334155", command=lambda: self.tabs.set("提示词")).pack(side="left", padx=(0, 10))
+        ctk.CTkButton(workflow_row, text="打开当日内容页", width=120, fg_color="#334155", command=lambda: self.tabs.set("当日内容")).pack(side="left", padx=(0, 10))
+        ctk.CTkButton(workflow_row, text="保存工作台", width=120, fg_color="#475569", command=self._save_workspace_state).pack(side="left", padx=(0, 10))
         ctk.CTkLabel(
             workflow,
             textvariable=self.quick_upload_mode_status_var,
@@ -616,7 +778,7 @@ class CommandCenterApp(ctk.CTk):
 
         render = self._section_card(
             scroll,
-            "步骤 3：渲染并发和节奏",
+            "步骤 4：渲染并发和节奏",
             "如果今天要制作视频，这里只保留最常用的两个杠杆：音频并行和视频并行。复杂特效再去“高级视觉”。",
         )
         render_row = ctk.CTkFrame(render, fg_color="transparent")
@@ -628,8 +790,8 @@ class CommandCenterApp(ctk.CTk):
 
         batch = self._section_card(
             scroll,
-            "步骤 4：如果今天有多个赛道，就在这里填任务清单",
-            "只有上传方式 = “多赛道任务清单”时，这块才是必填。其他模式可以先留空。",
+            "步骤 5：如果今天有多个赛道，就在这里填任务清单",
+            "只有今天要批量渲染多个赛道时，这块才是必填。其他模式可以先留空。",
         )
         self.batch_tags_box = ctk.CTkTextbox(batch, height=96)
         self.batch_tags_box.pack(fill="x", padx=14, pady=(0, 8))
@@ -646,7 +808,7 @@ class CommandCenterApp(ctk.CTk):
 
         links = self._section_card(
             scroll,
-            "步骤 5：启动前，先检查内容和素材路径",
+            "步骤 6：启动前，先检查内容和素材路径",
             "通常顺序是：先去提示词页看模板，再去当日内容页看标题/简介/封面，最后确认路径配置。",
         )
         links_row = ctk.CTkFrame(links, fg_color="transparent")
@@ -658,8 +820,8 @@ class CommandCenterApp(ctk.CTk):
 
         actions = self._section_card(
             scroll,
-            "步骤 6：开始执行",
-            "“开始当前流程”会按你上面的模块开关和上传方式一起跑；不想全跑，就用下面的单独按钮。",
+            "步骤 7：开始执行",
+            "“开始当前流程”会按你上面的任务模式去跑；不想全跑，就用下面的单独按钮。",
         )
         ctk.CTkButton(actions, text="开始当前流程", height=42, command=self._run_current_flow).pack(fill="x", padx=14, pady=(0, 10))
         ctk.CTkButton(actions, text="仅跑当前上传方式", height=40, fg_color="#334155", command=self._run_selected_upload_mode).pack(fill="x", padx=14, pady=(0, 10))
@@ -674,72 +836,95 @@ class CommandCenterApp(ctk.CTk):
         scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent")
         scroll.pack(fill="both", expand=True, padx=8, pady=8)
 
-        basic = self._section_card(
+        source = self._section_card(
             scroll,
-            "步骤 1：先定默认分组和日期",
-            "这里的分组会作为“同组模式”和“逐窗口模式”的默认 tag。你只在个别窗口需要例外时，再单独覆盖。",
+            "步骤 1：先定上传来源和文案来源",
+            "上传页现在统一处理两种情况：传渲染产物，或传现成视频文件夹。下面的窗口任务区两种来源都共用。",
         )
-        basic_row = ctk.CTkFrame(basic, fg_color="transparent")
-        basic_row.pack(fill="x", padx=14, pady=(0, 10))
+        source_row = ctk.CTkFrame(source, fg_color="transparent")
+        source_row.pack(fill="x", padx=14, pady=(0, 8))
+        ctk.CTkRadioButton(source_row, text="上传渲染产物", variable=self.upload_source_mode_var, value="render_output").pack(side="left", padx=(0, 20))
+        ctk.CTkRadioButton(source_row, text="上传现成视频文件夹", variable=self.upload_source_mode_var, value="ready_folder").pack(side="left", padx=(0, 20))
         self.upload_tag_menu = self._labeled_option(
-            basic_row,
+            source_row,
             "默认分组",
             self.upload_tag_var,
             ["加载中..."],
             width=220,
             command=lambda _: self._sync_upload_channels(),
         )
-        self._labeled_entry(basic_row, "日期", self.date_var, width=120, placeholder="MMDD / 3.12")
-        self.channel_menu = self._labeled_option(basic_row, "单频道备用", self.channel_var, [""], width=220)
-        ctk.CTkButton(basic_row, text="刷新频道", width=100, command=self._sync_upload_channels).pack(side="left", padx=(0, 10), pady=(20, 0))
+        self._labeled_entry(source_row, "日期", self.date_var, width=120, placeholder="MMDD / 3.12")
+        self.channel_menu = self._labeled_option(source_row, "单频道备用", self.channel_var, [""], width=220)
+        ctk.CTkButton(source_row, text="刷新频道", width=100, command=self._sync_upload_channels).pack(side="left", padx=(0, 10), pady=(20, 0))
+
+        source_row2 = ctk.CTkFrame(source, fg_color="transparent")
+        source_row2.pack(fill="x", padx=14, pady=(0, 8))
+        self._labeled_option(source_row2, "文案来源", self.upload_metadata_mode_var, UPLOAD_METADATA_MODE_VALUES, width=150)
+        ctk.CTkSwitch(source_row2, text="生成标题/简介/标签", variable=self.upload_fill_text_var).pack(side="left", padx=(0, 16), pady=(20, 0))
+        ctk.CTkSwitch(source_row2, text="处理缩略图", variable=self.upload_fill_thumbnails_var).pack(side="left", padx=(0, 16), pady=(20, 0))
+        ctk.CTkSwitch(source_row2, text="同步到当日内容", variable=self.upload_sync_daily_content_var).pack(side="left", padx=(0, 16), pady=(20, 0))
+        ctk.CTkButton(source_row2, text="打开提示词页", width=120, fg_color="#334155", command=lambda: self.tabs.set("提示词")).pack(side="left", padx=(0, 8), pady=(20, 0))
+        ctk.CTkButton(source_row2, text="打开当日内容页", width=120, fg_color="#334155", command=lambda: self.tabs.set("当日内容")).pack(side="left", padx=(0, 8), pady=(20, 0))
+
+        source_row3 = ctk.CTkFrame(source, fg_color="transparent")
+        source_row3.pack(fill="x", padx=14, pady=(0, 12))
+        self._labeled_entry(source_row3, "现成视频文件夹", self.group_upload_source_dir_var, placeholder="只在“上传现成视频文件夹”时需要", expand=True)
+        choose_video = ctk.CTkFrame(source_row3, fg_color="transparent")
+        choose_video.pack(side="left", pady=(20, 0))
+        ctk.CTkButton(choose_video, text="选择视频目录", width=110, fg_color="#334155", command=lambda: self._pick_directory_for_var(self.group_upload_source_dir_var)).pack()
+
+        source_row4 = ctk.CTkFrame(source, fg_color="transparent")
+        source_row4.pack(fill="x", padx=14, pady=(0, 12))
+        self._labeled_entry(source_row4, "现成缩略图文件夹", self.group_upload_thumb_dir_var, placeholder="可选，不填就走自动处理", expand=True)
+        choose_thumb = ctk.CTkFrame(source_row4, fg_color="transparent")
+        choose_thumb.pack(side="left", pady=(20, 0))
+        ctk.CTkButton(choose_thumb, text="选择缩略图目录", width=120, fg_color="#334155", command=lambda: self._pick_directory_for_var(self.group_upload_thumb_dir_var)).pack()
 
         planner = self._section_card(
             scroll,
             "步骤 2：今天哪些窗口要上传",
-            "先选三种范围模式之一。单窗口也走这里，只要填一个窗口号即可。逐窗口模式支持按行写覆盖规则。",
+            "现在只保留一个“逐窗口任务区”。你直接选分组、点窗口加号，系统会自动把窗口写进任务区；单分组和多分组都走同一个输入区。",
         )
-        mode_row = ctk.CTkFrame(planner, fg_color="transparent")
-        mode_row.pack(fill="x", padx=14, pady=(0, 8))
-        ctk.CTkRadioButton(mode_row, text="同一分组的一批窗口", variable=self.window_scope_mode_var, value=SCOPE_SAME_GROUP).pack(side="left", padx=(0, 18))
-        ctk.CTkRadioButton(mode_row, text="多个分组，各自列窗口", variable=self.window_scope_mode_var, value=SCOPE_MULTI_GROUP).pack(side="left", padx=(0, 18))
-        ctk.CTkRadioButton(mode_row, text="逐窗口单独配置", variable=self.window_scope_mode_var, value=SCOPE_MANUAL).pack(side="left")
-
-        same_row = ctk.CTkFrame(planner, fg_color="transparent")
-        same_row.pack(fill="x", padx=14, pady=(0, 8))
-        self._labeled_entry(
-            same_row,
-            "同组窗口号",
-            self.same_group_serials_var,
-            width=360,
-            placeholder="90,91,92",
+        picker_row = ctk.CTkFrame(planner, fg_color="transparent")
+        picker_row.pack(fill="x", padx=14, pady=(0, 8))
+        self.upload_picker_tag_menu = self._labeled_option(
+            picker_row,
+            "当前挑选分组",
+            self.upload_picker_tag_var,
+            ["加载中..."],
+            width=220,
+            command=lambda _: self._refresh_upload_window_buttons(),
         )
+        ctk.CTkButton(picker_row, text="加入本组全部窗口", width=130, fg_color="#334155", command=self._append_picker_group_windows).pack(side="left", padx=(0, 8), pady=(20, 0))
+        ctk.CTkButton(picker_row, text="移除本组窗口", width=130, fg_color="#475569", command=self._remove_picker_group_windows).pack(side="left", padx=(0, 8), pady=(20, 0))
+        ctk.CTkButton(picker_row, text="刷新窗口按钮", width=120, fg_color="#475569", command=self._refresh_upload_window_buttons).pack(side="left", pady=(20, 0))
 
-        multi_card = ctk.CTkFrame(planner, fg_color="transparent")
-        multi_card.pack(fill="x", padx=14, pady=(0, 8))
-        ctk.CTkLabel(multi_card, text="多分组输入区", text_color="#9aa0aa").pack(anchor="w", pady=(0, 4))
-        self.multi_group_plan_box = ctk.CTkTextbox(multi_card, height=90)
-        self.multi_group_plan_box.pack(fill="x")
-        self.multi_group_plan_box.bind("<KeyRelease>", lambda *_: self._preview_window_plan(show_error=False))
-        if self.ui_state.get("multi_group_plan_text"):
-            self.multi_group_plan_box.insert("1.0", self.ui_state["multi_group_plan_text"])
+        picker_help = ctk.CTkFrame(planner, fg_color="transparent")
+        picker_help.pack(fill="x", padx=14, pady=(0, 8))
+        self._labeled_option(picker_help, "加入窗口时 YPP", self.upload_window_ypp_override_var, BOOL_OVERRIDE_VALUES, width=120)
+        self._labeled_entry(picker_help, "自定义标题", self.upload_window_title_override_var, width=220, placeholder="可留空")
+        self._labeled_option(picker_help, "可见性覆盖", self.upload_window_visibility_override_var, ["", *GROUP_UPLOAD_VISIBILITY_VALUES], width=140)
+        self._labeled_option(picker_help, "分类覆盖", self.upload_window_category_override_var, ["", *GROUP_UPLOAD_CATEGORY_VALUES], width=170)
+        self._labeled_option(picker_help, "儿童内容覆盖", self.upload_window_made_for_kids_override_var, BOOL_OVERRIDE_VALUES, width=130)
+        self._labeled_option(picker_help, "AI内容覆盖", self.upload_window_altered_content_override_var, BOOL_OVERRIDE_VALUES, width=130)
+
+        self.upload_window_buttons_frame = ctk.CTkScrollableFrame(planner, height=180, fg_color="#10151d")
+        self.upload_window_buttons_frame.pack(fill="both", expand=True, padx=14, pady=(0, 8))
 
         manual_card = ctk.CTkFrame(planner, fg_color="transparent")
         manual_card.pack(fill="x", padx=14, pady=(0, 8))
-        ctk.CTkLabel(manual_card, text="逐窗口覆盖输入区", text_color="#9aa0aa").pack(anchor="w", pady=(0, 4))
-        self.manual_window_plan_box = ctk.CTkTextbox(manual_card, height=120)
+        ctk.CTkLabel(manual_card, text="逐窗口任务区（唯一输入区）", text_color="#9aa0aa").pack(anchor="w", pady=(0, 4))
+        self.manual_window_plan_box = ctk.CTkTextbox(manual_card, height=150)
         self.manual_window_plan_box.pack(fill="x")
-        self.manual_window_plan_box.bind("<KeyRelease>", lambda *_: self._preview_window_plan(show_error=False))
+        self.manual_window_plan_box.bind("<KeyRelease>", lambda *_: (self._preview_window_plan(show_error=False), self._refresh_upload_window_buttons()))
         if self.ui_state.get("manual_window_plan_text"):
             self.manual_window_plan_box.insert("1.0", self.ui_state["manual_window_plan_text"])
-
+        self.multi_group_plan_box = None
         tips = (
-            "多分组格式:\n"
-            "面壁者: 90,91\n"
-            "芝加哥蓝调: 94,95\n\n"
-            "逐窗口格式:\n"
+            "任务区格式示例:\n"
             "90 | 面壁者\n"
             "91 | 面壁者 | visibility=private | category=Music\n"
-            "95 | 芝加哥蓝调 | title=自定义标题 | altered_content=true"
+            "95 | 芝加哥蓝调 | is_ypp=true | title=自定义标题 | altered_content=true"
         )
         ctk.CTkLabel(planner, text=tips, text_color="#9aa0aa", justify="left").pack(anchor="w", padx=14, pady=(0, 12))
 
@@ -760,35 +945,36 @@ class CommandCenterApp(ctk.CTk):
         default_row2.pack(fill="x", padx=14, pady=(0, 10))
         self._labeled_entry(default_row2, "开始时间", self.group_upload_schedule_start_var, width=220, placeholder="2026-03-13 21:00")
         self._labeled_entry(default_row2, "间隔(分钟)", self.group_upload_schedule_interval_var, width=120, placeholder="60")
-        ctk.CTkButton(default_row2, text="打开提示词页", width=120, fg_color="#334155", command=lambda: self.tabs.set("提示词")).pack(side="left", padx=(0, 8), pady=(20, 0))
-        ctk.CTkButton(default_row2, text="打开当日内容页", width=120, fg_color="#334155", command=lambda: self.tabs.set("当日内容")).pack(side="left", padx=(0, 8), pady=(20, 0))
 
         preview = self._section_card(
             scroll,
             "步骤 4：预览并执行",
-            "先点预览，确认今天到底会上传哪些窗口。确认无误后，再开始“按窗口任务上传”。",
+            "先点预览，确认今天到底会上传哪些窗口、走哪种来源，再开始正式上传。",
         )
         action_row = ctk.CTkFrame(preview, fg_color="transparent")
         action_row.pack(fill="x", padx=14, pady=(0, 10))
-        ctk.CTkButton(action_row, text="预览今日窗口任务", width=150, fg_color="#334155", command=self._preview_window_plan).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(action_row, text="开始按窗口任务上传", width=170, command=self._run_window_plan_upload).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(action_row, text="预览今日上传计划", width=150, fg_color="#334155", command=self._preview_current_upload_plan).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(action_row, text="开始上传", width=170, command=self._run_selected_upload_mode).pack(side="left", padx=(0, 8))
         ctk.CTkButton(action_row, text="打开上传记录目录", width=140, fg_color="#475569", command=lambda: open_folder(str(SCRIPT_DIR / "upload_records"))).pack(side="left", padx=(0, 8))
         ctk.CTkButton(action_row, text="打开计划文件目录", width=140, fg_color="#475569", command=lambda: open_folder(str(self._window_plan_path().parent))).pack(side="left")
 
-        self.window_plan_preview_box = ctk.CTkTextbox(preview, height=220)
+        self.window_plan_preview_box = ctk.CTkTextbox(preview, height=240)
         self.window_plan_preview_box.pack(fill="both", expand=True, padx=14, pady=(0, 8))
         ctk.CTkLabel(preview, textvariable=self.window_plan_status_var, text_color="#a3e635").pack(anchor="w", padx=14, pady=(0, 12))
 
         legacy = self._section_card(
             scroll,
-            "附：旧入口保留",
-            "如果你今天只是重传一个频道，或者还是想沿用旧的多赛道 / 同分组现成视频入口，可以从这里走。",
+            "附：兼容入口保留",
+            "旧版单频道 / 多赛道 / 分组批量入口先保留在下面，日常优先用上面这套统一上传页。",
         )
         legacy_row = ctk.CTkFrame(legacy, fg_color="transparent")
         legacy_row.pack(fill="x", padx=14, pady=(0, 10))
         ctk.CTkButton(legacy_row, text="开始单频道上传", width=150, fg_color="#475569", command=self._run_upload_only).pack(side="left", padx=(0, 8))
         ctk.CTkButton(legacy_row, text="按多赛道任务清单上传", width=170, fg_color="#334155", command=self._run_bulk_upload).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(legacy_row, text="打开同分组现成视频页", width=170, fg_color="#475569", command=lambda: self.tabs.set("分组批量上传")).pack(side="left")
+        ctk.CTkButton(legacy_row, text="打开旧版现成视频页", width=170, fg_color="#475569", command=lambda: self.tabs.set("分组批量上传")).pack(side="left")
+
+        self.window_scope_mode_var.set(SCOPE_MANUAL)
+        self._refresh_upload_window_buttons()
 
     def _build_group_upload_tab(self, parent) -> None:
         scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent")
@@ -1419,8 +1605,9 @@ class CommandCenterApp(ctk.CTk):
         default_tag = self.upload_tag_var.get().strip() or self.tag_var.get().strip()
         if default_tag == "全部标签":
             default_tag = ""
+        scope_mode = SCOPE_MANUAL if self._textbox_get(self.manual_window_plan_box) else (self.window_scope_mode_var.get().strip() or SCOPE_SAME_GROUP)
         plan = build_window_upload_plan(
-            scope_mode=self.window_scope_mode_var.get().strip() or SCOPE_SAME_GROUP,
+            scope_mode=scope_mode,
             default_tag=default_tag,
             same_group_serials_text=self.same_group_serials_var.get().strip(),
             multi_group_text=self._textbox_get(self.multi_group_plan_box),
@@ -1478,6 +1665,100 @@ class CommandCenterApp(ctk.CTk):
         if not tags:
             raise ValueError("当前窗口任务没有解析出任何分组。")
         return plan, plan_path, tags, skip_channels
+
+    def _preview_ready_folder_upload_plan(self) -> dict:
+        plan, _plan_path, _tags, _skip_channels = self._prepare_window_plan_for_run()
+        source_dir = self.group_upload_source_dir_var.get().strip()
+        if not source_dir:
+            raise ValueError("请先填写现成视频文件夹")
+        prepared = prepare_window_task_upload_batch(
+            script_dir=SCRIPT_DIR,
+            scheduler_config_path=SCHEDULER_CONFIG_FILE,
+            prompt_studio_path=PROMPT_STUDIO_FILE,
+            channel_mapping_path=CHANNEL_MAPPING_FILE,
+            window_plan=plan,
+            date_value=self.date_var.get().strip(),
+            source_video_dir=Path(source_dir),
+            thumbnail_dir=Path(self.group_upload_thumb_dir_var.get().strip()) if self.group_upload_thumb_dir_var.get().strip() else None,
+            metadata_mode=self.upload_metadata_mode_var.get().strip() or "prompt_api",
+            fill_title_desc_tags=bool(self.upload_fill_text_var.get()),
+            fill_thumbnails=bool(self.upload_fill_thumbnails_var.get()),
+            sync_daily_content=bool(self.upload_sync_daily_content_var.get()),
+        )
+        lines = [
+            f"来源: 现成视频文件夹",
+            f"tags: {', '.join(prepared.get('tags', []))}",
+            f"assigned: {prepared.get('assigned_count', 0)}",
+            "",
+            *prepared.get("preview_lines", []),
+        ]
+        manifest_paths = prepared.get("manifest_paths", {})
+        if manifest_paths:
+            lines.extend(["", "manifest:"])
+            lines.extend(f"- {tag}: {path}" for tag, path in manifest_paths.items())
+        warnings = prepared.get("warnings", [])
+        if warnings:
+            lines.extend(["", "warnings:"])
+            lines.extend(f"- {item}" for item in warnings)
+        self._textbox_set(self.window_plan_preview_box, "\n".join(lines).strip())
+        self.window_plan_status_var.set(f"已准备现成视频上传计划：{prepared.get('assigned_count', 0)} 个窗口")
+        return prepared
+
+    def _preview_current_upload_plan(self) -> None:
+        try:
+            if self._current_upload_entry_mode() == "group_folder":
+                self._preview_ready_folder_upload_plan()
+            else:
+                self._preview_window_plan()
+        except Exception as e:
+            messagebox.showerror("预览失败", str(e))
+
+    def _build_ready_folder_upload_cmd(self) -> list[str]:
+        _plan, plan_path, tags, _skip_channels = self._prepare_window_plan_for_run()
+        source_dir = self.group_upload_source_dir_var.get().strip()
+        if not source_dir:
+            raise ValueError("请先填写现成视频文件夹")
+        primary_tag = tags[0] if tags else (self.upload_tag_var.get().strip() or self.tag_var.get().strip())
+        args = [
+            sys.executable,
+            str(GROUP_UPLOAD_SCRIPT),
+            "--tag",
+            primary_tag,
+            "--date",
+            normalize_mmdd(self.date_var.get()),
+            "--source-dir",
+            source_dir,
+            "--window-plan-file",
+            str(plan_path),
+            "--metadata-mode",
+            self.upload_metadata_mode_var.get().strip() or "prompt_api",
+            "--auto-confirm",
+        ]
+        if self.group_upload_thumb_dir_var.get().strip():
+            args.extend(["--thumb-dir", self.group_upload_thumb_dir_var.get().strip()])
+        if self.upload_fill_text_var.get():
+            args.append("--fill-text")
+        else:
+            args.append("--no-fill-text")
+        if self.upload_fill_thumbnails_var.get():
+            args.append("--fill-thumbnails")
+        else:
+            args.append("--no-fill-thumbnails")
+        if self.upload_sync_daily_content_var.get():
+            args.append("--sync-daily-content")
+        else:
+            args.append("--no-sync-daily-content")
+        if self.auto_close_browser_var.get():
+            args.append("--auto-close-browser")
+        return args
+
+    def _run_ready_folder_upload(self) -> None:
+        try:
+            cmd = self._build_ready_folder_upload_cmd()
+        except Exception as e:
+            messagebox.showerror("参数错误", str(e))
+            return
+        self._run_process(cmd, job_name="现成视频批量上传")
 
     def _save_group_upload_settings(self) -> None:
         settings = self._collect_group_upload_settings()
@@ -1601,6 +1882,8 @@ class CommandCenterApp(ctk.CTk):
         values = ["全部标签", *tags] if tags else ["全部标签"]
         self.tag_menu.configure(values=values)
         self.upload_tag_menu.configure(values=tags or [""])
+        if self.upload_picker_tag_menu is not None:
+            self.upload_picker_tag_menu.configure(values=tags or [""])
         if hasattr(self, "generation_tag_menu") and self.generation_tag_menu is not None:
             self.generation_tag_menu.configure(values=tags or [""])
         if hasattr(self, "prompt_tag_menu") and self.prompt_tag_menu is not None:
@@ -1617,17 +1900,22 @@ class CommandCenterApp(ctk.CTk):
             self.prompt_tag_var.set(self.tag_var.get() if self.tag_var.get() != "全部标签" else (tags[0] if tags else ""))
         if self.group_upload_tag_var.get() not in (tags or [""]):
             self.group_upload_tag_var.set(self.upload_tag_var.get() or (tags[0] if tags else ""))
+        if self.upload_picker_tag_var.get() not in (tags or [""]):
+            self.upload_picker_tag_var.set(self.upload_tag_var.get() or (tags[0] if tags else ""))
         self._sync_upload_channels()
         self._sync_generation_channels()
+        self._refresh_upload_window_buttons()
 
     def _sync_tag_to_upload(self) -> None:
         if self.tag_var.get() and self.tag_var.get() != "全部标签":
             self.upload_tag_var.set(self.tag_var.get())
+            self.upload_picker_tag_var.set(self.tag_var.get())
             self.generation_tag_var.set(self.tag_var.get())
             self.prompt_tag_var.set(self.tag_var.get())
             self.group_upload_tag_var.set(self.tag_var.get())
             self._sync_upload_channels()
             self._sync_generation_channels()
+            self._refresh_upload_window_buttons()
 
     def _sync_upload_channels(self) -> None:
         tag = self.upload_tag_var.get().strip()
@@ -1636,6 +1924,9 @@ class CommandCenterApp(ctk.CTk):
         self.channel_menu.configure(values=channels or [""])
         if self.channel_var.get() not in channels:
             self.channel_var.set(channels[0] if channels else "")
+        if not self.upload_picker_tag_var.get().strip():
+            self.upload_picker_tag_var.set(tag)
+        self._refresh_upload_window_buttons()
 
     def _sync_generation_channels(self) -> None:
         tag = self.generation_tag_var.get().strip()
@@ -1661,104 +1952,55 @@ class CommandCenterApp(ctk.CTk):
         self._refresh_batch_path_preview()
 
     def _handle_quick_mode_change(self, *_args) -> None:
+        self._sync_task_mode_to_module_flags(initial=True)
         self._preview_window_plan(show_error=False)
+        self._refresh_upload_window_buttons()
         self._refresh_quick_upload_mode_summary()
 
     def _current_upload_entry_mode(self) -> str:
-        mode = normalize_upload_entry_mode(self.upload_entry_mode_var.get())
-        if mode != self.upload_entry_mode_var.get():
-            self.upload_entry_mode_var.set(mode)
-        return mode
+        source_mode = str(self.upload_source_mode_var.get() or "render_output").strip()
+        normalized = "group_folder" if source_mode == "ready_folder" else "window_plan"
+        if normalized != self.upload_entry_mode_var.get():
+            self.upload_entry_mode_var.set(normalized)
+        return normalized
 
     def _upload_mode_label(self, mode: str | None = None) -> str:
         return UPLOAD_ENTRY_MODE_LABELS.get(mode or self._current_upload_entry_mode(), "单频道上传")
 
     def _open_active_upload_settings_tab(self) -> None:
-        mode = self._current_upload_entry_mode()
-        self.tabs.set(UPLOAD_ENTRY_MODE_TABS.get(mode, "上传"))
+        self.tabs.set("上传")
 
     def _run_selected_upload_mode(self) -> None:
-        mode = self._current_upload_entry_mode()
-        handlers = {
-            "window_plan": self._run_window_plan_upload,
-            "single_channel": self._run_upload_only,
-            "batch_tags": self._run_bulk_upload,
-            "group_folder": self._run_group_upload,
-        }
-        handlers.get(mode, self._run_window_plan_upload)()
+        if self._current_upload_entry_mode() == "group_folder":
+            self._run_ready_folder_upload()
+            return
+        self._run_window_plan_upload()
 
     def _refresh_quick_upload_mode_summary(self) -> None:
-        mode = self._current_upload_entry_mode()
-        label = self._upload_mode_label(mode)
-
-        if self.render_enabled_var.get() and not self.auto_upload_var.get():
-            self.quick_upload_mode_status_var.set(
-                f"当前流程：只渲染，不上传。\n上传方式预选：{label}。等你重新打开“上传模块”后，这个模式会继续生效。"
-            )
-            return
-
-        if not self.render_enabled_var.get() and not self.auto_upload_var.get():
-            self.quick_upload_mode_status_var.set("当前流程：未启用任何模块。至少打开“渲染模块”或“上传模块”。")
-            return
-
-        if mode == "window_plan":
-            scope_label = self._scope_mode_label()
-            try:
-                plan = self._build_window_plan()
-                groups = plan.get("groups", {})
-                task_count = len(plan.get("tasks", []))
-                if len(groups) <= 2:
-                    group_text = "；".join(f"{tag}: {', '.join(str(x) for x in serials)}" for tag, serials in groups.items())
-                else:
-                    group_text = f"{len(groups)} 个分组 / {task_count} 个窗口"
-                prefix = "渲染完成后会按窗口计划继续上传" if self.render_enabled_var.get() else "当前会直接按窗口计划上传"
-                self.quick_upload_mode_status_var.set(
-                    f"当前上传方式：{label}\n{prefix}\n范围模式：{scope_label}\n任务概览：{group_text or '未设置'}"
-                )
-            except Exception as e:
-                self.quick_upload_mode_status_var.set(
-                    f"当前上传方式：{label}\n范围模式：{scope_label}\n窗口计划未完成：{e}\n先到“上传”页把窗口任务填好。"
-                )
-            return
-
-        if mode == "single_channel":
-            tag = self.upload_tag_var.get().strip() or "未选择分组"
-            channel = self.channel_var.get().strip() or "未选择频道"
-            prefix = "渲染当前 tag 后会继续" if self.render_enabled_var.get() else "当前会直接"
-            self.quick_upload_mode_status_var.set(
-                f"当前上传方式：{label}\n{prefix}上传到 {tag} / 频道 {channel}。\n详细频道选择在“上传”页里调整。"
-            )
-            return
-
-        if mode == "batch_tags":
-            tags = self._effective_tags()
-            if tags:
-                if len(tags) <= 3:
-                    tag_text = "、".join(tags)
-                else:
-                    tag_text = f"{'、'.join(tags[:3])} 等 {len(tags)} 个赛道"
+        task_mode = self._task_mode_label()
+        source_mode = "现成视频文件夹" if self._current_upload_entry_mode() == "group_folder" else "渲染产物目录"
+        metadata_mode = "提示词/API" if self.upload_metadata_mode_var.get().strip() == "prompt_api" else "当日内容"
+        try:
+            plan = self._build_window_plan()
+            groups = plan.get("groups", {})
+            task_count = len(plan.get("tasks", []))
+            if len(groups) <= 2:
+                group_text = "；".join(f"{tag}: {', '.join(str(x) for x in serials)}" for tag, serials in groups.items())
             else:
-                tag_text = "还没填写多赛道任务清单"
-            prefix = "渲染完成后会按任务清单继续上传" if self.render_enabled_var.get() else "当前会直接按任务清单上传"
-            self.quick_upload_mode_status_var.set(
-                f"当前上传方式：{label}\n{prefix}。\n任务范围：{tag_text}。"
-            )
-            return
+                group_text = f"{len(groups)} 个分组 / {task_count} 个窗口"
+        except Exception as e:
+            group_text = f"窗口任务未完成：{e}"
 
-        tag = self.group_upload_tag_var.get().strip() or "未选择分组"
-        source_dir = self.group_upload_source_dir_var.get().strip() or "未设置现成视频目录"
-        serials = self.group_upload_serials_var.get().strip() or "使用该分组全部频道"
-        if self.render_enabled_var.get():
-            self.quick_upload_mode_status_var.set(
-                "当前上传方式：同分组现成视频\n这条链路只适合上传现成视频，不参与渲染。\n请关闭“启用渲染模块”，或把上传方式改成“单频道上传 / 多赛道任务清单”。"
-            )
-            return
-        schedule_text = "关闭"
-        if self.group_upload_schedule_enabled_var.get():
-            schedule_text = self.group_upload_schedule_start_var.get().strip() or "已开启，但还没填写开始时间"
-        self.quick_upload_mode_status_var.set(
-            f"当前上传方式：{label}\n分组：{tag}\n视频目录：{source_dir}\n频道范围：{serials}\n定时发布：{schedule_text}"
-        )
+        extra_lines = [f"本次任务：{task_mode}", f"上传来源：{source_mode}", f"文案来源：{metadata_mode}", f"窗口概览：{group_text}"]
+        if self._current_upload_entry_mode() == "group_folder":
+            extra_lines.append(f"现成视频目录：{self.group_upload_source_dir_var.get().strip() or '未设置'}")
+        if self.today_task_mode_var.get() == "render_only":
+            extra_lines.append("当前只会执行剪辑，不会执行上传。")
+        elif self.today_task_mode_var.get() == "upload_only":
+            extra_lines.append("当前只会执行上传，不会重新剪辑。")
+        else:
+            extra_lines.append("当前会先剪辑，再按上传页里的窗口任务继续上传。")
+        self.quick_upload_mode_status_var.set("\n".join(extra_lines))
 
     def _parse_tag_lines(self, raw: str) -> list[str]:
         seen = set()
@@ -1808,6 +2050,7 @@ class CommandCenterApp(ctk.CTk):
     def _primary_tag(self) -> str:
         for candidate in (
             self.upload_tag_var.get().strip(),
+            self.upload_picker_tag_var.get().strip(),
             self.tag_var.get().strip(),
             self.group_upload_tag_var.get().strip(),
         ):
@@ -2044,12 +2287,25 @@ class CommandCenterApp(ctk.CTk):
             "prompt_tag": self.prompt_tag_var.get(),
             "batch_tags_text": self._textbox_get(self.batch_tags_box),
             "upload_entry_mode": self._current_upload_entry_mode(),
+            "today_task_mode": self.today_task_mode_var.get(),
+            "upload_source_mode": self.upload_source_mode_var.get(),
+            "upload_metadata_mode": self.upload_metadata_mode_var.get(),
+            "upload_fill_text": bool(self.upload_fill_text_var.get()),
+            "upload_fill_thumbnails": bool(self.upload_fill_thumbnails_var.get()),
+            "upload_sync_daily_content": bool(self.upload_sync_daily_content_var.get()),
             "song_count": self.song_count_var.get(),
             "channel": self.channel_var.get(),
             "window_scope_mode": self.window_scope_mode_var.get(),
             "same_group_serials_text": self.same_group_serials_var.get(),
             "multi_group_plan_text": self._textbox_get(self.multi_group_plan_box),
             "manual_window_plan_text": self._textbox_get(self.manual_window_plan_box),
+            "upload_picker_tag": self.upload_picker_tag_var.get(),
+            "upload_window_ypp_override": self.upload_window_ypp_override_var.get(),
+            "upload_window_title_override": self.upload_window_title_override_var.get(),
+            "upload_window_visibility_override": self.upload_window_visibility_override_var.get(),
+            "upload_window_category_override": self.upload_window_category_override_var.get(),
+            "upload_window_made_for_kids_override": self.upload_window_made_for_kids_override_var.get(),
+            "upload_window_altered_content_override": self.upload_window_altered_content_override_var.get(),
             "audio_workers": int(self.audio_workers_var.get()),
             "video_workers": int(self.video_workers_var.get()),
             "render_enabled": bool(self.render_enabled_var.get()),

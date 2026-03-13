@@ -61,6 +61,9 @@ def _normalize_override(task: dict[str, Any], key: str, value: str) -> None:
     if key in {"made_for_kids", "altered_content"}:
         task[key] = _parse_bool(value)
         return
+    if key in {"is_ypp", "ypp"}:
+        task["is_ypp"] = _parse_bool(value)
+        return
     if key in {"tag_list", "tags"}:
         task["tag_list"] = _parse_tags(value)
         return
@@ -88,6 +91,7 @@ def _finalize_task(task: dict[str, Any], index: int) -> dict[str, Any]:
         "tag_list",
         "thumbnails",
         "ab_titles",
+        "is_ypp",
         "visibility",
         "category",
         "made_for_kids",
@@ -304,7 +308,7 @@ def merge_manifest_with_window_task(
         upload_options.setdefault(key, value)
 
     if task:
-        for key in ("title", "description", "channel_name", "tag_list", "thumbnails", "ab_titles"):
+        for key in ("title", "description", "channel_name", "tag_list", "thumbnails", "ab_titles", "is_ypp"):
             if key in task:
                 merged[key] = task[key]
         for key in UPLOAD_OPTION_KEYS:
