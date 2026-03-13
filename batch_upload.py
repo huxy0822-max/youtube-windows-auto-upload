@@ -24,6 +24,11 @@ import platform
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 from browser_api import list_browser_envs, start_browser_debug_port, stop_browser_container
 from path_helpers import resolve_config_file
+from upload_window_planner import (
+    find_window_task,
+    load_window_upload_plan,
+    merge_manifest_with_window_task,
+)
 
 # ============ 平台检测 ============
 IS_WINDOWS = platform.system() == "Windows"
@@ -5354,7 +5359,8 @@ async def batch_upload(
     skip_channels: Optional[List[int]] = None,
     max_open_windows: int = 10,
     window_ttl_hours: float = 2.0,
-    active_success_windows: Optional[List[Dict]] = None
+    active_success_windows: Optional[List[Dict]] = None,
+    window_plan: Optional[Dict[str, Any]] = None,
 ):
     """批量上传指定标签组的视频"""
     date_key = normalize_date_mmdd(date)
@@ -5458,6 +5464,10 @@ async def batch_upload(
             manifest_data = None
     else:
         log(f"ℹ️ 无 manifest 文件，使用实时 metadata 模式")
+
+    plan_default_options = {}
+    if isinstance(window_plan, dict):
+        plan_default_options = window_plan.get("default_upload_options", {}) or {}
     
     # 获取项目文件夹
     # 解析元数据（仅在无 manifest 时使用）
@@ -5493,6 +5503,11 @@ async def batch_upload(
 
             if manifest_data and str(serial) in manifest_data.get("channels", {}):
                 ch_manifest = manifest_data["channels"][str(serial)]
+                ch_manifest = merge_manifest_with_window_task(
+                    ch_manifest,
+                    find_window_task(window_plan, tag, serial),
+                    default_upload_options=plan_default_options,
+                )
                 thumbnails = [Path(p) for p in ch_manifest.get("thumbnails", []) if Path(p).exists()]
                 title = ch_manifest.get("title", "默认")
                 channel_name = ch_manifest.get("channel_name") or serial_to_channel_name.get(serial, "未知")
@@ -5630,6 +5645,11 @@ async def batch_upload(
         # ========== Manifest 模式: 直接读取冻结数据 ==========
         if manifest_data and str(serial) in manifest_data.get("channels", {}):
             ch_manifest = manifest_data["channels"][str(serial)]
+            ch_manifest = merge_manifest_with_window_task(
+                ch_manifest,
+                find_window_task(window_plan, tag, serial),
+                default_upload_options=plan_default_options,
+            )
             title = ch_manifest.get("title", "Video Title")
             description = ch_manifest.get("description", "")
             tag_list = [str(item).strip() for item in ch_manifest.get("tag_list", []) if str(item).strip()]
@@ -5873,13 +5893,14 @@ def parse_arguments():
     parser.add_argument("--auto-confirm", action="store_true", help="免交互自动确认")
     parser.add_argument("--auto-close-browser", action="store_true", help="每个频道上传后自动关闭容器浏览器")
     parser.add_argument("--skip-channels", type=str, default="", help="跳过指定频道序号，逗号分隔 (如: 17,26,30)")
+    parser.add_argument("--window-plan-file", type=str, default="", help="窗口任务计划 JSON 文件路径")
     parser.add_argument("--max-open-windows", type=int, default=10, help="成功发布后保留的最大窗口数 (默认: 10)")
     parser.add_argument("--window-ttl-hours", type=float, default=2.0, help="成功发布后窗口保留时长(小时) (默认: 2)")
     parser.add_argument("--pair-size", type=int, default=2, help="每组配令人数 (默认: 2)")
     parser.add_argument("--wait-hours", type=float, default=2.0, help="每组之间的等待时间(小时) (默认: 2.0)")
     return parser.parse_args()
 
-def _run_auto_mode(args, config):
+def _run_auto_mode(args, config, window_plan=None):
     print("🔍 自动扫描 AutoTask 文件夹...")
     
     grouped = auto_detect_videos(config)
@@ -5950,6 +5971,7 @@ def _run_auto_mode(args, config):
                         max_open_windows=args.max_open_windows,
                         window_ttl_hours=args.window_ttl_hours,
                         active_success_windows=active_success_windows,
+                        window_plan=window_plan,
                     )
                 )
                 if result and result.get("failed_count", 0) > 0:
@@ -5978,7 +6000,7 @@ def _run_auto_mode(args, config):
     print(f"{'='*60}")
     return 1 if had_failures else 0
 
-def _run_traditional_mode(args, config):
+def _run_traditional_mode(args, config, window_plan=None):
     tags = []
     
     if args.channel and not args.tag:
@@ -6040,6 +6062,7 @@ def _run_traditional_mode(args, config):
                 max_open_windows=args.max_open_windows,
                 window_ttl_hours=args.window_ttl_hours,
                 active_success_windows=active_success_windows,
+                window_plan=window_plan,
             )
         )
         if result and result.get("failed_count", 0) > 0:
@@ -6057,11 +6080,17 @@ def main():
     print("=" * 60 + "\n")
     
     config = load_config()
+    window_plan = load_window_upload_plan(args.window_plan_file)
+    if args.window_plan_file:
+        if window_plan:
+            print(f"📋 已加载窗口任务计划: {args.window_plan_file}")
+        else:
+            print(f"⚠️ 窗口任务计划加载失败或不存在: {args.window_plan_file}")
     
     if args.auto or (not args.tag and not args.date and not args.channel):
-        exit_code = _run_auto_mode(args, config)
+        exit_code = _run_auto_mode(args, config, window_plan=window_plan)
     else:
-        exit_code = _run_traditional_mode(args, config)
+        exit_code = _run_traditional_mode(args, config, window_plan=window_plan)
     sys.exit(exit_code)
 
 if __name__ == "__main__":

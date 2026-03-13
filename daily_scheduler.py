@@ -634,6 +634,7 @@ class RenderOptions:
     selected_tags: list[str] | None = None
     upload_auto_close_browser: bool = True
     upload_skip_channels: list[int] | None = None
+    upload_window_plan_file: str = ""
     fx_randomize: bool = False
     fx_spectrum: bool = True
     fx_timeline: bool = True
@@ -712,6 +713,8 @@ def parse_arguments() -> RenderOptions:
         elif arg.startswith('--skip-channels='):
             raw = arg.split('=', 1)[1]
             opts.upload_skip_channels = [int(x.strip()) for x in re.split(r'[，,]', raw) if x.strip().isdigit()]
+        elif arg.startswith('--window-plan-file='):
+            opts.upload_window_plan_file = arg.split('=', 1)[1].strip()
         elif arg == '--simple':  pass
         elif arg == '--render-only': opts.render_only = True
         elif arg == '--keep-upload-browser-open': opts.upload_auto_close_browser = False
@@ -1057,6 +1060,8 @@ def phase3_render_and_upload(active_projects: list, master_map: dict, opts: Rend
                     upload_cmd.append("--auto-close-browser")
                 if opts.upload_skip_channels:
                     upload_cmd.append("--skip-channels=" + ",".join(str(x) for x in opts.upload_skip_channels))
+                if opts.upload_window_plan_file:
+                    upload_cmd.append("--window-plan-file=" + opts.upload_window_plan_file)
                 upload_proc = subprocess.Popen(
                     upload_cmd,
                     stdout=log_f,
