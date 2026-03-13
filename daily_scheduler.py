@@ -634,6 +634,7 @@ class RenderOptions:
     selected_tags: list[str] | None = None
     upload_auto_close_browser: bool = True
     upload_skip_channels: list[int] | None = None
+    fx_randomize: bool = False
     fx_spectrum: bool = True
     fx_timeline: bool = True
     fx_letterbox: bool | str = False
@@ -667,6 +668,8 @@ def parse_arguments() -> RenderOptions:
     for arg in sys.argv[1:]:
         if arg == '--no-spectrum':     opts.fx_spectrum = False
         elif arg == '--no-timeline':  opts.fx_timeline = False
+        elif arg == '--randomize-effects': opts.fx_randomize = True
+        elif arg == '--fixed-effects': opts.fx_randomize = False
         elif arg.startswith('--letterbox'):
             if '=' in arg:
                 val = arg.split('=')[1]
@@ -740,6 +743,66 @@ def parse_arguments() -> RenderOptions:
         opts.target_date = date_arg
         
     return opts
+
+
+def build_effect_kwargs(opts: RenderOptions) -> dict:
+    kwargs = {
+        "spectrum": opts.fx_spectrum,
+        "timeline": opts.fx_timeline,
+        "letterbox": opts.fx_letterbox,
+        "zoom": opts.fx_zoom,
+        "color_spectrum": opts.fx_color_spectrum,
+        "color_timeline": opts.fx_color_timeline,
+        "spectrum_y": opts.fx_spectrum_y,
+        "spectrum_x": opts.fx_spectrum_x,
+        "spectrum_w": opts.fx_spectrum_w,
+        "style": opts.fx_style,
+        "text": opts.fx_text,
+        "text_pos": opts.fx_text_pos,
+        "text_size": opts.fx_text_size,
+        "text_style": opts.fx_text_style,
+        "film_grain": opts.fx_film_grain,
+        "grain_strength": opts.fx_grain_strength,
+        "vignette": opts.fx_vignette,
+        "color_tint": opts.fx_color_tint,
+        "soft_focus": opts.fx_soft_focus,
+        "soft_focus_sigma": opts.fx_soft_focus_sigma,
+        "particle": opts.fx_particle,
+        "particle_opacity": opts.fx_particle_opacity,
+        "particle_speed": opts.fx_particle_speed,
+        "text_font": opts.fx_text_font,
+    }
+    if not opts.fx_randomize:
+        return kwargs
+
+    # 统一的随机视觉策略，避免不同入口渲染结果过于同质。
+    kwargs.update(
+        {
+            "spectrum": "random",
+            "timeline": "random",
+            "letterbox": "random",
+            "zoom": "random",
+            "color_spectrum": "random",
+            "color_timeline": "random",
+            "spectrum_y": random.choice([470, 500, 530, 560, 590]),
+            "spectrum_x": random.choice([-1, -1, -1, 80, 120, 160]),
+            "spectrum_w": random.choice([1080, 1200, 1320, 1440, 1600]),
+            "style": "random",
+            "film_grain": "random",
+            "grain_strength": random.randint(6, 18),
+            "vignette": "random",
+            "color_tint": "random",
+            "soft_focus": "random",
+            "soft_focus_sigma": round(random.uniform(0.8, 1.8), 2),
+            "particle": "random",
+            "particle_opacity": round(random.uniform(0.35, 0.75), 2),
+            "particle_speed": round(random.uniform(0.85, 1.15), 2),
+        }
+    )
+    if opts.fx_text:
+        kwargs["text_style"] = "random"
+        kwargs["text_size"] = random.choice([48, 56, 64, 72])
+    return kwargs
 
 def phase2_build_master_audios(active_projects: list) -> dict:
     """Phase 2: 并行母带合成"""
@@ -923,19 +986,8 @@ def phase3_render_and_upload(active_projects: list, master_map: dict, opts: Rend
             chosen_master = random.choice(valid_masters)
             master_dur = get_audio_duration(chosen_master)
             
-            filter_str, effect_desc, extra_inputs = get_effect(master_dur,
-                spectrum=opts.fx_spectrum, timeline=opts.fx_timeline,
-                letterbox=opts.fx_letterbox, zoom=opts.fx_zoom,
-                color_spectrum=opts.fx_color_spectrum, color_timeline=opts.fx_color_timeline,
-                spectrum_y=opts.fx_spectrum_y, spectrum_x=opts.fx_spectrum_x,
-                spectrum_w=opts.fx_spectrum_w, style=opts.fx_style,
-                text=opts.fx_text, text_pos=opts.fx_text_pos,
-                text_size=opts.fx_text_size, text_style=opts.fx_text_style,
-                film_grain=opts.fx_film_grain, grain_strength=opts.fx_grain_strength,
-                vignette=opts.fx_vignette, color_tint=opts.fx_color_tint,
-                soft_focus=opts.fx_soft_focus, soft_focus_sigma=opts.fx_soft_focus_sigma,
-                particle=opts.fx_particle, particle_opacity=opts.fx_particle_opacity,
-                particle_speed=opts.fx_particle_speed, text_font=opts.fx_text_font)
+            effect_kwargs = build_effect_kwargs(opts)
+            filter_str, effect_desc, extra_inputs = get_effect(master_dur, **effect_kwargs)
             
             tag_video_jobs.append({
                 "tag": tag,
@@ -1058,6 +1110,7 @@ def save_render_history(opts: RenderOptions, active_projects: list, total_render
             "audio_workers": AUDIO_WORKERS,
             "video_workers": VIDEO_WORKERS,
             "total_minutes": round(total_time / 60, 1),
+            "fx_randomize": opts.fx_randomize,
             "fx_spectrum": opts.fx_spectrum,
             "fx_timeline": opts.fx_timeline,
             "fx_letterbox": opts.fx_letterbox,
@@ -1266,9 +1319,12 @@ def main():
     
     # 显示当前设置
     print(f"🎛️  效果设置:")
-    print(f"   频谱: {'✅ 开' if opts.fx_spectrum else '❌ 关'}  |  时间轴: {'✅ 开' if opts.fx_timeline else '❌ 关'}  |  黑边: {'✅ 开' if opts.fx_letterbox else '❌ 关'}")
-    print(f"   缩放: {opts.fx_zoom}  |  频谱色: {opts.fx_color_spectrum}  |  时间轴色: {opts.fx_color_timeline}")
-    print(f"   样式: {opts.fx_style}  |  频谱Y: {opts.fx_spectrum_y}")
+    if opts.fx_randomize:
+        print("   视觉策略: 🎲 全随机（频谱 / 时间轴 / 黑边 / 缩放 / 颜色 / 粒子 / 增强效果按视频随机）")
+    else:
+        print(f"   频谱: {'✅ 开' if opts.fx_spectrum else '❌ 关'}  |  时间轴: {'✅ 开' if opts.fx_timeline else '❌ 关'}  |  黑边: {'✅ 开' if opts.fx_letterbox else '❌ 关'}")
+        print(f"   缩放: {opts.fx_zoom}  |  频谱色: {opts.fx_color_spectrum}  |  时间轴色: {opts.fx_color_timeline}")
+        print(f"   样式: {opts.fx_style}  |  频谱Y: {opts.fx_spectrum_y}")
     print(f"   可选: --color=X (同时设置两种颜色)  --color-spectrum=X  --color-timeline=X  --style=bar/wave/circular  --spectrum-y=530")
     if opts.selected_tags:
         print(f"🏷️  指定标签: {', '.join(all_tags)}")

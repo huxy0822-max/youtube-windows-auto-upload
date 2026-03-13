@@ -60,7 +60,7 @@ COLOR_MAP = {
 COLOR_DISPLAY = list(COLOR_MAP.keys())
 COLOR_REVERSE = {v: k for k, v in COLOR_MAP.items()}
 
-ZOOM_MAP = {"慢": "slow", "中": "normal", "快": "fast", "关闭": "off"}
+ZOOM_MAP = {"随机": "random", "慢": "slow", "中": "normal", "快": "fast", "关闭": "off"}
 ZOOM_DISPLAY = list(ZOOM_MAP.keys())
 ZOOM_REVERSE = {v: k for k, v in ZOOM_MAP.items()}
 
@@ -294,8 +294,8 @@ class SchedulerGUI:
                      values=COLOR_DISPLAY, width=12, state="readonly").grid(row=0, column=3, sticky="w", padx=5)
         
         # Row 2: 样式 + 缩放
-        self.style_var = tk.StringVar(value="柱状")
-        self.zoom_var = tk.StringVar(value="慢")
+        self.style_var = tk.StringVar(value="随机")
+        self.zoom_var = tk.StringVar(value="随机")
         
         tk.Label(viz_frame, text="🎨 样式:", bg=self.bg, fg=self.fg,
                  font=("SF Pro Text", 13)).grid(row=1, column=0, sticky="e", padx=5, pady=5)
@@ -403,11 +403,11 @@ class SchedulerGUI:
         row_color.pack(fill="x", pady=2)
         tk.Label(row_color, text="色调:", bg=self.bg, fg=self.fg).pack(side="left")
         
-        self.color_tint_var = tk.StringVar(value="无")
+        self.color_tint_var = tk.StringVar(value="随机")
         ttk.Combobox(row_color, textvariable=self.color_tint_var, values=list(TINT_MAP.keys()), width=8, state="readonly").pack(side="left", padx=5)
         
         tk.Label(row_color, text="粒子:", bg=self.bg, fg=self.fg).pack(side="left", padx=(10, 2))
-        self.particle_var = tk.StringVar(value="无")
+        self.particle_var = tk.StringVar(value="随机")
         ttk.Combobox(row_color, textvariable=self.particle_var, values=list(PARTICLE_MAP.keys()), width=10, state="readonly").pack(side="left", padx=5)
         
         tk.Label(row_color, text="不透明度:", bg=self.bg, fg=self.fg).pack(side="left", padx=(10, 2))
@@ -431,6 +431,12 @@ class SchedulerGUI:
         
         self.auto_upload_var = tk.BooleanVar(value=True)
         tk.Checkbutton(opt_frame, text="📤 渲染后自动上传 (Pipeline 模式)", variable=self.auto_upload_var,
+                       bg=self.bg, fg=self.fg, selectcolor=self.surface,
+                       activebackground=self.bg, activeforeground=self.green,
+                       font=("SF Pro Text", 13)).pack(anchor="w", pady=(5, 0))
+
+        self.randomize_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(opt_frame, text="🎲 全随机视觉（推荐）", variable=self.randomize_var,
                        bg=self.bg, fg=self.fg, selectcolor=self.surface,
                        activebackground=self.bg, activeforeground=self.green,
                        font=("SF Pro Text", 13)).pack(anchor="w", pady=(5, 0))
@@ -840,6 +846,8 @@ class SchedulerGUI:
             args.append("--dry-run")
         if not self.auto_upload_var.get():
             args.append("--render-only")
+        if getattr(self, "randomize_var", None) and self.randomize_var.get():
+            args.append("--randomize-effects")
         
         args.append(f"--song-count={self.song_count_var.get()}")
         return args

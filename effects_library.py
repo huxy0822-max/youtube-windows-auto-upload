@@ -87,15 +87,33 @@ def _pick_palette(name: str) -> dict:
     return PALETTES.get(name, PALETTES["WhiteGold"])
 
 
+def _pick_flag(value, *, probability_true: float = 0.5) -> bool:
+    if value == "random":
+        return random.random() < probability_true
+    return bool(value)
+
+
+def _pick_style(name: str) -> str:
+    if name == "random":
+        return random.choice(["bar", "wave", "circular", "bar_mirror"])
+    return name
+
+
 def _pick_particle(name: str) -> str:
     if name == "random":
-        return random.choice(list(PARTICLE_FILES.keys()))
+        return random.choice(["none", *list(PARTICLE_FILES.keys())])
     return name
 
 
 def _pick_tint(name: str) -> str:
     if name == "random":
-        return random.choice([key for key in TINT_FILTERS.keys() if key != "none"])
+        return random.choice(list(TINT_FILTERS.keys()))
+    return name
+
+
+def _pick_text_style(name: str) -> str:
+    if name == "random":
+        return random.choice(["Classic", "Glow", "Neon", "Bold", "Box"])
     return name
 
 
@@ -212,9 +230,16 @@ def get_effect(
     particle_opacity = max(0.0, min(_coerce_float(particle_opacity, 0.6), 1.0))
     particle_speed = max(_coerce_float(particle_speed, 1.0), 0.2)
 
-    style = "bar" if style == "random" else style
+    spectrum = _pick_flag(spectrum, probability_true=0.85)
+    timeline = _pick_flag(timeline, probability_true=0.85)
+    letterbox = _pick_flag(letterbox, probability_true=0.5)
+    film_grain = _pick_flag(film_grain, probability_true=0.6)
+    vignette = _pick_flag(vignette, probability_true=0.45)
+    soft_focus = _pick_flag(soft_focus, probability_true=0.35)
+    style = _pick_style(style)
     if zoom == "random":
-        zoom = random.choice([key for key in ZOOM_SPEEDS.keys() if key != "off"])
+        zoom = random.choice(list(ZOOM_SPEEDS.keys()))
+    text_style = _pick_text_style(text_style)
     if text_style not in {"Classic", "Glow", "Neon", "Bold", "Box"}:
         text_style = "Classic"
 

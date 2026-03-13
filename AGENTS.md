@@ -14,9 +14,10 @@ When working in this repo, follow these rules first.
 Before making changes, read files in this order:
 
 1. `README.md`
-2. `docs/实操配置与提示词说明.md`
-3. `docs/GitHub协作入门.md`
-4. the target Python file you plan to edit
+2. `docs/统一控制台说明.md`
+3. `docs/实操配置与提示词说明.md`
+4. `docs/GitHub协作入门.md`
+5. the target Python file you plan to edit
 
 If the task is about uploading, inspect these files first:
 
@@ -68,11 +69,12 @@ Respect `.gitignore`.
 
 When the user asks for help operating this repo, prefer this workflow:
 
-1. Verify config files exist and explain what fields the user must fill.
-2. Verify required local files exist for the requested task.
-3. Run the smallest realistic command for the requested workflow.
-4. If automation fails, diagnose from `batch_upload.py` or the relevant runtime logs.
-5. Update docs when the operating method changes.
+1. Prefer `dashboard.py` as the daily entry point.
+2. Verify config files exist and explain what fields the user must fill.
+3. Verify required local files exist for the requested task.
+4. Run the smallest realistic command for the requested workflow.
+5. If automation fails, diagnose from `batch_upload.py` or the relevant runtime logs.
+6. Update docs when the operating method changes.
 
 Do not jump straight to broad refactors if the user asked for an operational fix.
 
@@ -103,16 +105,23 @@ Known behavior:
 
 Use this flow for rendering help:
 
-1. Check `scheduler_config.json`.
-2. Confirm music files exist under `workspace/music/<tag>/`.
-3. Confirm base images exist under `workspace/base_image/<tag>/`.
-4. Run render-only first.
-5. Verify output under `workspace/AutoTask/`.
+1. Prefer launching `dashboard.py` or `启动统一控制台.bat`.
+2. Check `scheduler_config.json`.
+3. Confirm music files exist under `workspace/music/<tag>/`.
+4. Confirm base images exist under `workspace/base_image/<tag>/`.
+5. Run render-only first.
+6. Verify output under `workspace/AutoTask/`.
 
 Typical command:
 
 ```bash
 py -3 daily_scheduler.py --standard 0312 --tags=面壁者 --render-only --song-count=1
+```
+
+Recommended daily GUI entry:
+
+```bash
+py -3 dashboard.py
 ```
 
 ## 7. Setup notes
