@@ -263,6 +263,15 @@ def load_config() -> dict:
 def get_all_tags(config: dict) -> list:
     return list(config.get("tag_to_project", {}).keys())
 
+
+def _dir_has_direct_files(directory: Path, suffixes: tuple[str, ...]) -> bool:
+    if not directory.exists() or not directory.is_dir():
+        return False
+    for item in directory.iterdir():
+        if item.is_file() and item.suffix.lower() in suffixes and not item.name.startswith('.'):
+            return True
+    return False
+
 def find_images_by_date(tag: str, date_str: str) -> list:
     tag_dir = BASE_IMAGE_DIR / tag
     if not tag_dir.exists():
@@ -1170,6 +1179,8 @@ def phase1_scan_resources(opts: RenderOptions, all_tags: list) -> list:
     active_projects = [] # [{'tag', 'images':[], 'music':[], 'out_dir':Path}]
     target_date = opts.target_date
     simple_mode = opts.simple_mode
+    flat_image_root_hint = len(all_tags) == 1 and _dir_has_direct_files(BASE_IMAGE_DIR, ('.png', '.jpg', '.jpeg', '.mp4'))
+    flat_music_root_hint = len(all_tags) == 1 and _dir_has_direct_files(MUSIC_DIR, ('.mp3',))
     
     for i, tag in enumerate(all_tags, 1):
         if simple_mode:
@@ -1201,6 +1212,19 @@ def phase1_scan_resources(opts: RenderOptions, all_tags: list) -> list:
                 })
         
         print(f"  {i:2d}. {tag:<15s} {status_icon} {status_msg}")
+        tag_image_dir = BASE_IMAGE_DIR / tag
+        tag_music_dir = MUSIC_DIR / tag
+        if not tag_image_dir.exists() and flat_image_root_hint:
+            print(f"      ↳ 检测到底图放在根目录：{BASE_IMAGE_DIR}")
+            print(f"        当前标准模式只会扫描：{tag_image_dir}")
+        elif not simple_mode and tag_image_dir.exists() and not images:
+            raw_images = [f for f in tag_image_dir.iterdir() if f.is_file() and f.suffix.lower() in ['.png', '.jpg', '.jpeg'] and 'cover' not in f.stem.lower()]
+            if raw_images:
+                print(f"      ↳ 检测到未按日期命名的底图，例如：{raw_images[0].name}")
+                print(f"        当前标准模式要求：{target_date}_90.png / {target_date}_91.jpg 这种格式")
+        if not tag_music_dir.exists() and flat_music_root_hint:
+            print(f"      ↳ 检测到音乐放在根目录：{MUSIC_DIR}")
+            print(f"        当前会扫描：{tag_music_dir}")
         
         # ========== 库存检查 (从 base image 目录 + generation_map.json) ==========
         try:

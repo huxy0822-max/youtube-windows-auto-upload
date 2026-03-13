@@ -77,6 +77,9 @@ DASHBOARD_STATE_FILE = SCRIPT_DIR / "dashboard_state.json"
 PROMPT_STUDIO_FILE = SCRIPT_DIR / "config" / "prompt_studio.json"
 CHANNEL_MAPPING_FILE = SCRIPT_DIR / "config" / "channel_mapping.json"
 UPLOAD_BATCH_SETTINGS_FILE = SCRIPT_DIR / "config" / "upload_batch_settings.json"
+IMAGE_SOURCE_SUFFIXES = {".png", ".jpg", ".jpeg", ".mp4"}
+IMAGE_RENDER_SUFFIXES = {".png", ".jpg", ".jpeg"}
+AUDIO_SOURCE_SUFFIXES = {".mp3"}
 
 COLOR_MAP = {
     "随机": "random",
@@ -2336,6 +2339,72 @@ class CommandCenterApp(ctk.CTk):
             lines.append("")
         self._textbox_set(self.batch_path_preview_box, "\n".join(lines).strip())
 
+    def _directory_has_direct_files(self, directory: Path, suffixes: set[str]) -> bool:
+        if not directory.exists() or not directory.is_dir():
+            return False
+        for item in directory.iterdir():
+            if item.is_file() and item.suffix.lower() in suffixes and not item.name.startswith("."):
+                return True
+        return False
+
+    def _list_media_files(self, directory: Path, suffixes: set[str]) -> list[Path]:
+        if not directory.exists() or not directory.is_dir():
+            return []
+        return [
+            item
+            for item in directory.iterdir()
+            if item.is_file() and item.suffix.lower() in suffixes and not item.name.startswith(".")
+        ]
+
+    def _render_preflight_issues(self) -> list[str]:
+        tags = self._scheduler_tags_for_current_mode()
+        if not tags:
+            return []
+        date_mmdd = normalize_mmdd(self.date_var.get())
+        music_root = resolve_local_path(self.music_dir_var.get().strip() or "workspace/music")
+        image_root = resolve_local_path(self.image_dir_var.get().strip() or "workspace/base_image")
+        issues: list[str] = []
+        single_tag = len(tags) == 1
+
+        for tag in tags:
+            tag_music_dir = music_root / tag
+            tag_image_dir = image_root / tag
+
+            if not tag_music_dir.exists():
+                if single_tag and self._directory_has_direct_files(music_root, AUDIO_SOURCE_SUFFIXES):
+                    issues.append(
+                        f"音乐现在放在根目录：{music_root}\n"
+                        f"当前渲染会扫描：{tag_music_dir}\n"
+                        f"请把 mp3 移到这个子目录里。"
+                    )
+                else:
+                    issues.append(f"缺少音乐子目录：{tag_music_dir}")
+
+            if not tag_image_dir.exists():
+                if single_tag and self._directory_has_direct_files(image_root, IMAGE_RENDER_SUFFIXES):
+                    issues.append(
+                        f"底图现在放在根目录：{image_root}\n"
+                        f"当前渲染会扫描：{tag_image_dir}\n"
+                        f"请把图片移到这个子目录里。"
+                    )
+                else:
+                    issues.append(f"缺少底图子目录：{tag_image_dir}")
+                continue
+
+            image_files = [
+                item for item in self._list_media_files(tag_image_dir, IMAGE_RENDER_SUFFIXES)
+                if "cover" not in item.stem.lower()
+            ]
+            if image_files and not any(item.stem.startswith(f"{date_mmdd}_") for item in image_files):
+                sample = image_files[0].name
+                issues.append(
+                    f"{tag} 的底图文件名不符合当前标准模式。\n"
+                    f"当前示例：{sample}\n"
+                    f"标准模式要求像 {date_mmdd}_90.jpg 或 {date_mmdd}_91.png 这样带日期和窗口号。"
+                )
+
+        return issues
+
     def _build_scheduler_cmd(self, *, render_only: bool) -> list[str]:
         date_mmdd = normalize_mmdd(self.date_var.get())
         mode = self._current_upload_entry_mode()
@@ -2822,6 +2891,14 @@ class CommandCenterApp(ctk.CTk):
 
     def _run_scheduler(self, *, render_only: bool) -> None:
         try:
+            issues = self._render_preflight_issues()
+            if issues:
+                detail = "\n\n".join(issues)
+                self._append_log("[预检] 渲染前检查失败：")
+                for item in issues:
+                    self._append_log(f"[预检] {item.replace(chr(10), ' | ')}")
+                messagebox.showerror("素材路径 / 命名不匹配", detail)
+                return
             cmd = self._build_scheduler_cmd(render_only=render_only)
         except Exception as e:
             messagebox.showerror("参数错误", str(e))
