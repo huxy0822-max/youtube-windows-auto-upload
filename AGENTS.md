@@ -22,6 +22,7 @@ Before making changes, read files in this order:
 If the task is about uploading, inspect these files first:
 
 - `batch_upload.py`
+- `bulk_upload.py`
 - `browser_api.py`
 - `utils.py`
 - `config/upload_config.json`
@@ -70,11 +71,12 @@ Respect `.gitignore`.
 When the user asks for help operating this repo, prefer this workflow:
 
 1. Prefer `dashboard.py` as the daily entry point.
-2. Verify config files exist and explain what fields the user must fill.
-3. Verify required local files exist for the requested task.
-4. Run the smallest realistic command for the requested workflow.
-5. If automation fails, diagnose from `batch_upload.py` or the relevant runtime logs.
-6. Update docs when the operating method changes.
+2. If the user has multiple tags for one day, use the multi-tag task list in `dashboard.py` or `bulk_upload.py`.
+3. Verify config files exist and explain what fields the user must fill.
+4. Verify required local files exist for the requested task.
+5. Run the smallest realistic command for the requested workflow.
+6. If automation fails, diagnose from `batch_upload.py`, `bulk_upload.py`, or the relevant runtime logs.
+7. Update docs when the operating method changes.
 
 Do not jump straight to broad refactors if the user asked for an operational fix.
 
@@ -95,6 +97,12 @@ Typical command:
 py -3 batch_upload.py --tag 面壁者 --date 3.12 --channel 90 --auto-confirm --auto-close-browser
 ```
 
+For multiple tags in one day:
+
+```bash
+py -3 bulk_upload.py --date 3.12 --tags 面壁者,芝加哥蓝调 --auto-confirm --auto-close-browser
+```
+
 Known behavior:
 
 - `Altered content` should be selected as `Yes`.
@@ -106,11 +114,12 @@ Known behavior:
 Use this flow for rendering help:
 
 1. Prefer launching `dashboard.py` or `启动统一控制台.bat`.
-2. Check `scheduler_config.json`.
-3. Confirm music files exist under `workspace/music/<tag>/`.
-4. Confirm base images exist under `workspace/base_image/<tag>/`.
-5. Run render-only first.
-6. Verify output under `workspace/AutoTask/`.
+2. If the user has more than one tag today, fill the multi-tag task list in `dashboard.py`.
+3. Check `scheduler_config.json`.
+4. Confirm music files exist under `workspace/music/<tag>/`.
+5. Confirm base images exist under `workspace/base_image/<tag>/`.
+6. Run render-only first.
+7. Verify output under `workspace/AutoTask/`.
 
 Typical command:
 

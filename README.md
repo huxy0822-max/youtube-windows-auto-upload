@@ -1,52 +1,75 @@
-# YouTube 自动化项目整理说明
+# YouTube 自动化项目说明
 
-这个仓库目前不是“完整上传项目”，而是以**视频渲染 + 日常调度**为主的子项目。  
-你朋友给的 `朋友使用教程.md` 对应的是另一套更完整的“上传视频自动化”仓库，里面应该还有 `scripts/batch_upload.py`、`config/upload_config.json` 等文件；这些文件在当前目录里原本并不完整。
+这是一个已经整理成 **Windows + BitBrowser** 日常可用形态的 YouTube 自动化项目，当前包含：
 
-这次我已经先把当前仓库整理成一个更适合 Windows 使用的版本，重点做了这些事：
+- 长视频渲染
+- 随机视觉特效
+- 单频道上传
+- 多赛道批量上传
+- 提示词 / 标题 / 简介 / 缩略图配置
+- 路径集中配置
 
-1. 补上了原本缺失的 `effects_library.py`，避免 GUI 和调度器一启动就报错。
-2. 修正了路径解析，优先使用当前仓库内的 `config/`，不再默认写死 macOS 绝对路径。
-3. 增加了 `HubStudio / BitBrowser` 可切换的浏览器 API 适配层。
-4. 新增了基础配置模板和中文说明文档，方便后续继续补上传脚本。
-
-如果你重点关心“参数在哪里改 / 提示词怎么改 / 模型怎么换”，直接看：
-
-- `docs/实操配置与提示词说明.md`
-
-现在日常推荐入口：
+日常推荐入口：
 
 - `dashboard.py`
 - `启动统一控制台.bat`
-- `config/prompt_studio.json`
 
-## 当前目录结构
+如果你重点关心“参数在哪里改 / 提示词怎么改 / 模型怎么换 / 多赛道怎么跑”，优先看这些文档：
+
+- `docs/统一控制台说明.md`
+- `docs/实操配置与提示词说明.md`
+- `docs/文件用途说明.md`
+
+## 当前这版能做什么
+
+1. 用 `dashboard.py` 统一管理渲染、上传、提示词、当日内容和路径。
+2. 在“快捷开始”里维护多赛道任务清单，一天可以连跑多个赛道。
+3. 在“路径配置”里统一改音乐目录、底图目录、输出目录，并预览多赛道目录结构。
+4. 在“提示词”里维护文本模型 / 图片模型 / 主提示词 / 标题库 / 生成数量。
+5. 在“当日内容”里直接改 `generation_map.json`，保存后同步 `upload_manifest.json`。
+6. 上传侧固定执行：
+   - `Altered content = Yes`
+   - `Category = Music`
+
+## 推荐使用方式
+
+1. 启动 `dashboard.py`
+2. 在“路径配置”确认目录
+3. 在“提示词”确认模板
+4. 在“当日内容”确认标题、简介、封面
+5. 在“快捷开始”填写今天的多赛道任务清单
+6. 点“开始当前流程”或去“上传”页点“按多赛道任务清单批量上传”
+
+## 主要文件
 
 ```text
 youtube自动化/
-├── app.py                    # 渲染工作站 GUI
-├── daily_scheduler.py        # 批量调度入口，可选调用外部上传脚本
+├── dashboard.py              # 统一控制台，日常主入口
+├── bulk_upload.py            # 多赛道批量上传入口
+├── batch_upload.py           # 单 tag / 单频道上传主脚本
+├── daily_scheduler.py        # 批量渲染调度入口，可顺带触发上传
+├── app.py                    # 旧版渲染工作站 GUI
+├── scheduler_gui.py          # 旧版调度器 GUI
+├── prompt_studio.py          # 提示词模板 / generation_map / manifest 辅助
 ├── render_engine.py          # FFmpeg 渲染核心
-├── scheduler_gui.py          # 调度器 GUI 壳层
-├── utils.py                  # 上传侧配置/元数据/频道工具函数
 ├── browser_api.py            # HubStudio / BitBrowser API 适配层
-├── path_helpers.py           # 路径与配置文件查找辅助函数
-├── effects_library.py        # 频谱/时间轴/粒子/文字等特效生成
-├── scheduler_config.json     # 调度器本地配置（已改成 Windows 友好默认值）
+├── utils.py                  # 上传侧配置 / 元数据 / 频道工具函数
+├── path_helpers.py           # 路径与配置文件查找辅助
+├── effects_library.py        # 频谱 / 粒子 / 文字等特效生成
+├── scheduler_config.json     # 本地路径配置
 ├── config/
-│   ├── upload_config.json    # 上传/浏览器配置模板
-│   └── channel_mapping.json  # 频道映射模板
-├── docs/
-│   └── 文件用途说明.md        # 每个文件/目录是干嘛的
-├── fonts/                    # 字体素材
-├── overlays/                 # 粒子叠层视频素材
-├── 朋友使用教程.md            # 原始朋友教程，偏 Mac + HubStudio
-└── 归档.zip                  # 老归档，内容与当前仓库部分重复
+│   ├── upload_config.json    # 上传 / 浏览器配置模板
+│   ├── channel_mapping.json  # 频道映射模板
+│   └── prompt_studio.json    # 提示词 / 模型 / 内容模板配置
+├── docs/                     # 中文说明文档
+├── fonts/                    # 字体资源
+├── overlays/                 # 粒子叠层视频
+└── workspace/                # 本地素材 / 输出目录
 ```
 
 ## BitBrowser 适配方式
 
-默认配置已经改成支持在 `config/upload_config.json` 里切换浏览器提供方：
+浏览器提供方已经支持在 `config/upload_config.json` 里切换，默认就是 `bitbrowser`。
 
 ```json
 {
@@ -61,14 +84,4 @@ youtube自动化/
 }
 ```
 
-如果你后面接入的 BitBrowser 版本字段不同，直接改这个 JSON 就行，不需要再去改 Python 代码。
-
-## 现在能做什么
-
-- 可以把它当成一个 Windows 下可用的渲染/调度工程继续整理。
-- 如果你补齐真实的上传脚本 `batch_upload.py`，现有 `utils.py + browser_api.py` 已经为 BitBrowser/HubStudio 预留好了适配口。
-
-## 现在还缺什么
-
-- 当前仓库仍然**不包含**朋友教程里说的完整上传脚本。
-- 所以 `daily_scheduler.py` 里的“自动上传”仍然是可选功能；找不到外部上传脚本时，会自动回退成“只渲染不上传”。
+如果你本地 BitBrowser 的接口字段不同，优先改这个 JSON，不要先改 Python。

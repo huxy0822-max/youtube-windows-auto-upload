@@ -46,6 +46,7 @@ ctk.set_default_color_theme("blue")
 SCRIPT_DIR = Path(__file__).parent
 SCHEDULER_SCRIPT = SCRIPT_DIR / "daily_scheduler.py"
 UPLOAD_SCRIPT = SCRIPT_DIR / "batch_upload.py"
+BULK_UPLOAD_SCRIPT = SCRIPT_DIR / "bulk_upload.py"
 LEGACY_RENDERER = SCRIPT_DIR / "app.py"
 LEGACY_SCHEDULER = SCRIPT_DIR / "scheduler_gui.py"
 SCHEDULER_CONFIG_FILE = SCRIPT_DIR / "scheduler_config.json"
@@ -129,6 +130,7 @@ def load_dashboard_state() -> dict:
         "generation_tag": "",
         "generation_channel": "",
         "prompt_tag": "",
+        "batch_tags_text": "",
         "song_count": "1",
         "channel": "",
         "audio_workers": 2,
@@ -251,6 +253,8 @@ class CommandCenterApp(ctk.CTk):
         self.gen_desc_box: ctk.CTkTextbox | None = None
         self.gen_covers_box: ctk.CTkTextbox | None = None
         self.gen_ab_titles_box: ctk.CTkTextbox | None = None
+        self.batch_tags_box: ctk.CTkTextbox | None = None
+        self.batch_path_preview_box: ctk.CTkTextbox | None = None
 
         self._build_variables()
         self._build_ui()
@@ -261,6 +265,7 @@ class CommandCenterApp(ctk.CTk):
         self._load_api_preset()
         self._load_content_template()
         self._load_generation_entry(silent=True)
+        self._refresh_batch_path_preview()
         self._apply_randomize_state()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -332,6 +337,16 @@ class CommandCenterApp(ctk.CTk):
         self.content_tag_range_var = ctk.StringVar(value="10-20")
         self.generation_is_ypp_var = ctk.BooleanVar(value=False)
         self.generation_set_var = ctk.StringVar(value="1")
+        self.batch_status_var = ctk.StringVar(value="未设置多赛道任务")
+
+        for traced_var in (
+            self.date_var,
+            self.tag_var,
+            self.music_dir_var,
+            self.image_dir_var,
+            self.output_dir_var,
+        ):
+            traced_var.trace_add("write", lambda *_: self._refresh_batch_path_preview())
 
     def _build_ui(self) -> None:
         top = ctk.CTkFrame(self, corner_radius=16)
@@ -396,6 +411,21 @@ class CommandCenterApp(ctk.CTk):
         ctk.CTkLabel(row3, text="视频并行").pack(side="left", padx=(16, 0))
         ctk.CTkSlider(row3, from_=1, to=8, variable=self.video_workers_var, number_of_steps=7, width=180).pack(side="left", padx=8)
 
+        batch = ctk.CTkFrame(parent)
+        batch.pack(fill="x", padx=10, pady=(4, 10))
+        ctk.CTkLabel(batch, text="多赛道任务清单（每行一个 tag）", font=ctk.CTkFont(size=16, weight="bold")).pack(anchor="w", padx=12, pady=(12, 6))
+        self.batch_tags_box = ctk.CTkTextbox(batch, height=90)
+        self.batch_tags_box.pack(fill="x", padx=12, pady=(0, 8))
+        if self.ui_state.get("batch_tags_text"):
+            self.batch_tags_box.insert("1.0", self.ui_state["batch_tags_text"])
+        batch_actions = ctk.CTkFrame(batch, fg_color="transparent")
+        batch_actions.pack(fill="x", padx=12, pady=(0, 10))
+        ctk.CTkButton(batch_actions, text="加入当前 tag", width=110, fg_color="#334155", command=self._append_current_tag_to_batch).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(batch_actions, text="整理去重", width=100, fg_color="#334155", command=self._normalize_batch_tags_box).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(batch_actions, text="批量建目录", width=100, fg_color="#475569", command=self._prepare_batch_directories).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(batch_actions, text="打开多赛道目录", width=120, fg_color="#475569", command=self._open_batch_directories).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(batch_actions, textvariable=self.batch_status_var, text_color="#9aa0aa").pack(side="right")
+
         note = ctk.CTkLabel(
             parent,
             text="日常推荐：先配置提示词模板，再检查当天标题/简介/封面，最后回这里执行当前流程。",
@@ -433,6 +463,12 @@ class CommandCenterApp(ctk.CTk):
 
         ctk.CTkButton(parent, text="开始单频道上传", height=42, command=self._run_upload_only).pack(fill="x", padx=10, pady=(0, 10))
         ctk.CTkButton(parent, text="打开上传记录目录", height=38, fg_color="#475569", command=lambda: open_folder(str(SCRIPT_DIR / "upload_records"))).pack(fill="x", padx=10)
+        ctk.CTkLabel(
+            parent,
+            text="如果今天要连跑多个赛道，直接在“快捷开始”的多赛道任务清单里填 tag，然后回来点下面这个按钮。",
+            text_color="#9aa0aa",
+        ).pack(anchor="w", padx=14, pady=(12, 8))
+        ctk.CTkButton(parent, text="按多赛道任务清单批量上传", height=42, fg_color="#334155", command=self._run_bulk_upload).pack(fill="x", padx=10)
 
     def _build_prompt_tab(self, parent) -> None:
         scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent")
@@ -622,6 +658,22 @@ class CommandCenterApp(ctk.CTk):
         ctk.CTkButton(parent, text="打开 prompt_studio.json", fg_color="#334155", command=lambda: open_target(PROMPT_STUDIO_FILE)).pack(anchor="w", padx=14, pady=(0, 8))
         ctk.CTkButton(parent, text="打开 config 文件夹", fg_color="#334155", command=lambda: open_target(SCRIPT_DIR / "config")).pack(anchor="w", padx=14)
 
+        batch = ctk.CTkFrame(parent)
+        batch.pack(fill="both", expand=True, padx=14, pady=(14, 0))
+        ctk.CTkLabel(batch, text="多赛道路径预览", font=ctk.CTkFont(size=17, weight="bold")).pack(anchor="w", padx=12, pady=(12, 6))
+        ctk.CTkLabel(
+            batch,
+            text="这里按“快捷开始”的多赛道任务清单预览每个赛道的音乐目录 / 底图目录 / 输出目录。",
+            text_color="#9aa0aa",
+        ).pack(anchor="w", padx=12, pady=(0, 8))
+        actions = ctk.CTkFrame(batch, fg_color="transparent")
+        actions.pack(fill="x", padx=12, pady=(0, 8))
+        ctk.CTkButton(actions, text="刷新预览", width=90, fg_color="#334155", command=self._refresh_batch_path_preview).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(actions, text="批量建目录", width=90, fg_color="#475569", command=self._prepare_batch_directories).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(actions, text="打开所有目录", width=100, fg_color="#475569", command=self._open_batch_directories).pack(side="left")
+        self.batch_path_preview_box = ctk.CTkTextbox(batch, height=220)
+        self.batch_path_preview_box.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
     def _build_log_tab(self, parent) -> None:
         toolbar = ctk.CTkFrame(parent, fg_color="transparent")
         toolbar.pack(fill="x", padx=10, pady=(10, 8))
@@ -702,9 +754,121 @@ class CommandCenterApp(ctk.CTk):
         for widget in self.manual_widgets:
             widget.configure(state=state)
 
+    def _parse_tag_lines(self, raw: str) -> list[str]:
+        seen = set()
+        tags: list[str] = []
+        all_known = set(get_all_tags())
+        normalized = raw.replace("，", ",").replace("；", ",").replace(";", ",")
+        for line in normalized.splitlines():
+            for chunk in line.split(","):
+                tag = chunk.strip()
+                if not tag or tag in seen:
+                    continue
+                if all_known and tag not in all_known:
+                    continue
+                seen.add(tag)
+                tags.append(tag)
+        return tags
+
+    def _batch_tags(self) -> list[str]:
+        return self._parse_tag_lines(self._textbox_get(self.batch_tags_box))
+
+    def _append_current_tag_to_batch(self) -> None:
+        current = self.tag_var.get().strip()
+        if not current or current == "全部标签":
+            return
+        tags = self._batch_tags()
+        if current not in tags:
+            tags.append(current)
+        self._textbox_set(self.batch_tags_box, "\n".join(tags))
+        self.batch_status_var.set(f"已加入当前 tag：{current}")
+        self._refresh_batch_path_preview()
+
+    def _normalize_batch_tags_box(self) -> None:
+        tags = self._batch_tags()
+        self._textbox_set(self.batch_tags_box, "\n".join(tags))
+        self.batch_status_var.set(f"已整理 {len(tags)} 个赛道")
+        self._refresh_batch_path_preview()
+
+    def _effective_tags(self) -> list[str]:
+        tags = self._batch_tags()
+        if tags:
+            return tags
+        current = self.tag_var.get().strip()
+        if current and current != "全部标签":
+            return [current]
+        return []
+
+    def _prepare_batch_directories(self) -> None:
+        try:
+            date_mmdd = normalize_mmdd(self.date_var.get())
+        except Exception as e:
+            messagebox.showerror("日期错误", str(e))
+            return
+
+        tags = self._effective_tags()
+        if not tags:
+            messagebox.showwarning("没有赛道", "请先在多赛道任务清单里填写 tag，或先选一个当前 tag。")
+            return
+
+        music_root = resolve_local_path(self.music_dir_var.get().strip() or "workspace/music")
+        image_root = resolve_local_path(self.image_dir_var.get().strip() or "workspace/base_image")
+        output_root = resolve_local_path(self.output_dir_var.get().strip() or "workspace/AutoTask")
+        for tag in tags:
+            (music_root / tag).mkdir(parents=True, exist_ok=True)
+            (image_root / tag).mkdir(parents=True, exist_ok=True)
+            (output_root / f"{date_mmdd}_{tag}").mkdir(parents=True, exist_ok=True)
+
+        self.batch_status_var.set(f"已准备 {len(tags)} 个赛道目录")
+        self._append_log(f"[多赛道] 已准备目录: {', '.join(tags)}")
+        self._refresh_batch_path_preview()
+
+    def _open_batch_directories(self) -> None:
+        try:
+            date_mmdd = normalize_mmdd(self.date_var.get())
+        except Exception:
+            date_mmdd = self.date_var.get().strip()
+
+        tags = self._effective_tags()
+        if not tags:
+            messagebox.showwarning("没有赛道", "请先在多赛道任务清单里填写 tag，或先选一个当前 tag。")
+            return
+
+        music_root = resolve_local_path(self.music_dir_var.get().strip() or "workspace/music")
+        image_root = resolve_local_path(self.image_dir_var.get().strip() or "workspace/base_image")
+        output_root = resolve_local_path(self.output_dir_var.get().strip() or "workspace/AutoTask")
+        for tag in tags:
+            open_target(music_root / tag)
+            open_target(image_root / tag)
+            open_target(output_root / f"{date_mmdd}_{tag}")
+        self.batch_status_var.set(f"已打开 {len(tags)} 个赛道目录")
+
+    def _refresh_batch_path_preview(self) -> None:
+        tags = self._effective_tags()
+        if not self.batch_path_preview_box:
+            return
+        if not tags:
+            self._textbox_set(self.batch_path_preview_box, "暂无多赛道任务。你可以在“快捷开始”页的任务清单里每行填一个 tag。")
+            return
+        try:
+            date_mmdd = normalize_mmdd(self.date_var.get())
+        except Exception:
+            date_mmdd = self.date_var.get().strip()
+        music_root = resolve_local_path(self.music_dir_var.get().strip() or "workspace/music")
+        image_root = resolve_local_path(self.image_dir_var.get().strip() or "workspace/base_image")
+        output_root = resolve_local_path(self.output_dir_var.get().strip() or "workspace/AutoTask")
+        lines = []
+        for tag in tags:
+            lines.append(f"[{tag}]")
+            lines.append(f"  music : {music_root / tag}")
+            lines.append(f"  image : {image_root / tag}")
+            lines.append(f"  output: {output_root / f'{date_mmdd}_{tag}'}")
+            lines.append("")
+        self._textbox_set(self.batch_path_preview_box, "\n".join(lines).strip())
+
     def _build_scheduler_cmd(self, *, render_only: bool) -> list[str]:
         date_mmdd = normalize_mmdd(self.date_var.get())
-        tag = self.tag_var.get().strip()
+        tags = self._effective_tags()
         args = [
             sys.executable,
             str(SCHEDULER_SCRIPT),
@@ -712,8 +876,8 @@ class CommandCenterApp(ctk.CTk):
             date_mmdd,
             f"--song-count={self.song_count_var.get().strip() or '1'}",
         ]
-        if tag and tag != "全部标签":
-            args.append(f"--tags={tag}")
+        if tags:
+            args.append("--tags=" + ",".join(tags))
         if render_only or not self.auto_upload_var.get():
             args.append("--render-only")
         if self.randomize_effects_var.get():
@@ -751,6 +915,24 @@ class CommandCenterApp(ctk.CTk):
             args.append("--keep-upload-browser-open")
         return args
 
+    def _build_bulk_upload_cmd(self) -> list[str]:
+        date_mmdd = normalize_mmdd(self.date_var.get())
+        tags = self._effective_tags()
+        if not tags:
+            raise ValueError("请先在多赛道任务清单填写至少一个 tag。")
+        args = [
+            sys.executable,
+            str(BULK_UPLOAD_SCRIPT),
+            "--date",
+            date_mmdd,
+            "--tags",
+            ",".join(tags),
+            "--auto-confirm",
+        ]
+        if self.auto_close_browser_var.get():
+            args.append("--auto-close-browser")
+        return args
+
     def _build_upload_cmd(self) -> list[str]:
         date_mmdd = normalize_mmdd(self.date_var.get())
         tag = self.upload_tag_var.get().strip()
@@ -783,6 +965,7 @@ class CommandCenterApp(ctk.CTk):
         self.scheduler_cfg = load_scheduler_config()
         self.status_var.set("路径配置已保存")
         self._append_log("已保存路径配置。")
+        self._refresh_batch_path_preview()
 
     def _collect_state(self) -> dict:
         return {
@@ -792,6 +975,7 @@ class CommandCenterApp(ctk.CTk):
             "generation_tag": self.generation_tag_var.get(),
             "generation_channel": self.generation_channel_var.get(),
             "prompt_tag": self.prompt_tag_var.get(),
+            "batch_tags_text": self._textbox_get(self.batch_tags_box),
             "song_count": self.song_count_var.get(),
             "channel": self.channel_var.get(),
             "audio_workers": int(self.audio_workers_var.get()),
@@ -846,6 +1030,9 @@ class CommandCenterApp(ctk.CTk):
             self._run_scheduler(render_only=not self.auto_upload_var.get())
             return
         if self.auto_upload_var.get():
+            if len(self._effective_tags()) > 1:
+                self._run_bulk_upload()
+                return
             self._run_upload_only()
             return
         messagebox.showwarning("没有启用模块", "请至少开启一个模块：渲染 或 上传。")
@@ -1114,6 +1301,14 @@ class CommandCenterApp(ctk.CTk):
             messagebox.showerror("参数错误", str(e))
             return
         self._run_process(cmd, job_name="单频道上传")
+
+    def _run_bulk_upload(self) -> None:
+        try:
+            cmd = self._build_bulk_upload_cmd()
+        except Exception as e:
+            messagebox.showerror("参数错误", str(e))
+            return
+        self._run_process(cmd, job_name="多赛道批量上传")
 
     def _run_process(self, cmd: list[str], *, job_name: str) -> None:
         if self.process and self.process.poll() is None:
