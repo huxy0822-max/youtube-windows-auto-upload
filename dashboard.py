@@ -361,6 +361,7 @@ class CommandCenterApp(ctk.CTk):
         self.prompt_audience_image_data_url: str | None = None
         self.prompt_audience_analysis_busy = False
         self._syncing_task_mode = False
+        self.quick_basic_card: ctk.CTkFrame | None = None
         self.gen_title_box: ctk.CTkTextbox | None = None
         self.gen_desc_box: ctk.CTkTextbox | None = None
         self.gen_covers_box: ctk.CTkTextbox | None = None
@@ -589,6 +590,8 @@ class CommandCenterApp(ctk.CTk):
                 self.render_enabled_var.set(desired[0])
             if bool(self.auto_upload_var.get()) != desired[1]:
                 self.auto_upload_var.set(desired[1])
+            if mode != "upload_only" and str(self.upload_source_mode_var.get() or "").strip() == "ready_folder":
+                self.upload_source_mode_var.set("render_output")
         finally:
             self._syncing_task_mode = False
         if not initial:
@@ -734,32 +737,21 @@ class CommandCenterApp(ctk.CTk):
         ctk.CTkSwitch(task_row, text="全随机视觉（推荐）", variable=self.randomize_effects_var, command=self._apply_randomize_state).pack(side="left", padx=(0, 16))
         ctk.CTkSwitch(task_row, text="上传后自动关闭浏览器", variable=self.auto_close_browser_var).pack(side="left")
 
-        basic = self._section_card(
-            scroll,
-            "步骤 2：今天的基础范围",
-            "这里保留主分组、日期和每赛道曲数。剪辑流程会读取这里；上传页则负责具体窗口和现成视频来源。",
-        )
-        basic_row = ctk.CTkFrame(basic, fg_color="transparent")
-        basic_row.pack(fill="x", padx=14, pady=(0, 10))
+        hidden_scope = ctk.CTkFrame(scroll, fg_color="transparent", width=1, height=1)
+        self.quick_basic_card = hidden_scope
         self.tag_menu = self._labeled_option(
-            basic_row,
+            hidden_scope,
             "主分组",
             self.tag_var,
             ["加载中..."],
             width=220,
             command=lambda _: self._sync_tag_to_upload(),
         )
-        self._labeled_entry(basic_row, "日期", self.date_var, width=120, placeholder="MMDD / 3.12")
-        self._labeled_entry(basic_row, "每赛道曲数", self.song_count_var, width=110, placeholder="1")
-        button_group = ctk.CTkFrame(basic_row, fg_color="transparent")
-        button_group.pack(side="left", padx=(0, 10), pady=(20, 0))
-        ctk.CTkButton(button_group, text="刷新标签", width=100, command=self._load_tags).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(button_group, text="打开输出目录", width=120, command=lambda: open_folder(self.output_dir_var.get())).pack(side="left")
 
         workflow = self._section_card(
             scroll,
-            "步骤 3：上传与内容入口",
-            "上传逻辑现在统一放在“上传”页里。那一页会决定你是传渲染产物，还是传现成视频文件夹，以及今天到底传哪些窗口。",
+            "步骤 2：先去上传页把今天的范围填好",
+            "今天要剪哪些、传哪些、传哪个分组哪个窗口，都统一在“上传”页配置。快捷开始这里只负责看状态和一键执行。",
         )
         workflow_row = ctk.CTkFrame(workflow, fg_color="transparent")
         workflow_row.pack(fill="x", padx=14, pady=(0, 8))
@@ -778,8 +770,8 @@ class CommandCenterApp(ctk.CTk):
 
         render = self._section_card(
             scroll,
-            "步骤 4：渲染并发和节奏",
-            "如果今天要制作视频，这里只保留最常用的两个杠杆：音频并行和视频并行。复杂特效再去“高级视觉”。",
+            "步骤 3：渲染并发和节奏",
+            "如果今天要制作视频，这里只保留最常用的几个杠杆。分组和日期直接读“上传”页，复杂特效再去“高级视觉”。",
         )
         render_row = ctk.CTkFrame(render, fg_color="transparent")
         render_row.pack(fill="x", padx=14, pady=(0, 12))
@@ -787,10 +779,20 @@ class CommandCenterApp(ctk.CTk):
         ctk.CTkSlider(render_row, from_=1, to=8, variable=self.audio_workers_var, number_of_steps=7, width=220).pack(side="left", padx=(0, 20))
         ctk.CTkLabel(render_row, text="视频并行", width=90).pack(side="left")
         ctk.CTkSlider(render_row, from_=1, to=8, variable=self.video_workers_var, number_of_steps=7, width=220).pack(side="left")
+        render_row2 = ctk.CTkFrame(render, fg_color="transparent")
+        render_row2.pack(fill="x", padx=14, pady=(0, 12))
+        self._labeled_entry(render_row2, "每赛道曲数", self.song_count_var, width=110, placeholder="1")
+        ctk.CTkButton(
+            render_row2,
+            text="打开输出目录",
+            width=120,
+            fg_color="#475569",
+            command=lambda: open_folder(self.output_dir_var.get()),
+        ).pack(side="left", padx=(0, 10), pady=(20, 0))
 
         batch = self._section_card(
             scroll,
-            "步骤 5：如果今天有多个赛道，就在这里填任务清单",
+            "步骤 4：如果今天有多个赛道，就在这里填任务清单",
             "只有今天要批量渲染多个赛道时，这块才是必填。其他模式可以先留空。",
         )
         self.batch_tags_box = ctk.CTkTextbox(batch, height=96)
@@ -808,7 +810,7 @@ class CommandCenterApp(ctk.CTk):
 
         links = self._section_card(
             scroll,
-            "步骤 6：启动前，先检查内容和素材路径",
+            "步骤 5：启动前，先检查内容和素材路径",
             "通常顺序是：先去提示词页看模板，再去当日内容页看标题/简介/封面，最后确认路径配置。",
         )
         links_row = ctk.CTkFrame(links, fg_color="transparent")
@@ -820,7 +822,7 @@ class CommandCenterApp(ctk.CTk):
 
         actions = self._section_card(
             scroll,
-            "步骤 7：开始执行",
+            "步骤 6：开始执行",
             "“开始当前流程”会按你上面的任务模式去跑；不想全跑，就用下面的单独按钮。",
         )
         ctk.CTkButton(actions, text="开始当前流程", height=42, command=self._run_current_flow).pack(fill="x", padx=14, pady=(0, 10))
@@ -1924,6 +1926,8 @@ class CommandCenterApp(ctk.CTk):
         self.channel_menu.configure(values=channels or [""])
         if self.channel_var.get() not in channels:
             self.channel_var.set(channels[0] if channels else "")
+        if tag and tag != self.tag_var.get().strip():
+            self.tag_var.set(tag)
         if not self.upload_picker_tag_var.get().strip():
             self.upload_picker_tag_var.set(tag)
         self._refresh_upload_window_buttons()
@@ -1991,7 +1995,13 @@ class CommandCenterApp(ctk.CTk):
         except Exception as e:
             group_text = f"窗口任务未完成：{e}"
 
-        extra_lines = [f"本次任务：{task_mode}", f"上传来源：{source_mode}", f"文案来源：{metadata_mode}", f"窗口概览：{group_text}"]
+        extra_lines = [
+            f"本次任务：{task_mode}",
+            f"上传来源：{source_mode}",
+            f"文案来源：{metadata_mode}",
+            f"窗口概览：{group_text}",
+            "任务范围统一以“上传”页里的窗口任务和日期为准。",
+        ]
         if self._current_upload_entry_mode() == "group_folder":
             extra_lines.append(f"现成视频目录：{self.group_upload_source_dir_var.get().strip() or '未设置'}")
         if self.today_task_mode_var.get() == "render_only":
@@ -2022,7 +2032,7 @@ class CommandCenterApp(ctk.CTk):
         return self._parse_tag_lines(self._textbox_get(self.batch_tags_box))
 
     def _append_current_tag_to_batch(self) -> None:
-        current = self.tag_var.get().strip()
+        current = self._primary_tag()
         if not current or current == "全部标签":
             return
         tags = self._batch_tags()
@@ -2042,9 +2052,13 @@ class CommandCenterApp(ctk.CTk):
         tags = self._batch_tags()
         if tags:
             return tags
-        current = self.tag_var.get().strip()
-        if current and current != "全部标签":
-            return [current]
+        for current in (
+            self.upload_tag_var.get().strip(),
+            self.upload_picker_tag_var.get().strip(),
+            self.tag_var.get().strip(),
+        ):
+            if current and current != "全部标签":
+                return [current]
         return []
 
     def _primary_tag(self) -> str:
