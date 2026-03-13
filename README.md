@@ -6,6 +6,7 @@
 - 随机视觉特效
 - 单频道上传
 - 多赛道批量上传
+- 同分组多视频批量上传
 - 提示词 / 标题 / 简介 / 缩略图配置
 - 路径集中配置
 
@@ -40,16 +41,24 @@
 5. 在“快捷开始”填写今天的多赛道任务清单
 6. 点“开始当前流程”或去“上传”页点“按多赛道任务清单批量上传”
 
+如果你是“一个文件夹里有多条现成视频，要按顺序上传到同一个比特浏览器分组下的多个频道”，不要走旧上传页，直接用：
+
+- `dashboard.py -> 分组批量上传`
+- 或命令行 `group_upload_batch.py`
+
 ## 主要文件
 
 ```text
 youtube自动化/
 ├── dashboard.py              # 统一控制台，日常主入口
+├── group_upload_batch.py     # 同分组多视频批量上传入口
+├── group_upload_workflow.py  # 同分组批量上传的编排层（扫文件夹/分配频道/写manifest）
 ├── bulk_upload.py            # 多赛道批量上传入口
 ├── batch_upload.py           # 单 tag / 单频道上传主脚本
 ├── daily_scheduler.py        # 批量渲染调度入口，可顺带触发上传
 ├── app.py                    # 旧版渲染工作站 GUI
 ├── scheduler_gui.py          # 旧版调度器 GUI
+├── content_generation.py     # 网页版 API 文案/标签/缩略图提示词生成逻辑
 ├── prompt_studio.py          # 提示词模板 / generation_map / manifest 辅助
 ├── render_engine.py          # FFmpeg 渲染核心
 ├── browser_api.py            # HubStudio / BitBrowser API 适配层
@@ -60,7 +69,8 @@ youtube自动化/
 ├── config/
 │   ├── upload_config.json    # 上传 / 浏览器配置模板
 │   ├── channel_mapping.json  # 频道映射模板
-│   └── prompt_studio.json    # 提示词 / 模型 / 内容模板配置
+│   ├── prompt_studio.json    # 提示词 / 模型 / 内容模板配置
+│   └── upload_batch_settings.json # 分组批量上传默认设置
 ├── docs/                     # 中文说明文档
 ├── fonts/                    # 字体资源
 ├── overlays/                 # 粒子叠层视频

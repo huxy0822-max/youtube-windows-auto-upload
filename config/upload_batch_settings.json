@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "generation_mode": "site_api",
+  "source_video_dir": "",
+  "source_thumbnail_dir": "",
+  "selected_serials_text": "",
+  "visibility": "public",
+  "category": "Music",
+  "made_for_kids": false,
+  "altered_content": true,
+  "schedule_enabled": false,
+  "schedule_start": "",
+  "schedule_interval_minutes": 60
+}

@@ -20,8 +20,14 @@ from pathlib import Path
 from typing import List
 
 import customtkinter as ctk
-from tkinter import messagebox
+from tkinter import filedialog, messagebox
 
+from group_upload_workflow import (
+    load_upload_batch_settings,
+    parse_serials_text,
+    prepare_group_upload_batch,
+    save_upload_batch_settings,
+)
 from path_helpers import default_scheduler_config, normalize_scheduler_config
 from prompt_studio import (
     build_site_preview,
@@ -47,12 +53,14 @@ SCRIPT_DIR = Path(__file__).parent
 SCHEDULER_SCRIPT = SCRIPT_DIR / "daily_scheduler.py"
 UPLOAD_SCRIPT = SCRIPT_DIR / "batch_upload.py"
 BULK_UPLOAD_SCRIPT = SCRIPT_DIR / "bulk_upload.py"
+GROUP_UPLOAD_SCRIPT = SCRIPT_DIR / "group_upload_batch.py"
 LEGACY_RENDERER = SCRIPT_DIR / "app.py"
 LEGACY_SCHEDULER = SCRIPT_DIR / "scheduler_gui.py"
 SCHEDULER_CONFIG_FILE = SCRIPT_DIR / "scheduler_config.json"
 DASHBOARD_STATE_FILE = SCRIPT_DIR / "dashboard_state.json"
 PROMPT_STUDIO_FILE = SCRIPT_DIR / "config" / "prompt_studio.json"
 CHANNEL_MAPPING_FILE = SCRIPT_DIR / "config" / "channel_mapping.json"
+UPLOAD_BATCH_SETTINGS_FILE = SCRIPT_DIR / "config" / "upload_batch_settings.json"
 
 COLOR_MAP = {
     "随机": "random",
@@ -239,6 +247,7 @@ class CommandCenterApp(ctk.CTk):
 
         self.scheduler_cfg = load_scheduler_config()
         self.prompt_cfg = load_prompt_studio_config(PROMPT_STUDIO_FILE)
+        self.upload_batch_cfg = load_upload_batch_settings(UPLOAD_BATCH_SETTINGS_FILE)
         self.channel_name_map = load_channel_name_map()
         self.ui_state = load_dashboard_state()
         self.process: subprocess.Popen | None = None
@@ -255,6 +264,8 @@ class CommandCenterApp(ctk.CTk):
         self.gen_ab_titles_box: ctk.CTkTextbox | None = None
         self.batch_tags_box: ctk.CTkTextbox | None = None
         self.batch_path_preview_box: ctk.CTkTextbox | None = None
+        self.group_upload_tag_menu: ctk.CTkOptionMenu | None = None
+        self.group_upload_preview_box: ctk.CTkTextbox | None = None
 
         self._build_variables()
         self._build_ui()
@@ -338,6 +349,19 @@ class CommandCenterApp(ctk.CTk):
         self.generation_is_ypp_var = ctk.BooleanVar(value=False)
         self.generation_set_var = ctk.StringVar(value="1")
         self.batch_status_var = ctk.StringVar(value="未设置多赛道任务")
+        self.group_upload_tag_var = ctk.StringVar(value=self.upload_batch_cfg.get("tag") or self.ui_state["upload_tag"] or self.ui_state["tag"])
+        self.group_upload_source_dir_var = ctk.StringVar(value=self.upload_batch_cfg.get("source_video_dir", ""))
+        self.group_upload_thumb_dir_var = ctk.StringVar(value=self.upload_batch_cfg.get("source_thumbnail_dir", ""))
+        self.group_upload_serials_var = ctk.StringVar(value=self.upload_batch_cfg.get("selected_serials_text", ""))
+        self.group_upload_mode_var = ctk.StringVar(value=self.upload_batch_cfg.get("generation_mode", "site_api"))
+        self.group_upload_visibility_var = ctk.StringVar(value=self.upload_batch_cfg.get("visibility", "public"))
+        self.group_upload_category_var = ctk.StringVar(value=self.upload_batch_cfg.get("category", "Music"))
+        self.group_upload_made_for_kids_var = ctk.BooleanVar(value=bool(self.upload_batch_cfg.get("made_for_kids", False)))
+        self.group_upload_altered_content_var = ctk.BooleanVar(value=bool(self.upload_batch_cfg.get("altered_content", True)))
+        self.group_upload_schedule_enabled_var = ctk.BooleanVar(value=bool(self.upload_batch_cfg.get("schedule_enabled", False)))
+        self.group_upload_schedule_start_var = ctk.StringVar(value=self.upload_batch_cfg.get("schedule_start", ""))
+        self.group_upload_schedule_interval_var = ctk.StringVar(value=str(self.upload_batch_cfg.get("schedule_interval_minutes", 60)))
+        self.group_upload_status_var = ctk.StringVar(value="等待载入分组批量上传计划")
 
         for traced_var in (
             self.date_var,
@@ -365,6 +389,7 @@ class CommandCenterApp(ctk.CTk):
         self.tabs.pack(fill="both", expand=True, padx=12, pady=12)
         self.tabs.add("快捷开始")
         self.tabs.add("上传")
+        self.tabs.add("分组批量上传")
         self.tabs.add("提示词")
         self.tabs.add("当日内容")
         self.tabs.add("高级视觉")
@@ -373,6 +398,7 @@ class CommandCenterApp(ctk.CTk):
 
         self._build_quick_tab(self.tabs.tab("快捷开始"))
         self._build_upload_tab(self.tabs.tab("上传"))
+        self._build_group_upload_tab(self.tabs.tab("分组批量上传"))
         self._build_prompt_tab(self.tabs.tab("提示词"))
         self._build_generation_tab(self.tabs.tab("当日内容"))
         self._build_advanced_tab(self.tabs.tab("高级视觉"))
@@ -469,6 +495,79 @@ class CommandCenterApp(ctk.CTk):
             text_color="#9aa0aa",
         ).pack(anchor="w", padx=14, pady=(12, 8))
         ctk.CTkButton(parent, text="按多赛道任务清单批量上传", height=42, fg_color="#334155", command=self._run_bulk_upload).pack(fill="x", padx=10)
+        ctk.CTkButton(parent, text="打开“分组批量上传”专用页", height=38, fg_color="#475569", command=lambda: self.tabs.set("分组批量上传")).pack(fill="x", padx=10, pady=(10, 0))
+
+    def _build_group_upload_tab(self, parent) -> None:
+        scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=8, pady=8)
+
+        header = ctk.CTkFrame(scroll)
+        header.pack(fill="x", padx=10, pady=(10, 8))
+        ctk.CTkLabel(header, text="分组批量上传", font=ctk.CTkFont(size=22, weight="bold")).pack(anchor="w", padx=14, pady=(12, 4))
+        ctk.CTkLabel(
+            header,
+            text="适合这种场景：一个文件夹里有多条现成视频，你要把它们按顺序发到同一个比特浏览器分组下的多个频道。",
+            text_color="#9aa0aa",
+            wraplength=900,
+            justify="left",
+        ).pack(anchor="w", padx=14, pady=(0, 12))
+
+        row1 = ctk.CTkFrame(scroll, fg_color="transparent")
+        row1.pack(fill="x", padx=10, pady=(0, 8))
+        self.group_upload_tag_menu = ctk.CTkOptionMenu(row1, variable=self.group_upload_tag_var, values=["加载中..."], width=220)
+        self.group_upload_tag_menu.pack(side="left", padx=(0, 10))
+        ctk.CTkEntry(row1, textvariable=self.date_var, width=120, placeholder_text="MMDD / 3.12").pack(side="left", padx=(0, 10))
+        ctk.CTkEntry(row1, textvariable=self.group_upload_source_dir_var, placeholder_text="现成视频文件夹").pack(side="left", fill="x", expand=True, padx=(0, 10))
+        ctk.CTkButton(row1, text="选择视频目录", width=110, fg_color="#334155", command=lambda: self._pick_directory_for_var(self.group_upload_source_dir_var)).pack(side="left")
+
+        row2 = ctk.CTkFrame(scroll, fg_color="transparent")
+        row2.pack(fill="x", padx=10, pady=(0, 8))
+        ctk.CTkEntry(row2, textvariable=self.group_upload_thumb_dir_var, placeholder_text="可选：现成缩略图文件夹").pack(side="left", fill="x", expand=True, padx=(0, 10))
+        ctk.CTkButton(row2, text="选择缩略图目录", width=120, fg_color="#334155", command=lambda: self._pick_directory_for_var(self.group_upload_thumb_dir_var)).pack(side="left", padx=(0, 10))
+        ctk.CTkEntry(row2, textvariable=self.group_upload_serials_var, width=280, placeholder_text="可选：限定频道序号，如 90,94,95").pack(side="left")
+
+        row3 = ctk.CTkFrame(scroll, fg_color="transparent")
+        row3.pack(fill="x", padx=10, pady=(0, 8))
+        ctk.CTkOptionMenu(row3, variable=self.group_upload_mode_var, values=["site_api", "legacy"], width=170).pack(side="left", padx=(0, 10))
+        ctk.CTkOptionMenu(row3, variable=self.group_upload_visibility_var, values=["public", "private", "unlisted", "schedule"], width=160).pack(side="left", padx=(0, 10))
+        ctk.CTkOptionMenu(
+            row3,
+            variable=self.group_upload_category_var,
+            values=["Music", "People & Blogs", "Education", "Entertainment", "News & Politics", "Gaming", "Sports", "Travel & Events"],
+            width=180,
+        ).pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(row3, textvariable=self.group_upload_status_var, text_color="#9aa0aa", wraplength=340, justify="left").pack(side="left", fill="x", expand=True)
+
+        row4 = ctk.CTkFrame(scroll, fg_color="transparent")
+        row4.pack(fill="x", padx=10, pady=(0, 8))
+        ctk.CTkSwitch(row4, text="儿童内容", variable=self.group_upload_made_for_kids_var).pack(side="left", padx=(0, 16))
+        ctk.CTkSwitch(row4, text="AI / 合成内容", variable=self.group_upload_altered_content_var).pack(side="left", padx=(0, 16))
+        ctk.CTkSwitch(row4, text="启用定时发布", variable=self.group_upload_schedule_enabled_var).pack(side="left", padx=(0, 16))
+        ctk.CTkEntry(row4, textvariable=self.group_upload_schedule_start_var, width=180, placeholder_text="YYYY-MM-DD HH:MM").pack(side="left", padx=(0, 10))
+        ctk.CTkEntry(row4, textvariable=self.group_upload_schedule_interval_var, width=100, placeholder_text="间隔分钟").pack(side="left")
+
+        hint = ctk.CTkLabel(
+            scroll,
+            text="生成模式：`site_api` = 走你网页版那套 API；`legacy` = 走原先 generation_map 逻辑。默认建议 `site_api`。",
+            text_color="#9aa0aa",
+            wraplength=960,
+            justify="left",
+        )
+        hint.pack(anchor="w", padx=14, pady=(0, 10))
+
+        actions = ctk.CTkFrame(scroll)
+        actions.pack(fill="x", padx=10, pady=(0, 10))
+        ctk.CTkButton(actions, text="保存本页设置", width=110, fg_color="#475569", command=self._save_group_upload_settings).pack(side="left", padx=(0, 8), pady=12)
+        ctk.CTkButton(actions, text="预览并准备上传计划", width=150, command=self._preview_group_upload_plan).pack(side="left", padx=(0, 8), pady=12)
+        ctk.CTkButton(actions, text="Dry-run 测试上传", width=130, fg_color="#334155", command=lambda: self._run_group_upload(dry_run=True)).pack(side="left", padx=(0, 8), pady=12)
+        ctk.CTkButton(actions, text="开始分组批量上传", width=150, fg_color="#2563eb", command=self._run_group_upload).pack(side="left", padx=(0, 8), pady=12)
+        ctk.CTkButton(actions, text="打开 staging 输出目录", width=140, fg_color="#334155", command=self._open_group_upload_output_dir).pack(side="left", pady=12)
+
+        preview = ctk.CTkFrame(scroll)
+        preview.pack(fill="both", expand=True, padx=10, pady=(0, 12))
+        ctk.CTkLabel(preview, text="上传计划预览", font=ctk.CTkFont(size=18, weight="bold")).pack(anchor="w", padx=14, pady=(12, 8))
+        self.group_upload_preview_box = ctk.CTkTextbox(preview, height=320)
+        self.group_upload_preview_box.pack(fill="both", expand=True, padx=14, pady=(0, 14))
 
     def _build_prompt_tab(self, parent) -> None:
         scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent")
@@ -698,6 +797,152 @@ class CommandCenterApp(ctk.CTk):
         ctk.CTkLabel(row, text=label, width=90).pack(side="left", padx=(12, 8), pady=10)
         ctk.CTkEntry(row, textvariable=variable).pack(side="left", fill="x", expand=True, padx=(0, 12), pady=10)
 
+    def _pick_directory_for_var(self, variable) -> None:
+        selected = filedialog.askdirectory()
+        if selected:
+            variable.set(selected)
+
+    def _collect_group_upload_settings(self) -> dict:
+        visibility = self.group_upload_visibility_var.get().strip() or "public"
+        if self.group_upload_schedule_enabled_var.get():
+            visibility = "schedule"
+        try:
+            interval_minutes = int(self.group_upload_schedule_interval_var.get().strip() or "60")
+        except Exception:
+            interval_minutes = 60
+        return {
+            "version": 1,
+            "tag": self.group_upload_tag_var.get().strip(),
+            "source_video_dir": self.group_upload_source_dir_var.get().strip(),
+            "source_thumbnail_dir": self.group_upload_thumb_dir_var.get().strip(),
+            "selected_serials_text": self.group_upload_serials_var.get().strip(),
+            "generation_mode": self.group_upload_mode_var.get().strip() or "site_api",
+            "visibility": visibility,
+            "category": self.group_upload_category_var.get().strip() or "Music",
+            "made_for_kids": bool(self.group_upload_made_for_kids_var.get()),
+            "altered_content": bool(self.group_upload_altered_content_var.get()),
+            "schedule_enabled": bool(self.group_upload_schedule_enabled_var.get()),
+            "schedule_start": self.group_upload_schedule_start_var.get().strip(),
+            "schedule_interval_minutes": interval_minutes,
+        }
+
+    def _save_group_upload_settings(self) -> None:
+        settings = self._collect_group_upload_settings()
+        save_upload_batch_settings(UPLOAD_BATCH_SETTINGS_FILE, settings)
+        self.group_upload_status_var.set("分组批量上传设置已保存")
+        self._append_log("[分组批量上传] 已保存设置")
+
+    def _group_upload_output_dir(self) -> Path:
+        date_mmdd = normalize_mmdd(self.date_var.get())
+        tag = self.group_upload_tag_var.get().strip()
+        return resolve_local_path(self.output_dir_var.get().strip() or "workspace/AutoTask") / f"{date_mmdd}_{tag}"
+
+    def _open_group_upload_output_dir(self) -> None:
+        try:
+            open_target(self._group_upload_output_dir())
+        except Exception as e:
+            messagebox.showerror("打开失败", str(e))
+
+    def _preview_group_upload_plan(self) -> None:
+        try:
+            settings = self._collect_group_upload_settings()
+            save_upload_batch_settings(UPLOAD_BATCH_SETTINGS_FILE, settings)
+            prepared = prepare_group_upload_batch(
+                script_dir=SCRIPT_DIR,
+                scheduler_config_path=SCHEDULER_CONFIG_FILE,
+                prompt_studio_path=PROMPT_STUDIO_FILE,
+                channel_mapping_path=CHANNEL_MAPPING_FILE,
+                tag=self.group_upload_tag_var.get().strip(),
+                date_value=self.date_var.get().strip(),
+                source_video_dir=Path(self.group_upload_source_dir_var.get().strip()),
+                thumbnail_dir=Path(self.group_upload_thumb_dir_var.get().strip()) if self.group_upload_thumb_dir_var.get().strip() else None,
+                selected_serials=parse_serials_text(self.group_upload_serials_var.get().strip()),
+                generation_mode=settings["generation_mode"],
+                visibility=settings["visibility"],
+                category=settings["category"],
+                made_for_kids=settings["made_for_kids"],
+                altered_content=settings["altered_content"],
+                schedule_enabled=settings["schedule_enabled"],
+                schedule_start=settings["schedule_start"],
+                schedule_interval_minutes=settings["schedule_interval_minutes"],
+            )
+        except Exception as e:
+            messagebox.showerror("生成计划失败", str(e))
+            return
+
+        lines = [
+            f"tag={prepared['tag']}",
+            f"date={prepared['date']}",
+            f"manifest={prepared['manifest_path']}",
+            f"assigned={prepared['assigned_count']}",
+            "",
+        ]
+        lines.extend(prepared["preview_lines"])
+        if prepared["warnings"]:
+            lines.append("")
+            lines.append("Warnings:")
+            lines.extend([f"- {item}" for item in prepared["warnings"]])
+        self._textbox_set(self.group_upload_preview_box, "\n".join(lines).strip())
+        self.group_upload_status_var.set(f"已准备 {prepared['assigned_count']} 个频道的上传计划")
+        self._append_log(f"[分组批量上传] 已生成计划: {prepared['manifest_path']}")
+
+    def _build_group_upload_cmd(self, *, dry_run: bool = False) -> list[str]:
+        settings = self._collect_group_upload_settings()
+        tag = self.group_upload_tag_var.get().strip()
+        source_dir = self.group_upload_source_dir_var.get().strip()
+        if not tag:
+            raise ValueError("请先选择一个上传分组")
+        if not source_dir:
+            raise ValueError("请先填写现成视频文件夹")
+
+        args = [
+            sys.executable,
+            str(GROUP_UPLOAD_SCRIPT),
+            "--tag",
+            tag,
+            "--date",
+            normalize_mmdd(self.date_var.get()),
+            "--source-dir",
+            source_dir,
+            "--generation-mode",
+            settings["generation_mode"],
+            "--visibility",
+            settings["visibility"],
+            "--category",
+            settings["category"],
+            "--schedule-interval-minutes",
+            str(settings["schedule_interval_minutes"]),
+            "--auto-confirm",
+        ]
+        if self.group_upload_thumb_dir_var.get().strip():
+            args.extend(["--thumb-dir", self.group_upload_thumb_dir_var.get().strip()])
+        if self.group_upload_serials_var.get().strip():
+            args.extend(["--serials", self.group_upload_serials_var.get().strip()])
+        if settings["schedule_enabled"] and settings["schedule_start"]:
+            args.extend(["--schedule-start", settings["schedule_start"]])
+        if settings["made_for_kids"]:
+            args.append("--made-for-kids")
+        else:
+            args.append("--not-made-for-kids")
+        if settings["altered_content"]:
+            args.append("--altered-content-yes")
+        else:
+            args.append("--altered-content-no")
+        if self.auto_close_browser_var.get():
+            args.append("--auto-close-browser")
+        if dry_run:
+            args.append("--dry-run")
+        return args
+
+    def _run_group_upload(self, *, dry_run: bool = False) -> None:
+        try:
+            save_upload_batch_settings(UPLOAD_BATCH_SETTINGS_FILE, self._collect_group_upload_settings())
+            cmd = self._build_group_upload_cmd(dry_run=dry_run)
+        except Exception as e:
+            messagebox.showerror("参数错误", str(e))
+            return
+        self._run_process(cmd, job_name="分组批量上传")
+
     def _load_tags(self) -> None:
         tags = get_all_tags()
         values = ["全部标签", *tags] if tags else ["全部标签"]
@@ -707,6 +952,8 @@ class CommandCenterApp(ctk.CTk):
             self.generation_tag_menu.configure(values=tags or [""])
         if hasattr(self, "prompt_tag_menu") and self.prompt_tag_menu is not None:
             self.prompt_tag_menu.configure(values=tags or [""])
+        if hasattr(self, "group_upload_tag_menu") and self.group_upload_tag_menu is not None:
+            self.group_upload_tag_menu.configure(values=tags or [""])
         if self.tag_var.get() not in values:
             self.tag_var.set(values[1] if len(values) > 1 else values[0])
         if self.upload_tag_var.get() not in (tags or [""]):
@@ -715,6 +962,8 @@ class CommandCenterApp(ctk.CTk):
             self.generation_tag_var.set(self.upload_tag_var.get() or (tags[0] if tags else ""))
         if self.prompt_tag_var.get() not in (tags or [""]):
             self.prompt_tag_var.set(self.tag_var.get() if self.tag_var.get() != "全部标签" else (tags[0] if tags else ""))
+        if self.group_upload_tag_var.get() not in (tags or [""]):
+            self.group_upload_tag_var.set(self.upload_tag_var.get() or (tags[0] if tags else ""))
         self._sync_upload_channels()
         self._sync_generation_channels()
 
@@ -1022,6 +1271,7 @@ class CommandCenterApp(ctk.CTk):
 
     def _save_workspace_state(self) -> None:
         save_dashboard_state(self._collect_state())
+        save_upload_batch_settings(UPLOAD_BATCH_SETTINGS_FILE, self._collect_group_upload_settings())
         self.status_var.set("当前工作台配置已保存")
         self._append_log("已保存当前工作台配置。")
 
@@ -1381,6 +1631,7 @@ class CommandCenterApp(ctk.CTk):
 
     def _on_close(self) -> None:
         save_dashboard_state(self._collect_state())
+        save_upload_batch_settings(UPLOAD_BATCH_SETTINGS_FILE, self._collect_group_upload_settings())
         self.destroy()
 
 

@@ -73,6 +73,7 @@ RETRYABLE_NETWORK_ERROR_MARKERS = (
     "ERR_CONNECTION_RESET",
     "ERR_NETWORK_CHANGED",
 )
+SUPPORTED_VIDEO_EXTENSIONS = (".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm")
 
 # 详细上传记录目录 (平台自适应)
 if IS_MAC:
@@ -817,6 +818,233 @@ async def set_video_category_music(page, max_attempts: int = 3) -> bool:
     return False
 
 
+async def set_video_category(page, category: str) -> bool:
+    target = str(category or "").strip()
+    if not target:
+        return True
+    if target.lower() == "music":
+        return await set_video_category_music(page)
+
+    dropdown_selectors = [
+        "ytcp-form-select:has-text('Category') ytcp-dropdown-trigger",
+        "ytcp-form-select:has-text('Category') [aria-haspopup='listbox']",
+        "ytcp-form-select #trigger",
+    ]
+    option_selectors = [
+        f"tp-yt-paper-item:has-text('{target}')",
+        f"[role='option']:has-text('{target}')",
+        f"ytcp-menu-service-item-renderer:has-text('{target}')",
+    ]
+
+    for attempt in range(1, 4):
+        await clear_blocking_overlays(page, f"generic-category-{attempt}")
+        for selector in dropdown_selectors:
+            locator = page.locator(selector).first
+            try:
+                if await locator.count() == 0 or not await locator.is_visible():
+                    continue
+                await human_click(page, locator, f"Category 下拉 ({selector})")
+                await asyncio.sleep(0.8)
+                break
+            except Exception:
+                continue
+
+        for selector in option_selectors:
+            locator = page.locator(selector).first
+            try:
+                if await locator.count() == 0 or not await locator.is_visible():
+                    continue
+                clicked = await human_click(page, locator, f"Category 选项 ({target})")
+                if not clicked:
+                    await locator.click(force=True, timeout=3000)
+                await asyncio.sleep(1.0)
+                return True
+            except Exception:
+                continue
+
+    log(f"Category 仍未成功设置为 {target}", "WARN")
+    return False
+
+
+async def set_made_for_kids_setting(page, made_for_kids: bool) -> bool:
+    radio_name = "VIDEO_MADE_FOR_KIDS_MFK" if made_for_kids else "VIDEO_MADE_FOR_KIDS_NOT_MFK"
+    desc = "Made for kids" if made_for_kids else "Not made for kids"
+    return await ensure_upload_radio_selected(page, radio_name, desc)
+
+
+async def set_altered_content_setting(page, altered_content: bool) -> bool:
+    radio_name = "VIDEO_HAS_ALTERED_CONTENT_YES" if altered_content else "VIDEO_HAS_ALTERED_CONTENT_NO"
+    desc = f"Altered content = {'Yes' if altered_content else 'No'}"
+    return await ensure_upload_radio_selected(page, radio_name, desc)
+
+
+async def fill_video_tags(page, tags: List[str]) -> bool:
+    clean_tags = [str(item).strip() for item in (tags or []) if str(item).strip()]
+    if not clean_tags:
+        return True
+
+    joined = ", ".join(clean_tags[:50])
+    tag_selectors = [
+        '#tags-input #textbox',
+        '#tags-input textarea',
+        '#tags-input input[type="text"]',
+        'ytcp-video-tags #textbox',
+        'ytcp-video-tags textarea',
+        'ytcp-video-tags input[type="text"]',
+        'input[aria-label*="Tags"]',
+        'textarea[aria-label*="Tags"]',
+    ]
+
+    for selector in tag_selectors:
+        locator = page.locator(selector).first
+        try:
+            if await locator.count() == 0 or not await locator.is_visible():
+                continue
+            if await human_fill(page, locator, joined, "标签"):
+                return True
+        except Exception:
+            continue
+
+    return await fill_visible_upload_field(page, "tags", joined)
+
+
+def _format_schedule_strings(schedule_text: str) -> tuple[list[str], list[str]]:
+    raw = str(schedule_text or "").strip()
+    parsed = None
+    for fmt in ("%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M", "%Y-%m-%dT%H:%M"):
+        try:
+            parsed = datetime.strptime(raw, fmt)
+            break
+        except Exception:
+            continue
+    if not parsed:
+        raise ValueError("定时发布时间格式应为 YYYY-MM-DD HH:MM")
+
+    date_candidates = [
+        parsed.strftime("%m/%d/%Y"),
+        parsed.strftime("%b %d, %Y"),
+    ]
+    time_candidates = [
+        parsed.strftime("%I:%M %p").lstrip("0"),
+        parsed.strftime("%H:%M"),
+    ]
+    return date_candidates, time_candidates
+
+
+async def fill_schedule_inputs(page, schedule_text: str) -> bool:
+    date_candidates, time_candidates = _format_schedule_strings(schedule_text)
+    try:
+        result = await page.evaluate(
+            """
+            ({ dateCandidates, timeCandidates }) => {
+                const visible = (el) => !!el && (
+                    el.offsetParent !== null ||
+                    el.offsetWidth > 0 ||
+                    el.offsetHeight > 0
+                );
+
+                const allInputs = Array.from(document.querySelectorAll('input, textarea')).filter(visible);
+                const inputMeta = (el) => [
+                    el.getAttribute('aria-label') || '',
+                    el.getAttribute('placeholder') || '',
+                    el.getAttribute('id') || '',
+                    el.getAttribute('name') || '',
+                    el.closest('tp-yt-paper-input, ytcp-form-input-container, ytcp-datetime-picker')
+                        ?.innerText || ''
+                ].join(' ').toLowerCase();
+
+                const dateInput = allInputs.find((el) => /date|日期|日期/i.test(inputMeta(el)));
+                const timeInput = allInputs.find((el) => /time|时间|時間/i.test(inputMeta(el)));
+
+                const assign = (el, value) => {
+                    if (!el) return false;
+                    el.focus();
+                    const setter = Object.getOwnPropertyDescriptor(el.__proto__, 'value')?.set;
+                    if (setter) {
+                        setter.call(el, value);
+                    } else {
+                        el.value = value;
+                    }
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+                    el.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }));
+                    return true;
+                };
+
+                let dateFilled = false;
+                for (const value of dateCandidates) {
+                    if (assign(dateInput, value)) {
+                        dateFilled = true;
+                        break;
+                    }
+                }
+
+                let timeFilled = false;
+                for (const value of timeCandidates) {
+                    if (assign(timeInput, value)) {
+                        timeFilled = true;
+                        break;
+                    }
+                }
+
+                return {
+                    dateFilled,
+                    timeFilled,
+                    dateMeta: dateInput ? inputMeta(dateInput) : '',
+                    timeMeta: timeInput ? inputMeta(timeInput) : '',
+                };
+            }
+            """,
+            {"dateCandidates": date_candidates, "timeCandidates": time_candidates},
+        )
+        if result.get("dateFilled") and result.get("timeFilled"):
+            await asyncio.sleep(1.0)
+            return True
+    except Exception as e:
+        log(f"定时发布时间填写异常: {e}", "WARN")
+    return False
+
+
+async def apply_visibility_settings(page, visibility: str, scheduled_publish_at: str | None = None) -> bool:
+    target = str(visibility or "public").strip().lower()
+    if target == "public":
+        public_radio = page.locator("tp-yt-paper-radio-button[name='PUBLIC']").first
+        public_clicked = await human_click(page, public_radio, "Public")
+        if not public_clicked:
+            public_clicked = await click_visible_upload_dialog_button(
+                page,
+                "Public",
+                text_pattern="^public$|^everyone$|公開|公开",
+            )
+        if not public_clicked:
+            public_clicked = await try_select_public_visibility(page)
+        await asyncio.sleep(1.0)
+        return await ensure_public_visibility_selected(page)
+
+    radio_map = {
+        "private": ("PRIVATE", "Private", "^private$|私密"),
+        "unlisted": ("UNLISTED", "Unlisted", "^unlisted$|不公開|不公开"),
+        "schedule": ("SCHEDULE", "Schedule", "^schedule$|scheduled|定時|定时|排程"),
+    }
+    radio_name, desc, pattern = radio_map.get(target, ("PUBLIC", "Public", "^public$|^everyone$|公開|公开"))
+    selected = await ensure_upload_radio_selected(page, radio_name, desc, max_attempts=3)
+    if not selected:
+        locator = page.locator(f"tp-yt-paper-radio-button[name='{radio_name}']").first
+        if await locator.count() > 0 and await locator.is_visible():
+            selected = await human_click(page, locator, desc)
+        if not selected:
+            selected = await click_visible_upload_dialog_button(page, desc, text_pattern=pattern)
+    await asyncio.sleep(1.0)
+
+    if not selected:
+        return False
+
+    if target == "schedule" and scheduled_publish_at:
+        return await fill_schedule_inputs(page, scheduled_publish_at)
+    return True
+
+
 async def ensure_public_visibility_selected(page) -> bool:
     """尽量确认 Visibility 已切到 Public。"""
     for _ in range(3):
@@ -1001,7 +1229,7 @@ async def try_click_publish_button(page) -> bool:
             """
             () => {
                 const dialogs = document.querySelectorAll('ytcp-uploads-dialog, ytcp-dialog, tp-yt-paper-dialog');
-                const publishRe = /publish|save|yayınla|發佈|发布|公開/i;
+                const publishRe = /publish|save|schedule|yayınla|發佈|发布|公開|定時|定时|排程/i;
                 const visible = (el) => !!el && (el.offsetParent !== null || el.offsetWidth > 0 || el.offsetHeight > 0);
 
                 for (const dialog of dialogs) {
@@ -1016,7 +1244,7 @@ async def try_click_publish_button(page) -> bool:
 
                         const target = btn.querySelector('button') || btn;
                         target.click();
-                        return { success: true, text: text || id || 'publish' };
+                        return { success: true, text: text || id || 'publish_or_schedule' };
                     }
                 }
                 return { success: false };
@@ -1382,6 +1610,16 @@ async def fill_visible_upload_field(page, field_name: str, text: str) -> bool:
                         'ytcp-social-suggestions-textbox#description-textarea #textbox',
                         '#description-textarea [contenteditable="true"]',
                         '#description-textarea textarea',
+                    ],
+                    tags: [
+                        '#tags-input #textbox',
+                        '#tags-input textarea',
+                        '#tags-input input[type="text"]',
+                        'ytcp-video-tags #textbox',
+                        'ytcp-video-tags textarea',
+                        'ytcp-video-tags input[type="text"]',
+                        'input[aria-label*="Tags"]',
+                        'textarea[aria-label*="Tags"]',
                     ],
                 };
 
@@ -1868,8 +2106,9 @@ async def get_upload_monitor_snapshot(page) -> Dict[str, Any]:
             const cancelUploadRe = /Cancel upload|取消上传|取消上傳/i;
             const resumeUploadRe = /Resume upload|恢复上传|恢復上傳|继续上传|繼續上傳/i;
             const rowPublishedRe = /\\bPublished\\b|已发布|已發佈/i;
+            const rowScheduledRe = /\\bScheduled\\b|已排程|已定時|定时发布|定時發布/i;
             const rowUploadedRe = /\\bUploaded\\b|已上传|已上傳/i;
-            const rowVisibilityRe = /\\b(Public|Private|Unlisted)\\b|公开|公開|私密|不公开|不公開/i;
+            const rowVisibilityRe = /\\b(Public|Private|Unlisted|Scheduled)\\b|公开|公開|私密|不公开|不公開|已排程|已定時/i;
 
             result.active_processing =
                 processingRe.test(combinedText) &&
@@ -1920,6 +2159,9 @@ async def get_upload_monitor_snapshot(page) -> Dict[str, Any]:
                 } else if (rowPublishedRe.test(latestRowText)) {
                     result.published_confirmed = true;
                     result.status = 'published';
+                } else if (rowScheduledRe.test(latestRowText)) {
+                    result.upload_completed = true;
+                    result.status = 'scheduled';
                 } else if (rowUploadedRe.test(latestRowText) || rowVisibilityRe.test(latestRowText)) {
                     result.upload_completed = true;
                     result.status = 'upload_complete';
@@ -1957,7 +2199,7 @@ def is_safe_to_close_after_publish(snapshot: Dict[str, Any]) -> bool:
         return False
 
     status = snapshot.get("status")
-    if status in {"upload_complete", "processing", "published", "checks_complete"}:
+    if status in {"upload_complete", "processing", "published", "checks_complete", "scheduled"}:
         return True
 
     return False
@@ -2220,6 +2462,12 @@ async def upload_single_with_browser_recovery(
     is_ypp: bool,
     ab_test_titles: Optional[List[str]] = None,
     playlist_name: Optional[str] = None,
+    tags: Optional[List[str]] = None,
+    visibility: str = "public",
+    scheduled_publish_at: Optional[str] = None,
+    made_for_kids: bool = False,
+    altered_content: bool = True,
+    category: str = "Music",
 ) -> Dict[str, Any]:
     """浏览器/代理断线时，停浏览器后自动重试一次。"""
     attempts = 2
@@ -2244,6 +2492,12 @@ async def upload_single_with_browser_recovery(
             is_ypp=is_ypp,
             ab_test_titles=ab_test_titles,
             playlist_name=playlist_name,
+            tags=tags,
+            visibility=visibility,
+            scheduled_publish_at=scheduled_publish_at,
+            made_for_kids=made_for_kids,
+            altered_content=altered_content,
+            category=category,
         )
 
         if not is_retryable_browser_network_failure(last_result):
@@ -2339,8 +2593,8 @@ def auto_detect_videos(config: Dict) -> Dict[str, Dict[str, List[Path]]]:
         if tag not in valid_tags:
             continue
         
-        # 扫描子目录中的 mp4 文件
-        videos = sorted(sub_dir.glob("*.mp4"))
+        # 扫描子目录中的视频文件
+        videos = sorted([v for v in sub_dir.iterdir() if v.is_file() and v.suffix.lower() in SUPPORTED_VIDEO_EXTENSIONS])
         # 排除母带等非视频文件
         videos = [v for v in videos if not v.name.startswith("master_")]
         
@@ -2552,8 +2806,8 @@ def find_videos(video_folder: str, keyword: str, date: str, tag: str = None) -> 
         log(f"视频子目录不存在: {sub_dir}", "WARN")
         return []
     
-    # 扫描 mp4 文件
-    videos = sorted(sub_dir.glob("*.mp4"))
+    # 扫描视频文件
+    videos = sorted([v for v in sub_dir.iterdir() if v.is_file() and v.suffix.lower() in SUPPORTED_VIDEO_EXTENSIONS])
     # 排除母带
     videos = [v for v in videos if not v.name.startswith("master_")]
     
@@ -4148,7 +4402,13 @@ async def upload_single(
     description: str,
     is_ypp: bool,
     ab_test_titles: List[str] = None,
-    playlist_name: str = None
+    playlist_name: str = None,
+    tags: Optional[List[str]] = None,
+    visibility: str = "public",
+    scheduled_publish_at: Optional[str] = None,
+    made_for_kids: bool = False,
+    altered_content: bool = True,
+    category: str = "Music",
 ) -> Dict[str, Any]:
     """上传单个视频到指定环境"""
     from playwright.async_api import async_playwright
@@ -4646,16 +4906,11 @@ async def upload_single(
                     except Exception as e:
                         log(f"播放列表设置失败 (非致命): {e}", "WARN")
             
-            # ========== 选择 Not made for kids ==========
-            # 验证成功 (2026-01-30): 使用 scrollIntoViewIfNeeded 确保元素可见
-            log("选择 'Not made for kids'...")
-            not_for_kids_selected = await ensure_upload_radio_selected(
-                page,
-                "VIDEO_MADE_FOR_KIDS_NOT_MFK",
-                "Not made for kids",
-            )
-            if not not_for_kids_selected:
-                log("未能确认 'Not made for kids' 已选中，继续后续流程（默认通常为 No）", "WARN")
+            # ========== 设置儿童内容 ==========
+            log(f"设置儿童内容 = {'Yes' if made_for_kids else 'No'}...")
+            kids_selected = await set_made_for_kids_setting(page, made_for_kids)
+            if not kids_selected:
+                log("未能确认儿童内容选项，继续后续流程", "WARN")
             await random_delay(0.5, 1)
             
             # ========== 展开 Show more ==========
@@ -4672,41 +4927,34 @@ async def upload_single(
                         await random_delay(2.0, 2.5)  # 等待展开动画
                 except Exception as e:
                     log(f"Show more 点击失败: {e}", "WARN")
+
+            # ========== 标签 ==========
+            if tags:
+                log(f"填写标签 ({len(tags)} 个)...")
+                tags_ok = await fill_video_tags(page, tags)
+                if not tags_ok:
+                    log("标签未能确认填写成功，继续后续流程", "WARN")
             
-            # ========== Category 固定为 Music ==========
-            log("设置 Category = Music...")
-            category_ok = await set_video_category_music(page)
+            # ========== Category ==========
+            log(f"设置 Category = {category}...")
+            category_ok = await set_video_category(page, category)
             if not category_ok:
                 return make_upload_result(
                     False,
                     True,
-                    "未能确认 Category = Music",
+                    f"未能确认 Category = {category}",
                     "category_selection_failed",
                 )
 
-            # ========== 选择 Altered content = Yes ==========
-            # 用户要求：该项必须为 Yes
-            log("选择 'Altered content = Yes'...")
-            altered_yes = page.locator("tp-yt-paper-radio-button[name='VIDEO_HAS_ALTERED_CONTENT_YES']").first
-            if await altered_yes.count() > 0:
-                altered_selected = await ensure_upload_radio_selected(
-                    page,
-                    "VIDEO_HAS_ALTERED_CONTENT_YES",
-                    "Altered content = Yes",
-                )
-                if not altered_selected:
-                    return make_upload_result(
-                        False,
-                        True,
-                        "未能确认 Altered content = Yes",
-                        "altered_content_selection_failed",
-                    )
-            else:
+            # ========== AI / 合成内容 ==========
+            log(f"设置 Altered content = {'Yes' if altered_content else 'No'}...")
+            altered_selected = await set_altered_content_setting(page, altered_content)
+            if not altered_selected:
                 return make_upload_result(
                     False,
                     True,
-                    "未找到 Altered content 选项（Yes）",
-                    "altered_content_option_missing",
+                    f"未能确认 Altered content = {'Yes' if altered_content else 'No'}",
+                    "altered_content_selection_failed",
                 )
             
             await random_delay(0.5, 1)
@@ -4715,13 +4963,8 @@ async def upload_single(
             # 大文件时，Studio 可能在上传进度较低时不渲染 Next 按钮；这里需要长等待。
             next_clicked = await click_next_button(page, "Next", timeout_ms=30 * 60 * 1000)
             if not next_clicked:
-                log("Next 未就绪，重试设置 Not made for kids 后再试一次...", "WARN")
-                await ensure_upload_radio_selected(
-                    page,
-                    "VIDEO_MADE_FOR_KIDS_NOT_MFK",
-                    "Not made for kids (retry)",
-                    max_attempts=2,
-                )
+                log("Next 未就绪，重试设置儿童内容后再试一次...", "WARN")
+                await set_made_for_kids_setting(page, made_for_kids)
                 next_clicked = await click_next_button(page, "Next (retry)", timeout_ms=10 * 60 * 1000)
             if not next_clicked:
                 return make_upload_result(
@@ -4914,35 +5157,30 @@ async def upload_single(
                 )
             await random_delay(2, 3)
             
-            # 选择 Public
-            public_radio = page.locator("tp-yt-paper-radio-button[name='PUBLIC']").first
-            public_clicked = await human_click(page, public_radio, "Public")
-            if not public_clicked:
-                public_clicked = await click_visible_upload_dialog_button(
-                    page,
-                    "Public",
-                    text_pattern="^public$|^everyone$|公開|公开",
-                )
-            if not public_clicked:
-                public_clicked = await try_select_public_visibility(page)
+            log(f"设置可见性 = {visibility}...")
+            visibility_ok = await apply_visibility_settings(page, visibility, scheduled_publish_at=scheduled_publish_at)
             await random_delay(1, 2)
-            public_selected = await ensure_public_visibility_selected(page)
-            if not public_selected:
-                log("未能确认 Public 已选中，继续尝试 Publish 兜底", "WARN")
+            if not visibility_ok:
+                return make_upload_result(
+                    False,
+                    True,
+                    f"未能确认可见性 = {visibility}",
+                    "visibility_selection_failed",
+                )
             
-            # ========== 检测并点击 Publish 按钮 ==========
+            # ========== 检测并点击 Publish / Save / Schedule 按钮 ==========
             publish_state = await get_visible_upload_dialog_button_state(
                 page,
                 button_id="done-button",
-                text_pattern="publish|save|yayınla|發佈|发布|公開",
+                text_pattern="publish|save|schedule|yayınla|發佈|发布|公開|定時|定时|排程",
             )
             
             if not publish_state.get("found"):
-                log("未找到 Publish 按钮，尝试 DOM 兜底直接点击", "WARN")
+                log("未找到最终提交按钮，尝试 DOM 兜底直接点击", "WARN")
                 publish_clicked = await try_click_publish_button(page)
                 if not publish_clicked:
-                    log("未找到 Publish 按钮", "ERR")
-                    return make_upload_result(False, True, "未找到 Publish 按钮", "publish_button_missing")
+                    log("未找到最终提交按钮", "ERR")
+                    return make_upload_result(False, True, "未找到最终提交按钮", "publish_button_missing")
                 await asyncio.sleep(2)
                 dialog_result = await handle_publish_anyway_dialog(
                     page,
@@ -4952,7 +5190,7 @@ async def upload_single(
                 )
                 if dialog_result.get("detected") and not dialog_result.get("clicked"):
                     log("检测到内容检查提示，但未能自动点击 'Publish anyway'，后续监控会继续重试", "WARN")
-                log("✅ 已点击 Publish!", "OK")
+                log("✅ 已点击最终提交按钮!", "OK")
                 publish_state = {"found": True, "disabled": False, "clicked_via_dom": True}
             
             # 检查按钮状态：aria-disabled="true" 表示灰色不可点
@@ -4960,7 +5198,7 @@ async def upload_single(
             
             if is_disabled == "true":
                 # ========== 灰色 = 上传失败, 立刻取消 ==========
-                log("❌ Publish 按钮灰色 (不可点击) = 上传失败!", "ERR")
+                log("❌ 最终提交按钮灰色 (不可点击) = 上传失败!", "ERR")
                 log("正在取消上传并清理...", "ACT")
                 
                 try:
@@ -5039,20 +5277,20 @@ async def upload_single(
                         pass
                 
                 log("📋 此频道将记录为失败, 需要重新上传", "ERR")
-                return make_upload_result(False, True, "Publish 按钮灰色，已取消上传", "publish_disabled")
+                return make_upload_result(False, True, "最终提交按钮灰色，已取消上传", "publish_disabled")
             
-            # ========== Publish 可点击, 正常发布 ==========
+            # ========== 提交按钮可点击, 正常提交 ==========
             if not publish_state.get("clicked_via_dom"):
-                log("点击 Publish...", "ACT")
+                log("点击最终提交按钮...", "ACT")
                 try:
                     done_btn = page.locator("ytcp-button#done-button").first
-                    publish_clicked = await human_click(page, done_btn, "Publish (Yayınla)")
+                    publish_clicked = await human_click(page, done_btn, "Done / Publish / Schedule")
                     if not publish_clicked:
                         publish_clicked = await click_visible_upload_dialog_button(
                             page,
-                            "Publish",
+                            "Done / Publish / Schedule",
                             button_id="done-button",
-                            text_pattern="publish|save|yayınla|發佈|发布|公開",
+                            text_pattern="publish|save|schedule|yayınla|發佈|发布|公開|定時|定时|排程",
                         )
                     if not publish_clicked:
                         publish_clicked = await try_click_publish_button(page)
@@ -5067,10 +5305,10 @@ async def upload_single(
                     )
                     if dialog_result.get("detected") and not dialog_result.get("clicked"):
                         log("检测到内容检查提示，但未能自动点击 'Publish anyway'，后续监控会继续重试", "WARN")
-                    log("✅ 已点击 Publish!", "OK")
+                    log("✅ 已点击最终提交按钮!", "OK")
                 except Exception as e:
-                    log(f"点击 Publish 失败: {e}", "ERR")
-                    return make_upload_result(False, True, f"点击 Publish 失败: {e}", "publish_click_failed")
+                    log(f"点击最终提交按钮失败: {e}", "ERR")
+                    return make_upload_result(False, True, f"点击最终提交按钮失败: {e}", "publish_click_failed")
 
             monitor_result = await wait_for_safe_close_after_publish(page, serial)
             if not monitor_result.get("confirmed"):
@@ -5248,40 +5486,48 @@ async def batch_upload(
             # 按容器号匹配视频
             video = None
             for v in videos:
-                v_match = re.match(r'\d{4}_(\d+)\.mp4', v.name)
+                v_match = re.match(r'\d{4}_(\d+)\.[^.]+$', v.name)
                 if v_match and int(v_match.group(1)) == serial:
                     video = v
                     break
-            
-            # 按 Container ID 匹配元数据
-            channel_meta = None
-            for meta in metadata:
-                if meta.get("container_id") == serial:
-                    channel_meta = meta
-                    break
-            if not channel_meta and i < len(metadata):
-                channel_meta = metadata[i]
-            
-            # 按 Container ID 查找封面
-            thumbnails = find_thumbnails(str(project_folder), count=1, container=serial) if project_folder else []
-            current_set_num = None
-            if thumbnails:
-                match = re.match(r'^(\d+)_(\d+)', thumbnails[0].stem)
-                if match:
-                    current_set_num = int(match.group(2))
-            
-            # 获取对应标题
-            title = "默认"
-            if channel_meta:
-                titles_dict = channel_meta.get("titles", {})
-                if isinstance(titles_dict, dict) and current_set_num and current_set_num in titles_dict:
-                    title = titles_dict[current_set_num]
-                elif isinstance(titles_dict, dict) and titles_dict:
-                    title = list(titles_dict.values())[0]
-                elif isinstance(titles_dict, list) and titles_dict:
-                    title = titles_dict[0]
-            
-            print(f"序号 {serial}: {channel_meta.get('name', '未知') if channel_meta else '未知'}")
+
+            if manifest_data and str(serial) in manifest_data.get("channels", {}):
+                ch_manifest = manifest_data["channels"][str(serial)]
+                thumbnails = [Path(p) for p in ch_manifest.get("thumbnails", []) if Path(p).exists()]
+                title = ch_manifest.get("title", "默认")
+                channel_name = ch_manifest.get("channel_name") or serial_to_channel_name.get(serial, "未知")
+                current_set_num = ch_manifest.get("set")
+            else:
+                # 按 Container ID 匹配元数据
+                channel_meta = None
+                for meta in metadata:
+                    if meta.get("container_id") == serial:
+                        channel_meta = meta
+                        break
+                if not channel_meta and i < len(metadata):
+                    channel_meta = metadata[i]
+
+                # 按 Container ID 查找封面
+                thumbnails = find_thumbnails(str(project_folder), count=1, container=serial) if project_folder else []
+                current_set_num = None
+                if thumbnails:
+                    match = re.match(r'^(\d+)_(\d+)', thumbnails[0].stem)
+                    if match:
+                        current_set_num = int(match.group(2))
+
+                # 获取对应标题
+                title = "默认"
+                if channel_meta:
+                    titles_dict = channel_meta.get("titles", {})
+                    if isinstance(titles_dict, dict) and current_set_num and current_set_num in titles_dict:
+                        title = titles_dict[current_set_num]
+                    elif isinstance(titles_dict, dict) and titles_dict:
+                        title = list(titles_dict.values())[0]
+                    elif isinstance(titles_dict, list) and titles_dict:
+                        title = titles_dict[0]
+                channel_name = channel_meta.get("name", "未知") if channel_meta else "未知"
+
+            print(f"序号 {serial}: {channel_name}")
             print(f"  视频: {video.name if video else '无'}")
             print(f"  封面: {thumbnails[0].name if thumbnails else '无'} (套{current_set_num or '?'})")
             print(f"  标题: {title[:50]}...")
@@ -5372,7 +5618,7 @@ async def batch_upload(
         video = None
         for v in videos:
             # 从文件名提取容器号: "0212_113.mp4" → 113
-            v_match = re.match(r'\d{4}_(\d+)\.mp4', v.name)
+            v_match = re.match(r'\d{4}_(\d+)\.[^.]+$', v.name)
             if v_match and int(v_match.group(1)) == serial:
                 video = v
                 break
@@ -5386,6 +5632,13 @@ async def batch_upload(
             ch_manifest = manifest_data["channels"][str(serial)]
             title = ch_manifest.get("title", "Video Title")
             description = ch_manifest.get("description", "")
+            tag_list = [str(item).strip() for item in ch_manifest.get("tag_list", []) if str(item).strip()]
+            upload_options = ch_manifest.get("upload_options", {}) if isinstance(ch_manifest.get("upload_options", {}), dict) else {}
+            visibility = str(upload_options.get("visibility") or "public").strip().lower()
+            scheduled_publish_at = str(upload_options.get("scheduled_publish_at") or "").strip() or None
+            made_for_kids = bool(upload_options.get("made_for_kids", False))
+            altered_content = bool(upload_options.get("altered_content", True))
+            category = str(upload_options.get("category") or "Music").strip() or "Music"
             # 【空标题阻断】标题为空时跳过，避免浪费浏览器资源
             if not title or title == "Video Title":
                 log(f"序号 {serial}: ❌ 标题为空，跳过上传（请检查 generation_map.json 和 metadata_channels.md）", "ERR")
@@ -5446,7 +5699,13 @@ async def batch_upload(
                 description=description,
                 is_ypp=is_ypp,
                 ab_test_titles=ab_titles,
-                playlist_name=playlist_name
+                playlist_name=playlist_name,
+                tags=tag_list,
+                visibility=visibility,
+                scheduled_publish_at=scheduled_publish_at,
+                made_for_kids=made_for_kids,
+                altered_content=altered_content,
+                category=category,
             )
         except Exception as e:
             log(f"序号 {serial} 上传异常: {e}", "ERR")

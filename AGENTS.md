@@ -23,10 +23,13 @@ If the task is about uploading, inspect these files first:
 
 - `batch_upload.py`
 - `bulk_upload.py`
+- `group_upload_batch.py`
+- `group_upload_workflow.py`
 - `browser_api.py`
 - `utils.py`
 - `config/upload_config.json`
 - `config/channel_mapping.json`
+- `config/upload_batch_settings.json`
 
 If the task is about rendering, inspect these files first:
 
@@ -72,11 +75,12 @@ When the user asks for help operating this repo, prefer this workflow:
 
 1. Prefer `dashboard.py` as the daily entry point.
 2. If the user has multiple tags for one day, use the multi-tag task list in `dashboard.py` or `bulk_upload.py`.
-3. Verify config files exist and explain what fields the user must fill.
-4. Verify required local files exist for the requested task.
-5. Run the smallest realistic command for the requested workflow.
-6. If automation fails, diagnose from `batch_upload.py`, `bulk_upload.py`, or the relevant runtime logs.
-7. Update docs when the operating method changes.
+3. If the user already has rendered videos and wants to upload a whole folder to one browser group, use `dashboard.py -> 分组批量上传` or `group_upload_batch.py`.
+4. Verify config files exist and explain what fields the user must fill.
+5. Verify required local files exist for the requested task.
+6. Run the smallest realistic command for the requested workflow.
+7. If automation fails, diagnose from `batch_upload.py`, `bulk_upload.py`, `group_upload_batch.py`, or the relevant runtime logs.
+8. Update docs when the operating method changes.
 
 Do not jump straight to broad refactors if the user asked for an operational fix.
 
@@ -103,10 +107,17 @@ For multiple tags in one day:
 py -3 bulk_upload.py --date 3.12 --tags 面壁者,芝加哥蓝调 --auto-confirm --auto-close-browser
 ```
 
+For an existing video folder that should be assigned to channels in one tag:
+
+```bash
+py -3 group_upload_batch.py --tag 面壁者 --date 3.12 --source-dir F:\待上传视频 --generation-mode site_api --visibility public --auto-confirm --auto-close-browser
+```
+
 Known behavior:
 
 - `Altered content` should be selected as `Yes`.
 - `Category` should be selected as `Music`.
+- The new group-upload manifest can also carry tags, made-for-kids, visibility, and schedule settings.
 - For large files, the first `Next` button may not appear until upload progresses much further.
 
 ## 6. Render workflow
