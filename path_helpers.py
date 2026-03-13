@@ -70,13 +70,17 @@ def resolve_upload_script(base_dir: str | Path) -> Path:
 def default_scheduler_config(base_dir: str | Path) -> dict:
     """生成适合当前仓库的默认调度配置。"""
     base = Path(base_dir).resolve(strict=False)
+    output_root = (base / "workspace" / "AutoTask").resolve(strict=False)
     return {
         "music_dir": str((base / "workspace" / "music").resolve(strict=False)),
         "base_image_dir": str((base / "workspace" / "base_image").resolve(strict=False)),
-        "output_root": str((base / "workspace" / "AutoTask").resolve(strict=False)),
+        "output_root": str(output_root),
         "upload_config": str(resolve_config_file(base, "upload_config.json")),
         "ffmpeg_bin": "ffmpeg",
         "ffmpeg_path": "ffmpeg",
+        "used_media_root": str((output_root / "_used_media").resolve(strict=False)),
+        "render_cleanup_days": 5,
+        "group_source_bindings": {},
     }
 
 
@@ -87,7 +91,7 @@ def normalize_scheduler_config(raw_cfg: dict | None, base_dir: str | Path) -> di
         cfg.update(raw_cfg)
 
     base = Path(base_dir).resolve(strict=False)
-    for key in ("music_dir", "base_image_dir", "output_root", "upload_config"):
+    for key in ("music_dir", "base_image_dir", "output_root", "upload_config", "used_media_root"):
         cfg[key] = str(normalize_path(cfg.get(key), base))
 
     ffmpeg_bin = cfg.get("ffmpeg_bin") or cfg.get("ffmpeg_path") or "ffmpeg"
@@ -95,4 +99,18 @@ def normalize_scheduler_config(raw_cfg: dict | None, base_dir: str | Path) -> di
         ffmpeg_bin = str(normalize_path(ffmpeg_bin, base))
     cfg["ffmpeg_bin"] = ffmpeg_bin
     cfg["ffmpeg_path"] = ffmpeg_bin
+    try:
+        cfg["render_cleanup_days"] = max(0, int(cfg.get("render_cleanup_days", 5)))
+    except Exception:
+        cfg["render_cleanup_days"] = 5
+
+    raw_bindings = cfg.get("group_source_bindings") or {}
+    normalized_bindings: dict[str, str] = {}
+    if isinstance(raw_bindings, dict):
+        for tag, value in raw_bindings.items():
+            text = str(value or "").strip()
+            if not text:
+                continue
+            normalized_bindings[str(tag)] = str(normalize_path(text, base))
+    cfg["group_source_bindings"] = normalized_bindings
     return cfg

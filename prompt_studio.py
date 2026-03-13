@@ -95,6 +95,7 @@ def default_prompt_studio_config() -> dict:
         "version": 1,
         "defaultApiPreset": "默认API模板",
         "defaultContentTemplate": "默认内容模板",
+        "tagApiBindings": {},
         "tagBindings": {},
         "apiPresets": {
             "默认API模板": default_api_preset(),
@@ -139,6 +140,10 @@ def normalize_prompt_studio_config(raw: Any) -> dict:
     if default_content in config["contentTemplates"]:
         config["defaultContentTemplate"] = default_content
 
+    for tag, template_name in (raw.get("tagApiBindings") or {}).items():
+        if template_name in config["apiPresets"]:
+            config["tagApiBindings"][str(tag)] = template_name
+
     for tag, template_name in (raw.get("tagBindings") or {}).items():
         if template_name in config["contentTemplates"]:
             config["tagBindings"][str(tag)] = template_name
@@ -173,6 +178,21 @@ def pick_content_template_name(config: dict, tag: str) -> str:
     if default_name in templates:
         return default_name
     return next(iter(templates))
+
+
+def pick_api_preset_name(config: dict, tag: str) -> str:
+    presets = config.get("apiPresets", {})
+    if not presets:
+        return "默认API模板"
+    bound = config.get("tagApiBindings", {}).get(tag)
+    if bound in presets:
+        return bound
+    if tag in presets:
+        return tag
+    default_name = config.get("defaultApiPreset")
+    if default_name in presets:
+        return default_name
+    return next(iter(presets))
 
 
 def parse_tag_range(raw: str) -> tuple[int, int]:

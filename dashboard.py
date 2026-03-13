@@ -44,6 +44,7 @@ from prompt_studio import (
     guess_cover_names,
     load_generation_map as load_generation_map_file,
     load_prompt_studio_config,
+    pick_api_preset_name,
     pick_content_template_name,
     render_master_prompt,
     save_generation_map as save_generation_map_file,
@@ -70,6 +71,7 @@ SCHEDULER_SCRIPT = SCRIPT_DIR / "daily_scheduler.py"
 UPLOAD_SCRIPT = SCRIPT_DIR / "batch_upload.py"
 BULK_UPLOAD_SCRIPT = SCRIPT_DIR / "bulk_upload.py"
 GROUP_UPLOAD_SCRIPT = SCRIPT_DIR / "group_upload_batch.py"
+DIRECT_MEDIA_SCRIPT = SCRIPT_DIR / "direct_media_batch.py"
 LEGACY_RENDERER = SCRIPT_DIR / "app.py"
 LEGACY_SCHEDULER = SCRIPT_DIR / "scheduler_gui.py"
 SCHEDULER_CONFIG_FILE = SCRIPT_DIR / "scheduler_config.json"
@@ -80,6 +82,7 @@ UPLOAD_BATCH_SETTINGS_FILE = SCRIPT_DIR / "config" / "upload_batch_settings.json
 IMAGE_SOURCE_SUFFIXES = {".png", ".jpg", ".jpeg", ".mp4"}
 IMAGE_RENDER_SUFFIXES = {".png", ".jpg", ".jpeg"}
 AUDIO_SOURCE_SUFFIXES = {".mp3"}
+DIRECT_AUDIO_SUFFIXES = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
 
 COLOR_MAP = {
     "随机": "random",
@@ -150,7 +153,7 @@ GROUP_UPLOAD_CATEGORY_VALUES = [
     "Travel & Events",
 ]
 TASK_MODE_VALUES = ["upload_only", "render_only", "render_and_upload"]
-UPLOAD_SOURCE_MODE_VALUES = ["render_output", "ready_folder"]
+UPLOAD_SOURCE_MODE_VALUES = ["render_output", "group_bound_media", "ready_folder"]
 UPLOAD_METADATA_MODE_VALUES = ["prompt_api", "daily_content"]
 UPLOAD_METADATA_MODE_LABELS = {
     "prompt_api": "提示词那套",
@@ -160,12 +163,14 @@ UPLOAD_METADATA_MODE_DISPLAY_VALUES = [UPLOAD_METADATA_MODE_LABELS[item] for ite
 BOOL_OVERRIDE_VALUES = ["yes", "no"]
 
 UPLOAD_ENTRY_MODE_LABELS = {
+    "direct_media": "鎸夊垎缁勭礌鏉愭枃浠跺す鐩村嚭",
     "window_plan": "按窗口任务上传",
     "single_channel": "单频道上传",
     "batch_tags": "多赛道任务清单",
     "group_folder": "同分组现成视频",
 }
 UPLOAD_ENTRY_MODE_TABS = {
+    "direct_media": "涓婁紶",
     "window_plan": "上传",
     "single_channel": "上传",
     "batch_tags": "上传",
@@ -180,6 +185,9 @@ WINDOW_SCOPE_LABELS = {
 
 def normalize_upload_entry_mode(value: str) -> str:
     aliases = {
+        "direct_media": "direct_media",
+        "group_bound_media": "direct_media",
+        "鎸夊垎缁勭礌鏉愭枃浠跺す鐩村嚭": "direct_media",
         "window_plan": "window_plan",
         "window": "window_plan",
         "窗口": "window_plan",
@@ -398,6 +406,10 @@ class CommandCenterApp(ctk.CTk):
         self.prompt_audience_image_data_url: str | None = None
         self.prompt_audience_analysis_busy = False
         self.prompt_api_test_busy = False
+        self.api_preset_save_name_entry: ctk.CTkEntry | None = None
+        self.content_template_save_name_entry: ctk.CTkEntry | None = None
+        self.group_binding_vars: dict[str, ctk.StringVar] = {}
+        self.group_binding_rows_frame: ctk.CTkScrollableFrame | None = None
         self._syncing_task_mode = False
         self.quick_basic_card: ctk.CTkFrame | None = None
         self.gen_title_box: ctk.CTkTextbox | None = None
@@ -512,6 +524,12 @@ class CommandCenterApp(ctk.CTk):
         self.generation_status_var = ctk.StringVar(value="等待加载 generation_map")
         self.api_preset_name_var = ctk.StringVar(value=self.ui_state["api_preset_name"])
         self.content_template_name_var = ctk.StringVar(value=self.ui_state["content_template_name"])
+        self.api_preset_save_name_var = ctk.StringVar(
+            value=self.ui_state.get("api_preset_save_name") or self.ui_state["api_preset_name"]
+        )
+        self.content_template_save_name_var = ctk.StringVar(
+            value=self.ui_state.get("content_template_save_name") or self.ui_state["content_template_name"]
+        )
         self.api_provider_var = ctk.StringVar(value="")
         self.api_key_var = ctk.StringVar(value="")
         self.api_base_url_var = ctk.StringVar(value="")
@@ -556,6 +574,8 @@ class CommandCenterApp(ctk.CTk):
         self.upload_fill_text_var = ctk.BooleanVar(value=bool(self.ui_state.get("upload_fill_text", True)))
         self.upload_fill_thumbnails_var = ctk.BooleanVar(value=bool(self.ui_state.get("upload_fill_thumbnails", True)))
         self.upload_sync_daily_content_var = ctk.BooleanVar(value=bool(self.ui_state.get("upload_sync_daily_content", True)))
+        self.used_media_root_var = ctk.StringVar(value=str(self.scheduler_cfg.get("used_media_root", resolve_local_path("workspace/AutoTask/_used_media"))))
+        self.render_cleanup_days_var = ctk.StringVar(value=str(self.scheduler_cfg.get("render_cleanup_days", 5)))
 
         for traced_var in (
             self.date_var,
@@ -597,6 +617,7 @@ class CommandCenterApp(ctk.CTk):
             traced_var.trace_add("write", self._handle_quick_mode_change)
 
         self.upload_metadata_mode_var.trace_add("write", self._handle_upload_metadata_mode_change)
+        self.upload_source_mode_var.trace_add("write", self._handle_upload_source_mode_change)
 
     def _build_ui(self) -> None:
         top = ctk.CTkFrame(self, corner_radius=16)
@@ -703,6 +724,10 @@ class CommandCenterApp(ctk.CTk):
     def _handle_upload_metadata_mode_change(self, *_args) -> None:
         self._sync_upload_metadata_mode_ui()
 
+    def _handle_upload_source_mode_change(self, *_args) -> None:
+        self._sync_upload_metadata_mode_ui()
+        self._refresh_quick_upload_mode_summary()
+
     def _set_upload_metadata_mode_from_label(self, selected: str) -> None:
         mode = normalize_upload_metadata_mode(selected)
         if self.upload_metadata_mode_var.get() != mode:
@@ -719,7 +744,8 @@ class CommandCenterApp(ctk.CTk):
         if self.upload_metadata_mode_label_var.get() != label:
             self.upload_metadata_mode_label_var.set(label)
         if self.upload_ready_source_section is not None:
-            should_show_ready_inputs = mode != "prompt_api"
+            source_mode = str(self.upload_source_mode_var.get() or "render_output").strip()
+            should_show_ready_inputs = source_mode == "ready_folder" and mode == "daily_content"
             is_visible = bool(self.upload_ready_source_section.winfo_manager())
             if should_show_ready_inputs and not is_visible:
                 self.upload_ready_source_section.pack(fill="x", padx=14, pady=(0, 12))
@@ -1077,6 +1103,150 @@ class CommandCenterApp(ctk.CTk):
         self._sync_upload_metadata_mode_ui()
         self._refresh_upload_window_buttons()
 
+    def _build_upload_tab(self, parent) -> None:
+        scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=8, pady=8)
+        hidden_state = ctk.CTkFrame(scroll, fg_color="transparent", width=1, height=1)
+        self.upload_tag_menu = ctk.CTkOptionMenu(hidden_state, variable=self.upload_tag_var, values=[""])
+        self.channel_menu = ctk.CTkOptionMenu(hidden_state, variable=self.channel_var, values=[""])
+
+        source = self._section_card(
+            scroll,
+            "步骤 1：先定上传来源和文案来源",
+            "上传页就是唯一入口。1 个窗口任务就是单个上传，多个窗口任务就是批量上传。"
+            "现在一共 3 种来源：上传渲染产物、按分组素材文件夹直出、上传现成视频文件夹。",
+        )
+        source_row = ctk.CTkFrame(source, fg_color="transparent")
+        source_row.pack(fill="x", padx=14, pady=(0, 8))
+        ctk.CTkRadioButton(source_row, text="上传渲染产物", variable=self.upload_source_mode_var, value="render_output").pack(side="left", padx=(0, 20))
+        ctk.CTkRadioButton(source_row, text="按分组素材文件夹直出", variable=self.upload_source_mode_var, value="group_bound_media").pack(side="left", padx=(0, 20))
+        ctk.CTkRadioButton(source_row, text="上传现成视频文件夹", variable=self.upload_source_mode_var, value="ready_folder").pack(side="left", padx=(0, 20))
+        ctk.CTkButton(source_row, text="打开提示词页", width=120, fg_color="#334155", command=lambda: self.tabs.set("提示词")).pack(side="left", padx=(16, 8))
+        ctk.CTkButton(source_row, text="打开当日内容页", width=120, fg_color="#334155", command=lambda: self.tabs.set("当日内容")).pack(side="left")
+
+        source_row2 = ctk.CTkFrame(source, fg_color="transparent")
+        source_row2.pack(fill="x", padx=14, pady=(0, 8))
+        self.upload_metadata_mode_menu = self._labeled_option(
+            source_row2,
+            "文案来源",
+            self.upload_metadata_mode_label_var,
+            UPLOAD_METADATA_MODE_DISPLAY_VALUES,
+            width=160,
+            command=self._set_upload_metadata_mode_from_label,
+        )
+        ctk.CTkSwitch(source_row2, text="生成标题/简介/标签", variable=self.upload_fill_text_var).pack(side="left", padx=(0, 16), pady=(20, 0))
+        ctk.CTkSwitch(source_row2, text="处理缩略图", variable=self.upload_fill_thumbnails_var).pack(side="left", padx=(0, 16), pady=(20, 0))
+        ctk.CTkSwitch(source_row2, text="同步到当日内容", variable=self.upload_sync_daily_content_var).pack(side="left", padx=(0, 16), pady=(20, 0))
+
+        ctk.CTkLabel(
+            source,
+            text="说明：如果选择“按分组素材文件夹直出”，每个分组的素材目录去“路径配置”里长期绑定。"
+            "如果选择“上传现成视频文件夹”，只有在“原先那套”下才需要下面这两个目录。",
+            text_color="#9aa0aa",
+            justify="left",
+            wraplength=940,
+        ).pack(anchor="w", padx=14, pady=(0, 8))
+
+        self.upload_ready_source_section = ctk.CTkFrame(source, fg_color="transparent")
+        self.upload_ready_source_section.pack(fill="x", padx=14, pady=(0, 12))
+
+        source_row3 = ctk.CTkFrame(self.upload_ready_source_section, fg_color="transparent")
+        source_row3.pack(fill="x", pady=(0, 8))
+        self._labeled_entry(source_row3, "现成视频文件夹", self.group_upload_source_dir_var, placeholder="只在‘上传现成视频文件夹 + 原先那套’时需要", expand=True)
+        ctk.CTkButton(source_row3, text="选择视频目录", width=110, fg_color="#334155", command=lambda: self._pick_directory_for_var(self.group_upload_source_dir_var)).pack(side="left", padx=(0, 10), pady=(20, 0))
+
+        source_row4 = ctk.CTkFrame(self.upload_ready_source_section, fg_color="transparent")
+        source_row4.pack(fill="x", pady=(0, 12))
+        self._labeled_entry(source_row4, "现成缩略图文件夹", self.group_upload_thumb_dir_var, placeholder="可选，不填就自动处理", expand=True)
+        ctk.CTkButton(source_row4, text="选择缩略图目录", width=120, fg_color="#334155", command=lambda: self._pick_directory_for_var(self.group_upload_thumb_dir_var)).pack(side="left", padx=(0, 10), pady=(20, 0))
+
+        defaults = self._section_card(
+            scroll,
+            "步骤 2：统一默认规则",
+            "这里是所有窗口的通用默认值。某个窗口要单独改，再用下面“加入窗口时”的那排临时覆盖。",
+        )
+        default_row = ctk.CTkFrame(defaults, fg_color="transparent")
+        default_row.pack(fill="x", padx=14, pady=(0, 8))
+        self._labeled_entry(default_row, "日期", self.date_var, width=120, placeholder="MMDD / 3.12")
+        self._labeled_option(default_row, "可见性", self.group_upload_visibility_var, GROUP_UPLOAD_VISIBILITY_VALUES, width=150)
+        self._labeled_option(default_row, "分类", self.group_upload_category_var, GROUP_UPLOAD_CATEGORY_VALUES, width=180)
+        ctk.CTkSwitch(default_row, text="儿童内容", variable=self.group_upload_made_for_kids_var).pack(side="left", padx=(0, 16), pady=(20, 0))
+        ctk.CTkSwitch(default_row, text="AI/合成内容", variable=self.group_upload_altered_content_var).pack(side="left", padx=(0, 16), pady=(20, 0))
+        ctk.CTkSwitch(default_row, text="启用定时发布", variable=self.group_upload_schedule_enabled_var).pack(side="left", padx=(0, 16), pady=(20, 0))
+
+        default_row2 = ctk.CTkFrame(defaults, fg_color="transparent")
+        default_row2.pack(fill="x", padx=14, pady=(0, 12))
+        self._labeled_entry(default_row2, "开始时间", self.group_upload_schedule_start_var, width=220, placeholder="2026-03-13 21:00")
+        self._labeled_entry(default_row2, "间隔(分钟)", self.group_upload_schedule_interval_var, width=120, placeholder="60")
+        ctk.CTkButton(default_row2, text="恢复加入窗口默认值", width=150, fg_color="#475569", command=self._reset_upload_window_overrides).pack(side="left", padx=(0, 10), pady=(20, 0))
+
+        planner = self._section_card(
+            scroll,
+            "步骤 3：把今天要上传的窗口加进来",
+            "先选分组，再点窗口。系统会自动写进下面唯一的任务区。只写 1 行就是单个上传，写多行就是批量上传。",
+        )
+        picker_row = ctk.CTkFrame(planner, fg_color="transparent")
+        picker_row.pack(fill="x", padx=14, pady=(0, 8))
+        self.upload_picker_tag_menu = self._labeled_option(
+            picker_row,
+            "当前分组",
+            self.upload_picker_tag_var,
+            ["加载中..."],
+            width=220,
+            command=lambda _: self._refresh_upload_window_buttons(),
+        )
+        ctk.CTkButton(picker_row, text="加入本组全部窗口", width=130, fg_color="#334155", command=self._append_picker_group_windows).pack(side="left", padx=(0, 8), pady=(20, 0))
+        ctk.CTkButton(picker_row, text="移除本组窗口", width=130, fg_color="#475569", command=self._remove_picker_group_windows).pack(side="left", padx=(0, 8), pady=(20, 0))
+        ctk.CTkButton(picker_row, text="刷新窗口按钮", width=120, fg_color="#475569", command=self._refresh_upload_window_buttons).pack(side="left", pady=(20, 0))
+
+        picker_help = ctk.CTkFrame(planner, fg_color="transparent")
+        picker_help.pack(fill="x", padx=14, pady=(0, 8))
+        self._labeled_option(picker_help, "加入窗口时 YPP", self.upload_window_ypp_override_var, BOOL_OVERRIDE_VALUES, width=110)
+        self._labeled_entry(picker_help, "自定义标题", self.upload_window_title_override_var, width=220, placeholder="可留空")
+        self._labeled_option(picker_help, "可见性覆盖", self.upload_window_visibility_override_var, GROUP_UPLOAD_VISIBILITY_VALUES, width=140)
+        self._labeled_option(picker_help, "分类覆盖", self.upload_window_category_override_var, GROUP_UPLOAD_CATEGORY_VALUES, width=170)
+        self._labeled_option(picker_help, "儿童内容覆盖", self.upload_window_made_for_kids_override_var, BOOL_OVERRIDE_VALUES, width=110)
+        self._labeled_option(picker_help, "AI内容覆盖", self.upload_window_altered_content_override_var, BOOL_OVERRIDE_VALUES, width=110)
+
+        self.upload_window_buttons_frame = ctk.CTkScrollableFrame(planner, height=180, fg_color="#10151d")
+        self.upload_window_buttons_frame.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+
+        manual_card = ctk.CTkFrame(planner, fg_color="transparent")
+        manual_card.pack(fill="x", padx=14, pady=(0, 8))
+        ctk.CTkLabel(manual_card, text="窗口任务列表（唯一输入区。点窗口会自动写入；你也可以手改）", text_color="#9aa0aa").pack(anchor="w", pady=(0, 4))
+        self.manual_window_plan_box = ctk.CTkTextbox(manual_card, height=170)
+        self.manual_window_plan_box.pack(fill="x")
+        self.manual_window_plan_box.bind("<KeyRelease>", lambda *_: (self._preview_window_plan(show_error=False), self._refresh_upload_window_buttons()))
+        if self.ui_state.get("manual_window_plan_text"):
+            self.manual_window_plan_box.insert("1.0", self.ui_state["manual_window_plan_text"])
+        self.multi_group_plan_box = None
+        ctk.CTkLabel(
+            planner,
+            text="示例：\n90 | 面壁者\n91 | 面壁者 | title=自定义标题\n95 | 芝加哥蓝调 | is_ypp=true | visibility=private",
+            text_color="#9aa0aa",
+            justify="left",
+        ).pack(anchor="w", padx=14, pady=(0, 12))
+
+        preview = self._section_card(
+            scroll,
+            "步骤 4：预览并执行",
+            "先看一眼今天到底会传哪些窗口、每个分组从哪里取素材，再正式开始。",
+        )
+        action_row = ctk.CTkFrame(preview, fg_color="transparent")
+        action_row.pack(fill="x", padx=14, pady=(0, 10))
+        ctk.CTkButton(action_row, text="预览今日上传计划", width=150, fg_color="#334155", command=self._preview_current_upload_plan).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(action_row, text="开始上传", width=170, command=self._run_selected_upload_mode).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(action_row, text="打开上传记录目录", width=140, fg_color="#475569", command=lambda: open_folder(str(SCRIPT_DIR / "upload_records"))).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(action_row, text="打开计划文件目录", width=140, fg_color="#475569", command=lambda: open_folder(str(self._window_plan_path().parent))).pack(side="left")
+
+        self.window_plan_preview_box = ctk.CTkTextbox(preview, height=240)
+        self.window_plan_preview_box.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+        ctk.CTkLabel(preview, textvariable=self.window_plan_status_var, text_color="#a3e635").pack(anchor="w", padx=14, pady=(0, 12))
+
+        self.window_scope_mode_var.set(SCOPE_MANUAL)
+        self._sync_upload_metadata_mode_ui()
+        self._refresh_upload_window_buttons()
+
     def _build_group_upload_tab(self, parent) -> None:
         scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent")
         scroll.pack(fill="both", expand=True, padx=8, pady=8)
@@ -1166,8 +1336,14 @@ class CommandCenterApp(ctk.CTk):
         self.content_template_menu = self._labeled_option(top, "内容模板", self.content_template_name_var, ["默认内容模板"], width=220, command=lambda _: self._load_content_template())
         choose_buttons = ctk.CTkFrame(top, fg_color="transparent")
         choose_buttons.pack(side="left", pady=(20, 0))
-        ctk.CTkButton(choose_buttons, text="绑定当前分组到内容模板", width=150, command=self._bind_tag_to_content_template).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(choose_buttons, text="绑定分组到 API 模板", width=140, command=self._bind_tag_to_api_preset).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(choose_buttons, text="绑定分组到内容模板", width=150, command=self._bind_tag_to_content_template).pack(side="left", padx=(0, 8))
         ctk.CTkButton(choose_buttons, text="打开配置文件", width=110, fg_color="#334155", command=lambda: open_target(PROMPT_STUDIO_FILE)).pack(side="left")
+
+        name_row = ctk.CTkFrame(choose, fg_color="transparent")
+        name_row.pack(fill="x", padx=14, pady=(0, 12))
+        self.api_preset_save_name_entry = self._labeled_entry(name_row, "API 模板另存为", self.api_preset_save_name_var, width=220, placeholder="例如：芝加哥蓝调 API")
+        self.content_template_save_name_entry = self._labeled_entry(name_row, "内容模板另存为", self.content_template_save_name_var, width=260, placeholder="例如：面壁者-台男50+")
 
         api = self._section_card(
             scroll,
@@ -1409,6 +1585,140 @@ class CommandCenterApp(ctk.CTk):
         ctk.CTkButton(actions, text="打开所有目录", width=100, fg_color="#475569", command=self._open_batch_directories).pack(side="left")
         self.batch_path_preview_box = ctk.CTkTextbox(batch, height=220)
         self.batch_path_preview_box.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+    def _group_source_binding_map(self) -> dict[str, str]:
+        bindings: dict[str, str] = {}
+        for tag, variable in self.group_binding_vars.items():
+            value = str(variable.get() or "").strip()
+            if value:
+                bindings[tag] = value
+        return bindings
+
+    def _pick_group_binding_directory(self, tag: str) -> None:
+        variable = self.group_binding_vars.get(tag)
+        if variable is None:
+            return
+        selected = filedialog.askdirectory(title=f"选择 {tag} 的素材文件夹")
+        if selected:
+            variable.set(selected)
+
+    def _open_group_binding_directory(self, tag: str) -> None:
+        path_text = str((self.group_binding_vars.get(tag).get() if tag in self.group_binding_vars else "") or "").strip()
+        if not path_text:
+            messagebox.showwarning("未绑定目录", f"{tag} 还没有绑定素材目录。")
+            return
+        open_target(path_text)
+
+    def _refresh_group_binding_editor(self) -> None:
+        if self.group_binding_rows_frame is None:
+            return
+        tags = get_all_tags()
+        cfg_bindings = self.scheduler_cfg.get("group_source_bindings") or {}
+        for tag in tags:
+            current = self.group_binding_vars.get(tag)
+            current_value = current.get().strip() if current is not None else str(cfg_bindings.get(tag) or "").strip()
+            self.group_binding_vars[tag] = current or ctk.StringVar(value=current_value)
+            if current is not None and not current.get().strip() and current_value:
+                current.set(current_value)
+        for stale in [tag for tag in self.group_binding_vars.keys() if tag not in tags]:
+            self.group_binding_vars.pop(stale, None)
+
+        for child in self.group_binding_rows_frame.winfo_children():
+            child.destroy()
+        if not tags:
+            ctk.CTkLabel(self.group_binding_rows_frame, text="当前还没有读取到任何分组。", text_color="#9aa0aa").pack(anchor="w", padx=8, pady=8)
+            return
+
+        for tag in tags:
+            row = ctk.CTkFrame(self.group_binding_rows_frame)
+            row.pack(fill="x", padx=6, pady=6)
+            ctk.CTkLabel(row, text=tag, width=170, anchor="w").pack(side="left", padx=(12, 8), pady=10)
+            ctk.CTkEntry(row, textvariable=self.group_binding_vars[tag]).pack(side="left", fill="x", expand=True, padx=(0, 8), pady=10)
+            ctk.CTkButton(row, text="选择", width=80, fg_color="#334155", command=lambda current_tag=tag: self._pick_group_binding_directory(current_tag)).pack(side="left", padx=(0, 8), pady=10)
+            ctk.CTkButton(row, text="打开", width=80, fg_color="#475569", command=lambda current_tag=tag: self._open_group_binding_directory(current_tag)).pack(side="left", padx=(0, 10), pady=10)
+
+    def _build_paths_tab(self, parent) -> None:
+        info = ctk.CTkLabel(
+            parent,
+            text="这里统一管理长期路径。后面如果你换盘符、换素材根目录，或者给某个分组换素材文件夹，只改这里。",
+            text_color="#9aa0aa",
+        )
+        info.pack(anchor="w", padx=14, pady=(12, 8))
+
+        basics = self._section_card(parent, "步骤 1：全局路径")
+        self._path_row(basics, "音乐目录", self.music_dir_var)
+        self._path_row(basics, "底图目录", self.image_dir_var)
+        self._path_row(basics, "输出目录", self.output_dir_var)
+        self._path_row(basics, "已用素材目录", self.used_media_root_var)
+        self._path_row(basics, "FFmpeg", self.ffmpeg_var)
+
+        extra_row = ctk.CTkFrame(basics, fg_color="transparent")
+        extra_row.pack(fill="x", padx=14, pady=(0, 12))
+        self._labeled_entry(extra_row, "视频保留天数", self.render_cleanup_days_var, width=140, placeholder="5")
+        ctk.CTkButton(extra_row, text="保存路径配置", command=self._save_scheduler_paths).pack(side="left", padx=(0, 10), pady=(20, 0))
+        ctk.CTkButton(extra_row, text="打开 prompt_studio.json", fg_color="#334155", command=lambda: open_target(PROMPT_STUDIO_FILE)).pack(side="left", padx=(0, 10), pady=(20, 0))
+        ctk.CTkButton(extra_row, text="打开 config 文件夹", fg_color="#334155", command=lambda: open_target(SCRIPT_DIR / "config")).pack(side="left", pady=(20, 0))
+
+        binding = self._section_card(
+            parent,
+            "步骤 2：把分组和素材文件夹长期绑定",
+            "这里的绑定专门给“按分组素材文件夹直出”用。以后你在上传页选这个模式时，就直接按这里的绑定自动取图和音频。",
+        )
+        binding_actions = ctk.CTkFrame(binding, fg_color="transparent")
+        binding_actions.pack(fill="x", padx=14, pady=(0, 8))
+        ctk.CTkButton(binding_actions, text="刷新分组列表", width=110, fg_color="#334155", command=self._refresh_group_binding_editor).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(binding_actions, text="保存全部绑定", width=110, command=self._save_scheduler_paths).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(binding_actions, text="每个分组绑定一个文件夹即可，里面可以直接放图片和音频。", text_color="#9aa0aa").pack(side="left", padx=(6, 0), pady=(6, 0))
+
+        self.group_binding_rows_frame = ctk.CTkScrollableFrame(binding, height=280)
+        self.group_binding_rows_frame.pack(fill="both", expand=True, padx=14, pady=(0, 12))
+        self._refresh_group_binding_editor()
+
+        batch = ctk.CTkFrame(parent)
+        batch.pack(fill="both", expand=True, padx=14, pady=(14, 0))
+        ctk.CTkLabel(batch, text="旧多赛道路径预览", font=ctk.CTkFont(size=17, weight="bold")).pack(anchor="w", padx=12, pady=(12, 6))
+        ctk.CTkLabel(
+            batch,
+            text="这块保留给旧的多赛道渲染目录预览。如果你今天走的是“分组素材文件夹直出”，上面那块绑定才是主入口。",
+            text_color="#9aa0aa",
+        ).pack(anchor="w", padx=12, pady=(0, 8))
+        actions = ctk.CTkFrame(batch, fg_color="transparent")
+        actions.pack(fill="x", padx=12, pady=(0, 8))
+        ctk.CTkButton(actions, text="刷新预览", width=90, fg_color="#334155", command=self._refresh_batch_path_preview).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(actions, text="批量建目录", width=90, fg_color="#475569", command=self._prepare_batch_directories).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(actions, text="打开所有目录", width=100, fg_color="#475569", command=self._open_batch_directories).pack(side="left")
+        self.batch_path_preview_box = ctk.CTkTextbox(batch, height=220)
+        self.batch_path_preview_box.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+    def _save_scheduler_paths(self) -> None:
+        cfg = self.scheduler_cfg.copy()
+        cfg["music_dir"] = self.music_dir_var.get().strip()
+        cfg["base_image_dir"] = self.image_dir_var.get().strip()
+        cfg["output_root"] = self.output_dir_var.get().strip()
+        cfg["used_media_root"] = self.used_media_root_var.get().strip()
+        cfg["ffmpeg_bin"] = self.ffmpeg_var.get().strip() or "ffmpeg"
+        cfg["ffmpeg_path"] = cfg["ffmpeg_bin"]
+        try:
+            cfg["render_cleanup_days"] = max(0, int(self.render_cleanup_days_var.get().strip() or "5"))
+        except Exception:
+            cfg["render_cleanup_days"] = 5
+            self.render_cleanup_days_var.set("5")
+        cfg["group_source_bindings"] = self._group_source_binding_map()
+        save_scheduler_config(cfg)
+        self.scheduler_cfg = load_scheduler_config()
+        self.music_dir_var.set(self.scheduler_cfg.get("music_dir", ""))
+        self.image_dir_var.set(self.scheduler_cfg.get("base_image_dir", ""))
+        self.output_dir_var.set(self.scheduler_cfg.get("output_root", ""))
+        self.used_media_root_var.set(self.scheduler_cfg.get("used_media_root", ""))
+        self.ffmpeg_var.set(self.scheduler_cfg.get("ffmpeg_bin") or "ffmpeg")
+        self.render_cleanup_days_var.set(str(self.scheduler_cfg.get("render_cleanup_days", 5)))
+        for tag, value in (self.scheduler_cfg.get("group_source_bindings") or {}).items():
+            if tag in self.group_binding_vars:
+                self.group_binding_vars[tag].set(str(value))
+        self.status_var.set("路径配置已保存")
+        self._append_log("已保存路径配置。")
+        self._refresh_batch_path_preview()
+        self._refresh_group_binding_editor()
 
     def _build_log_tab(self, parent) -> None:
         toolbar = ctk.CTkFrame(parent, fg_color="transparent")
@@ -2095,6 +2405,8 @@ class CommandCenterApp(ctk.CTk):
         self._sync_upload_channels()
         self._sync_generation_channels()
         self._refresh_upload_window_buttons()
+        self._refresh_group_binding_editor()
+        self._refresh_preset_menus()
 
     def _sync_tag_to_upload(self) -> None:
         if self.tag_var.get() and self.tag_var.get() != "全部标签":
@@ -2151,7 +2463,12 @@ class CommandCenterApp(ctk.CTk):
 
     def _current_upload_entry_mode(self) -> str:
         source_mode = str(self.upload_source_mode_var.get() or "render_output").strip()
-        normalized = "group_folder" if source_mode == "ready_folder" else "window_plan"
+        if source_mode == "ready_folder":
+            normalized = "group_folder"
+        elif source_mode == "group_bound_media":
+            normalized = "direct_media"
+        else:
+            normalized = "window_plan"
         if normalized != self.upload_entry_mode_var.get():
             self.upload_entry_mode_var.set(normalized)
         return normalized
@@ -2261,7 +2578,7 @@ class CommandCenterApp(ctk.CTk):
         return ""
 
     def _scheduler_tags_for_current_mode(self) -> list[str]:
-        if self._current_upload_entry_mode() == "window_plan":
+        if self._current_upload_entry_mode() in {"window_plan", "direct_media"}:
             try:
                 _plan, _path, tags, _skip_channels = self._prepare_window_plan_for_run()
             except Exception:
@@ -2357,6 +2674,8 @@ class CommandCenterApp(ctk.CTk):
         ]
 
     def _render_preflight_issues(self) -> list[str]:
+        if self._current_upload_entry_mode() == "direct_media":
+            return []
         tags = self._scheduler_tags_for_current_mode()
         if not tags:
             return []
@@ -2928,6 +3247,415 @@ class CommandCenterApp(ctk.CTk):
             messagebox.showerror("参数错误", str(e))
             return
         self._run_process(cmd, job_name="多赛道批量上传")
+
+    def _refresh_preset_menus(self) -> None:
+        api_names = sorted(self.prompt_cfg.get("apiPresets", {}).keys()) or [default_api_preset()["name"]]
+        content_names = sorted(self.prompt_cfg.get("contentTemplates", {}).keys()) or [default_content_template()["name"]]
+        bound_api_name = pick_api_preset_name(self.prompt_cfg, self.prompt_tag_var.get().strip())
+        bound_content_name = pick_content_template_name(self.prompt_cfg, self.prompt_tag_var.get().strip())
+        if self.api_preset_menu is not None:
+            self.api_preset_menu.configure(values=api_names)
+        if self.content_template_menu is not None:
+            self.content_template_menu.configure(values=content_names)
+        if self.api_preset_name_var.get() not in api_names:
+            self.api_preset_name_var.set(bound_api_name if bound_api_name in api_names else api_names[0])
+        if self.content_template_name_var.get() not in content_names:
+            self.content_template_name_var.set(bound_content_name if bound_content_name in content_names else content_names[0])
+        if not self.api_preset_save_name_var.get().strip():
+            self.api_preset_save_name_var.set(self.api_preset_name_var.get())
+        if not self.content_template_save_name_var.get().strip():
+            self.content_template_save_name_var.set(self.content_template_name_var.get())
+
+    def _apply_bound_content_template(self) -> None:
+        tag = self.prompt_tag_var.get().strip()
+        api_name = pick_api_preset_name(self.prompt_cfg, tag)
+        if api_name in self.prompt_cfg.get("apiPresets", {}):
+            self.api_preset_name_var.set(api_name)
+            self._load_api_preset()
+        content_name = pick_content_template_name(self.prompt_cfg, tag)
+        if content_name in self.prompt_cfg.get("contentTemplates", {}):
+            self.content_template_name_var.set(content_name)
+            self._load_content_template()
+
+    def _load_api_preset(self) -> None:
+        preset_name = self.api_preset_name_var.get().strip()
+        preset = clone_json(self.prompt_cfg.get("apiPresets", {}).get(preset_name, default_api_preset(preset_name or "默认API模板")))
+        self.api_preset_name_var.set(preset.get("name", "默认API模板"))
+        self.api_preset_save_name_var.set(preset.get("name", "默认API模板"))
+        self.api_provider_var.set(preset.get("provider", "openai_compatible"))
+        self.api_key_var.set(preset.get("apiKey", ""))
+        self.api_base_url_var.set(preset.get("baseUrl", ""))
+        self.api_model_var.set(preset.get("model", ""))
+        self.api_temperature_var.set(str(preset.get("temperature", "0.9")))
+        self.api_max_tokens_var.set(str(preset.get("maxTokens", "16000")))
+        self.api_auto_image_var.set(str(preset.get("autoImageEnabled", "0")))
+        self.image_base_url_var.set(preset.get("imageBaseUrl", ""))
+        self.image_api_key_var.set(preset.get("imageApiKey", ""))
+        self.image_model_var.set(preset.get("imageModel", ""))
+        self.image_concurrency_var.set(str(preset.get("imageConcurrency", "3")))
+        self.prompt_status_var.set(f"已加载 API 模板：{self.api_preset_name_var.get()}")
+
+    def _load_content_template(self) -> None:
+        template_name = self.content_template_name_var.get().strip()
+        template = clone_json(self.prompt_cfg.get("contentTemplates", {}).get(template_name, default_content_template(template_name or "默认内容模板")))
+        self.content_template_name_var.set(template.get("name", "默认内容模板"))
+        self.content_template_save_name_var.set(template.get("name", "默认内容模板"))
+        self.content_music_genre_var.set(template.get("musicGenre", ""))
+        self.content_angle_var.set(template.get("angle", ""))
+        self.content_audience_var.set(template.get("audience", ""))
+        self.content_output_language_var.set(template.get("outputLanguage", "zh-TW"))
+        self.content_title_count_var.set(str(template.get("titleCount", "3")))
+        self.content_desc_count_var.set(str(template.get("descCount", "1")))
+        self.content_thumb_count_var.set(str(template.get("thumbCount", "3")))
+        self.content_title_min_var.set(str(template.get("titleMin", "80")))
+        self.content_title_max_var.set(str(template.get("titleMax", "95")))
+        self.content_desc_len_var.set(str(template.get("descLen", "300")))
+        self.content_tag_range_var.set(str(template.get("tagRange", "10-20")))
+        self._textbox_set(self.prompt_master_box, template.get("masterPrompt", ""))
+        self._textbox_set(self.prompt_title_library_box, template.get("titleLibrary", ""))
+        self.prompt_status_var.set(f"已加载内容模板：{self.content_template_name_var.get()}")
+
+    def _save_api_preset(self) -> None:
+        preset = self._current_api_preset()
+        preset_name = self.api_preset_save_name_var.get().strip() or self.api_preset_name_var.get().strip() or "默认API模板"
+        preset["name"] = preset_name
+        self.prompt_cfg.setdefault("apiPresets", {})
+        self.prompt_cfg["apiPresets"][preset_name] = preset
+        save_prompt_studio_config(PROMPT_STUDIO_FILE, self.prompt_cfg)
+        self.api_preset_name_var.set(preset_name)
+        self.api_preset_save_name_var.set(preset_name)
+        self._refresh_preset_menus()
+        self.prompt_status_var.set(f"已保存 API 模板：{preset_name}")
+        self._append_log(f"[提示词] 已保存 API 模板：{preset_name}")
+
+    def _save_content_template(self) -> None:
+        template = self._current_content_template()
+        template_name = self.content_template_save_name_var.get().strip() or self.content_template_name_var.get().strip() or "默认内容模板"
+        template["name"] = template_name
+        self.prompt_cfg.setdefault("contentTemplates", {})
+        self.prompt_cfg["contentTemplates"][template_name] = template
+        save_prompt_studio_config(PROMPT_STUDIO_FILE, self.prompt_cfg)
+        self.content_template_name_var.set(template_name)
+        self.content_template_save_name_var.set(template_name)
+        self._refresh_preset_menus()
+        self.prompt_status_var.set(f"已保存内容模板：{template_name}")
+        self._append_log(f"[提示词] 已保存内容模板：{template_name}")
+
+    def _bind_tag_to_api_preset(self) -> None:
+        tag = self.prompt_tag_var.get().strip()
+        preset_name = self.api_preset_name_var.get().strip()
+        if not tag:
+            messagebox.showerror("缺少分组", "请先选择一个分组。")
+            return
+        if not preset_name:
+            messagebox.showerror("缺少模板", "请先选择一个 API 模板。")
+            return
+        self.prompt_cfg.setdefault("tagApiBindings", {})
+        self.prompt_cfg["tagApiBindings"][tag] = preset_name
+        save_prompt_studio_config(PROMPT_STUDIO_FILE, self.prompt_cfg)
+        self.prompt_status_var.set(f"已绑定：{tag} -> {preset_name}")
+        self._append_log(f"[提示词] 已绑定 API 模板：{tag} -> {preset_name}")
+
+    def _bind_tag_to_content_template(self) -> None:
+        tag = self.prompt_tag_var.get().strip()
+        template_name = self.content_template_name_var.get().strip()
+        if not tag:
+            messagebox.showerror("缺少分组", "请先选择一个分组。")
+            return
+        if not template_name:
+            messagebox.showerror("缺少模板", "请先选择一个内容模板。")
+            return
+        self.prompt_cfg.setdefault("tagBindings", {})
+        self.prompt_cfg["tagBindings"][tag] = template_name
+        save_prompt_studio_config(PROMPT_STUDIO_FILE, self.prompt_cfg)
+        self.prompt_status_var.set(f"已绑定：{tag} -> {template_name}")
+        self._append_log(f"[提示词] 已绑定内容模板：{tag} -> {template_name}")
+
+    def _preview_direct_media_upload_plan(self) -> dict:
+        plan, _plan_path, tags, _skip_channels = self._prepare_window_plan_for_run()
+        bindings = self._group_source_binding_map() or (self.scheduler_cfg.get("group_source_bindings") or {})
+        lines = [
+            "来源: 按分组素材文件夹直出",
+            f"文案来源: {self._upload_metadata_mode_label()}",
+            "",
+        ]
+        warnings: list[str] = []
+        usable_total = 0
+        for tag in tags:
+            tasks = [task for task in (plan.get("tasks") or []) if str(task.get("tag") or "").strip() == tag]
+            windows = [str(int(task.get("serial") or 0)) for task in tasks if int(task.get("serial") or 0) > 0]
+            bound_dir_text = str(bindings.get(tag) or "").strip()
+            lines.append(f"[{tag}]")
+            if not bound_dir_text:
+                warnings.append(f"{tag} 还没有在路径配置里绑定素材文件夹")
+                lines.append("  source: 未绑定")
+                lines.append(f"  windows: {', '.join(windows) if windows else '无'}")
+                lines.append("  usable: 0")
+                lines.append("")
+                continue
+            source_dir = Path(bound_dir_text)
+            if not source_dir.exists():
+                warnings.append(f"{tag} 绑定的素材文件夹不存在: {source_dir}")
+                lines.append(f"  source: {source_dir} (不存在)")
+                lines.append(f"  windows: {', '.join(windows) if windows else '无'}")
+                lines.append("  usable: 0")
+                lines.append("")
+                continue
+            image_count = len(self._list_media_files(source_dir, IMAGE_RENDER_SUFFIXES | {'.webp'}))
+            audio_count = len(self._list_media_files(source_dir, DIRECT_AUDIO_SUFFIXES))
+            usable = min(len(tasks), image_count, audio_count)
+            usable_total += usable
+            lines.append(f"  source: {source_dir}")
+            lines.append(f"  windows: {', '.join(windows) if windows else '无'}")
+            lines.append(f"  images/audio: {image_count}/{audio_count}")
+            lines.append(f"  usable: {usable}")
+            if len(tasks) > usable:
+                warnings.append(f"{tag}: 窗口 {len(tasks)} 个，但素材只够做 {usable} 个视频")
+            lines.append("")
+
+        if warnings:
+            lines.append("warnings:")
+            lines.extend(f"- {item}" for item in warnings)
+        self._textbox_set(self.window_plan_preview_box, "\n".join(lines).strip())
+        self.window_plan_status_var.set(f"已预览分组素材直出计划：可生成 {usable_total} 个视频")
+        return {"plan": plan, "tags": tags, "usable_total": usable_total, "warnings": warnings}
+
+    def _build_direct_media_cmd(self, *, render_only: bool) -> list[str]:
+        _plan, plan_path, _tags, _skip_channels = self._prepare_window_plan_for_run()
+        try:
+            retain_days = max(0, int(self.render_cleanup_days_var.get().strip() or "5"))
+        except Exception:
+            retain_days = 5
+        args = [
+            sys.executable,
+            str(DIRECT_MEDIA_SCRIPT),
+            "--date",
+            normalize_mmdd(self.date_var.get()),
+            "--window-plan-file",
+            str(plan_path),
+            "--metadata-mode",
+            normalize_upload_metadata_mode(self.upload_metadata_mode_var.get()),
+            "--retain-video-days",
+            str(retain_days),
+        ]
+        if render_only:
+            args.append("--render-only")
+        if not self.upload_fill_text_var.get():
+            args.append("--skip-fill-text")
+        if not self.upload_fill_thumbnails_var.get():
+            args.append("--skip-fill-thumbnails")
+        if not self.upload_sync_daily_content_var.get():
+            args.append("--no-sync-daily-content")
+        if self.randomize_effects_var.get():
+            args.append("--randomize-effects")
+        if self.auto_close_browser_var.get() and not render_only:
+            args.append("--auto-close-browser")
+        return args
+
+    def _run_direct_media_flow(self, *, render_only: bool) -> None:
+        try:
+            cmd = self._build_direct_media_cmd(render_only=render_only)
+        except Exception as e:
+            messagebox.showerror("参数错误", str(e))
+            return
+        job_name = "分组素材直出渲染" if render_only else "分组素材直出并上传"
+        self._run_process(cmd, job_name=job_name)
+
+    def _preview_current_upload_plan(self) -> None:
+        try:
+            mode = self._current_upload_entry_mode()
+            if mode == "group_folder":
+                self._preview_ready_folder_upload_plan()
+            elif mode == "direct_media":
+                self._preview_direct_media_upload_plan()
+            else:
+                self._preview_window_plan()
+        except Exception as e:
+            messagebox.showerror("预览失败", str(e))
+
+    def _run_selected_upload_mode(self) -> None:
+        mode = self._current_upload_entry_mode()
+        if mode == "group_folder":
+            self._run_ready_folder_upload()
+            return
+        if mode == "direct_media":
+            self._run_direct_media_flow(render_only=False)
+            return
+        self._run_window_plan_upload()
+
+    def _refresh_quick_upload_mode_summary(self) -> None:
+        task_mode = self._task_mode_label()
+        current_mode = self._current_upload_entry_mode()
+        source_labels = {
+            "window_plan": "渲染产物",
+            "direct_media": "按分组素材文件夹直出",
+            "group_folder": "现成视频文件夹",
+        }
+        source_mode = source_labels.get(current_mode, "渲染产物")
+        metadata_mode = self._upload_metadata_mode_label()
+        try:
+            plan = self._build_window_plan()
+            groups = plan.get("groups", {})
+            task_count = len(plan.get("tasks", []))
+            if len(groups) <= 2:
+                group_text = "；".join(f"{tag}: {', '.join(str(x) for x in serials)}" for tag, serials in groups.items())
+            else:
+                group_text = f"{len(groups)} 个分组 / {task_count} 个窗口"
+        except Exception as e:
+            group_text = f"窗口任务未完成：{e}"
+            groups = {}
+
+        extra_lines = [
+            f"本次任务：{task_mode}",
+            f"上传来源：{source_mode}",
+            f"文案来源：{metadata_mode}",
+            f"窗口概览：{group_text}",
+            "任务范围统一以上传页里的窗口任务和日期为准。",
+        ]
+        if current_mode == "group_folder":
+            extra_lines.append(f"现成视频目录：{self.group_upload_source_dir_var.get().strip() or '未设置'}")
+        elif current_mode == "direct_media":
+            bindings = self._group_source_binding_map() or (self.scheduler_cfg.get("group_source_bindings") or {})
+            bound_summary = []
+            for tag in list(groups.keys())[:3]:
+                bound_summary.append(f"{tag}: {'已绑定' if str(bindings.get(tag) or '').strip() else '未绑定'}")
+            if bound_summary:
+                extra_lines.append("素材绑定：" + " | ".join(bound_summary))
+            else:
+                extra_lines.append("素材绑定：请先到‘路径配置’绑定分组素材目录。")
+        if self.today_task_mode_var.get() == "render_only":
+            if current_mode == "direct_media":
+                extra_lines.append("当前会先按分组素材文件夹生成视频，但不会上传。")
+            else:
+                extra_lines.append("当前只会执行剪辑，不会执行上传。")
+        elif self.today_task_mode_var.get() == "upload_only":
+            if current_mode == "direct_media":
+                extra_lines.append("当前会从分组素材文件夹直接出视频并上传。")
+            else:
+                extra_lines.append("当前只会执行上传，不会重新剪辑。")
+        else:
+            if current_mode == "direct_media":
+                extra_lines.append("当前会从分组素材文件夹直接出视频，然后继续上传。")
+            else:
+                extra_lines.append("当前会先剪辑，再按上传页里的窗口任务继续上传。")
+        self.quick_upload_mode_status_var.set("\n".join(extra_lines))
+
+    def _collect_state(self) -> dict:
+        return {
+            "date": self.date_var.get(),
+            "tag": self.tag_var.get(),
+            "upload_tag": self.upload_tag_var.get(),
+            "generation_tag": self.generation_tag_var.get(),
+            "generation_channel": self.generation_channel_var.get(),
+            "prompt_tag": self.prompt_tag_var.get(),
+            "batch_tags_text": self._textbox_get(self.batch_tags_box),
+            "upload_entry_mode": self._current_upload_entry_mode(),
+            "today_task_mode": self.today_task_mode_var.get(),
+            "upload_source_mode": self.upload_source_mode_var.get(),
+            "upload_metadata_mode": self.upload_metadata_mode_var.get(),
+            "upload_fill_text": bool(self.upload_fill_text_var.get()),
+            "upload_fill_thumbnails": bool(self.upload_fill_thumbnails_var.get()),
+            "upload_sync_daily_content": bool(self.upload_sync_daily_content_var.get()),
+            "song_count": self.song_count_var.get(),
+            "channel": self.channel_var.get(),
+            "window_scope_mode": self.window_scope_mode_var.get(),
+            "same_group_serials_text": self.same_group_serials_var.get(),
+            "multi_group_plan_text": self._textbox_get(self.multi_group_plan_box),
+            "manual_window_plan_text": self._textbox_get(self.manual_window_plan_box),
+            "upload_picker_tag": self.upload_picker_tag_var.get(),
+            "upload_window_ypp_override": self.upload_window_ypp_override_var.get(),
+            "upload_window_title_override": self.upload_window_title_override_var.get(),
+            "upload_window_visibility_override": self.upload_window_visibility_override_var.get(),
+            "upload_window_category_override": self.upload_window_category_override_var.get(),
+            "upload_window_made_for_kids_override": self.upload_window_made_for_kids_override_var.get(),
+            "upload_window_altered_content_override": self.upload_window_altered_content_override_var.get(),
+            "audio_workers": int(self.audio_workers_var.get()),
+            "video_workers": int(self.video_workers_var.get()),
+            "render_enabled": bool(self.render_enabled_var.get()),
+            "randomize_effects": bool(self.randomize_effects_var.get()),
+            "auto_upload": bool(self.auto_upload_var.get()),
+            "auto_close_browser": bool(self.auto_close_browser_var.get()),
+            "auto_sync_manifest": bool(self.auto_sync_manifest_var.get()),
+            "spectrum": bool(self.spectrum_var.get()),
+            "timeline": bool(self.timeline_var.get()),
+            "letterbox": self.letterbox_var.get(),
+            "zoom": self.zoom_var.get(),
+            "color_spectrum": self.color_spectrum_var.get(),
+            "color_timeline": self.color_timeline_var.get(),
+            "style": self.style_var.get(),
+            "particle": self.particle_var.get(),
+            "particle_opacity": self.particle_opacity_var.get(),
+            "film_grain": bool(self.film_grain_var.get()),
+            "grain_strength": self.grain_strength_var.get(),
+            "vignette": bool(self.vignette_var.get()),
+            "soft_focus": bool(self.soft_focus_var.get()),
+            "soft_focus_sigma": self.soft_focus_sigma_var.get(),
+            "color_tint": self.color_tint_var.get(),
+            "text": self.text_var.get(),
+            "text_pos": self.text_pos_var.get(),
+            "text_size": self.text_size_var.get(),
+            "text_style": self.text_style_var.get(),
+            "api_preset_name": self.api_preset_name_var.get(),
+            "content_template_name": self.content_template_name_var.get(),
+            "api_preset_save_name": self.api_preset_save_name_var.get(),
+            "content_template_save_name": self.content_template_save_name_var.get(),
+            "prompt_audience_shot_path": self.prompt_audience_shot_path_var.get().strip(),
+            "prompt_audience_parsed_text": self._textbox_get(self.prompt_audience_parsed_box),
+        }
+
+    def _push_generation_to_prompt_preview(self) -> None:
+        self.prompt_tag_var.set(self.generation_tag_var.get())
+        self._apply_bound_content_template()
+        preview_text = build_site_preview(self._current_content_template(), self._current_api_preset())
+        title = self._textbox_get(self.gen_title_box)
+        desc = self._textbox_get(self.gen_desc_box)
+        self._textbox_set(
+            self.prompt_preview_box,
+            preview_text + f"\n\n=== 当前 generation_map 内容 ===\n标题: {title}\n\n简介:\n{desc}",
+        )
+        self.tabs.set("提示词")
+        self.prompt_status_var.set("已把当前 generation_map 内容带到提示词预览。")
+
+    def _run_current_flow(self) -> None:
+        mode = self._current_upload_entry_mode()
+        if mode == "direct_media":
+            if not self.render_enabled_var.get() and not self.auto_upload_var.get():
+                messagebox.showwarning("没有启用模块", "请至少开启一个模块：直出生成 或 上传。")
+                return
+            self._run_direct_media_flow(render_only=not self.auto_upload_var.get())
+            return
+        if self.render_enabled_var.get():
+            if self.auto_upload_var.get() and mode == "group_folder":
+                messagebox.showwarning(
+                    "流程冲突",
+                    "“上传现成视频文件夹”只适合上传已经做好的成品视频，不参与渲染。请关闭渲染模块，或把上传来源改成“上传渲染产物”。",
+                )
+                return
+            self._run_scheduler(render_only=not self.auto_upload_var.get())
+            return
+        if self.auto_upload_var.get():
+            self._run_selected_upload_mode()
+            return
+        messagebox.showwarning("没有启用模块", "请至少开启一个模块：渲染 或 上传。")
+
+    def _run_scheduler(self, *, render_only: bool) -> None:
+        if self._current_upload_entry_mode() == "direct_media":
+            self._run_direct_media_flow(render_only=render_only)
+            return
+        try:
+            issues = self._render_preflight_issues()
+            if issues:
+                detail = "\n\n".join(issues)
+                self._append_log("[预检] 渲染前检查失败：")
+                for item in issues:
+                    self._append_log(f"[预检] {item.replace(chr(10), ' | ')}")
+                messagebox.showerror("素材路径 / 命名不匹配", detail)
+                return
+            cmd = self._build_scheduler_cmd(render_only=render_only)
+        except Exception as e:
+            messagebox.showerror("参数错误", str(e))
+            return
+        self._run_process(cmd, job_name="渲染调度")
 
     def _run_process(self, cmd: list[str], *, job_name: str) -> None:
         if self.process and self.process.poll() is None:

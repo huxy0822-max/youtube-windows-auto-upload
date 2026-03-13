@@ -5361,6 +5361,7 @@ async def batch_upload(
     window_ttl_hours: float = 2.0,
     active_success_windows: Optional[List[Dict]] = None,
     window_plan: Optional[Dict[str, Any]] = None,
+    retain_video_days: int = 0,
 ):
     """批量上传指定标签组的视频"""
     date_key = normalize_date_mmdd(date)
@@ -5784,9 +5785,15 @@ async def batch_upload(
             # === 删除视频文件：上传成功后释放磁盘空间 ===
             try:
                 if video.exists():
-                    video_size_mb = video.stat().st_size / 1024 / 1024
-                    video.unlink()
-                    log(f"🗑️ 已删除视频文件: {video.name} ({video_size_mb:.0f} MB)", "OK")
+                    if retain_video_days > 0:
+                        log(
+                            f"🗂️ 已保留视频文件: {video.name}，将在后续运行时按 {retain_video_days} 天规则清理",
+                            "OK",
+                        )
+                    else:
+                        video_size_mb = video.stat().st_size / 1024 / 1024
+                        video.unlink()
+                        log(f"🗑️ 已删除视频文件: {video.name} ({video_size_mb:.0f} MB)", "OK")
             except Exception as e:
                 log(f"删除视频文件失败 (非致命): {e}", "WARN")
         
@@ -5898,6 +5905,7 @@ def parse_arguments():
     parser.add_argument("--window-plan-file", type=str, default="", help="窗口任务计划 JSON 文件路径")
     parser.add_argument("--max-open-windows", type=int, default=10, help="成功发布后保留的最大窗口数 (默认: 10)")
     parser.add_argument("--window-ttl-hours", type=float, default=2.0, help="成功发布后窗口保留时长(小时) (默认: 2)")
+    parser.add_argument("--retain-video-days", type=int, default=0, help="上传成功后保留视频文件的天数；0 表示立即删除")
     parser.add_argument("--pair-size", type=int, default=2, help="每组配令人数 (默认: 2)")
     parser.add_argument("--wait-hours", type=float, default=2.0, help="每组之间的等待时间(小时) (默认: 2.0)")
     return parser.parse_args()
@@ -5974,6 +5982,7 @@ def _run_auto_mode(args, config, window_plan=None):
                         window_ttl_hours=args.window_ttl_hours,
                         active_success_windows=active_success_windows,
                         window_plan=window_plan,
+                        retain_video_days=args.retain_video_days,
                     )
                 )
                 if result and result.get("failed_count", 0) > 0:
@@ -6065,6 +6074,7 @@ def _run_traditional_mode(args, config, window_plan=None):
                 window_ttl_hours=args.window_ttl_hours,
                 active_success_windows=active_success_windows,
                 window_plan=window_plan,
+                retain_video_days=args.retain_video_days,
             )
         )
         if result and result.get("failed_count", 0) > 0:
