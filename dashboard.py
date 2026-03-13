@@ -10,7 +10,10 @@
 
 from __future__ import annotations
 
+import base64
+import io
 import json
+import mimetypes
 import os
 import subprocess
 import sys
@@ -20,8 +23,10 @@ from pathlib import Path
 from typing import List
 
 import customtkinter as ctk
+from PIL import Image, ImageGrab
 from tkinter import filedialog, messagebox
 
+from content_generation import analyze_audience_screenshot
 from group_upload_workflow import (
     load_upload_batch_settings,
     parse_serials_text,
@@ -240,6 +245,8 @@ def load_dashboard_state() -> dict:
         "text_style": "随机",
         "api_preset_name": "默认API模板",
         "content_template_name": "默认内容模板",
+        "prompt_audience_shot_path": "",
+        "prompt_audience_parsed_text": "",
     }
     if DASHBOARD_STATE_FILE.exists():
         try:
@@ -329,6 +336,11 @@ class CommandCenterApp(ctk.CTk):
         self.prompt_master_box: ctk.CTkTextbox | None = None
         self.prompt_title_library_box: ctk.CTkTextbox | None = None
         self.prompt_preview_box: ctk.CTkTextbox | None = None
+        self.prompt_audience_parsed_box: ctk.CTkTextbox | None = None
+        self.prompt_audience_preview_label: ctk.CTkLabel | None = None
+        self.prompt_audience_preview_image: ctk.CTkImage | None = None
+        self.prompt_audience_image_data_url: str | None = None
+        self.prompt_audience_analysis_busy = False
         self.gen_title_box: ctk.CTkTextbox | None = None
         self.gen_desc_box: ctk.CTkTextbox | None = None
         self.gen_covers_box: ctk.CTkTextbox | None = None
@@ -349,6 +361,7 @@ class CommandCenterApp(ctk.CTk):
         self._refresh_preset_menus()
         self._load_api_preset()
         self._load_content_template()
+        self._restore_prompt_audience_state()
         self._load_generation_entry(silent=True)
         self._refresh_batch_path_preview()
         self._preview_window_plan(show_error=False)
@@ -416,6 +429,7 @@ class CommandCenterApp(ctk.CTk):
         self.image_api_key_var = ctk.StringVar(value="")
         self.image_model_var = ctk.StringVar(value="")
         self.image_concurrency_var = ctk.StringVar(value="3")
+        self.prompt_audience_shot_path_var = ctk.StringVar(value=self.ui_state.get("prompt_audience_shot_path", ""))
         self.content_music_genre_var = ctk.StringVar(value="")
         self.content_angle_var = ctk.StringVar(value="")
         self.content_audience_var = ctk.StringVar(value="")
@@ -915,9 +929,52 @@ class CommandCenterApp(ctk.CTk):
         self._labeled_entry(content_row2, "简介字数", self.content_desc_len_var, width=100, placeholder="300")
         self._labeled_entry(content_row2, "标签数量区间", self.content_tag_range_var, width=120, placeholder="10-20")
 
+        audience_card = self._section_card(
+            scroll,
+            "步骤 4：受众截图自动识别",
+            "把 YouTube 后台受众截图放进来后，会调用当前 API 模板对应的模型识别年龄、性别、地区和设备，并自动同步到上面的“目标受众”。",
+        )
+        shot_row = ctk.CTkFrame(audience_card, fg_color="transparent")
+        shot_row.pack(fill="x", padx=14, pady=(0, 8))
+        self._labeled_entry(
+            shot_row,
+            "受众截图文件",
+            self.prompt_audience_shot_path_var,
+            placeholder="可直接选择文件，或用下方按钮粘贴剪贴板截图",
+            expand=True,
+        )
+        shot_buttons = ctk.CTkFrame(shot_row, fg_color="transparent")
+        shot_buttons.pack(side="left", pady=(20, 0))
+        ctk.CTkButton(shot_buttons, text="选择截图", width=100, command=self._pick_prompt_audience_shot).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(shot_buttons, text="粘贴截图", width=100, fg_color="#334155", command=self._paste_prompt_audience_shot_from_clipboard).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(shot_buttons, text="重新识别", width=100, fg_color="#475569", command=self._analyze_prompt_audience_shot).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(shot_buttons, text="清空截图", width=100, fg_color="#475569", command=self._clear_prompt_audience_shot).pack(side="left")
+
+        shot_body = ctk.CTkFrame(audience_card, fg_color="transparent")
+        shot_body.pack(fill="both", expand=True, padx=14, pady=(0, 12))
+        preview_frame = ctk.CTkFrame(shot_body)
+        preview_frame.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        ctk.CTkLabel(preview_frame, text="截图预览", text_color="#9aa0aa").pack(anchor="w", padx=12, pady=(12, 6))
+        self.prompt_audience_preview_label = ctk.CTkLabel(
+            preview_frame,
+            text="未选择截图",
+            width=360,
+            height=220,
+            fg_color="#111827",
+            corner_radius=10,
+        )
+        self.prompt_audience_preview_label.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        parsed_frame = ctk.CTkFrame(shot_body)
+        parsed_frame.pack(side="left", fill="both", expand=True, padx=(8, 0))
+        ctk.CTkLabel(parsed_frame, text="截图解析结果（会自动同步到“目标受众”）", text_color="#9aa0aa").pack(anchor="w", padx=12, pady=(12, 6))
+        self.prompt_audience_parsed_box = ctk.CTkTextbox(parsed_frame, height=220)
+        self.prompt_audience_parsed_box.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        self._textbox_set(self.prompt_audience_parsed_box, "等待截图后自动解析目标人群...")
+
         prompt_body = self._section_card(
             scroll,
-            "步骤 4：主提示词和标题库",
+            "步骤 5：主提示词和标题库",
             "这里就是你最关心的提示词正文。以后改生成方向，优先改这里，而不是去猜接口参数。",
         )
         ctk.CTkLabel(prompt_body, text="主提示词", text_color="#9aa0aa").pack(anchor="w", padx=14, pady=(0, 6))
@@ -929,7 +986,7 @@ class CommandCenterApp(ctk.CTk):
 
         actions = self._section_card(
             scroll,
-            "步骤 5：保存模板并看最终送模版的内容",
+            "步骤 6：保存模板并看最终送模版的内容",
             "改完模板后先保存，再点预览。这样你能直接看到发给模型前的拼装结果。",
         )
         action_row = ctk.CTkFrame(actions, fg_color="transparent")
@@ -939,7 +996,7 @@ class CommandCenterApp(ctk.CTk):
         ctk.CTkButton(action_row, text="预览当前主提示词", fg_color="#334155", command=self._preview_prompt_bundle).pack(side="left", padx=(0, 10))
         ctk.CTkLabel(action_row, textvariable=self.prompt_status_var, text_color="#9aa0aa").pack(side="right")
 
-        preview = self._section_card(scroll, "送给模型前的预览", "这里显示最终拼装后的 Prompt，方便你确认变量、风格和语气有没有跑偏。")
+        preview = self._section_card(scroll, "步骤 7：送给模型前的预览", "这里显示最终拼装后的 Prompt，方便你确认变量、风格和语气有没有跑偏。")
         self.prompt_preview_box = ctk.CTkTextbox(preview, height=260)
         self.prompt_preview_box.pack(fill="both", expand=True, padx=14, pady=(0, 14))
 
@@ -1145,6 +1202,170 @@ class CommandCenterApp(ctk.CTk):
         selected = filedialog.askdirectory()
         if selected:
             variable.set(selected)
+
+    def _pick_prompt_audience_shot(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="选择 YouTube 受众截图",
+            filetypes=[
+                ("图片文件", "*.png *.jpg *.jpeg *.webp"),
+                ("PNG", "*.png"),
+                ("JPEG", "*.jpg *.jpeg"),
+                ("WebP", "*.webp"),
+                ("所有文件", "*.*"),
+            ],
+        )
+        if selected:
+            self._load_prompt_audience_shot_from_path(Path(selected))
+
+    def _paste_prompt_audience_shot_from_clipboard(self) -> None:
+        try:
+            grabbed = ImageGrab.grabclipboard()
+        except Exception as exc:
+            messagebox.showerror("剪贴板读取失败", str(exc))
+            return
+
+        if isinstance(grabbed, list):
+            for item in grabbed:
+                candidate = Path(str(item))
+                if candidate.exists() and candidate.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
+                    self._load_prompt_audience_shot_from_path(candidate)
+                    return
+            messagebox.showwarning("剪贴板没有图片", "剪贴板里有文件，但不是可用的图片截图。")
+            return
+
+        if isinstance(grabbed, Image.Image):
+            self._apply_prompt_audience_image(grabbed.copy(), image_data_url=self._image_to_data_url(grabbed), display_path="")
+            return
+
+        messagebox.showwarning("剪贴板没有图片", "当前剪贴板里没有检测到图片截图。")
+
+    def _clear_prompt_audience_shot(self) -> None:
+        self.prompt_audience_shot_path_var.set("")
+        self.prompt_audience_image_data_url = None
+        self.prompt_audience_preview_image = None
+        if self.prompt_audience_preview_label is not None:
+            self.prompt_audience_preview_label.configure(image=None, text="未选择截图")
+        self._textbox_set(self.prompt_audience_parsed_box, "等待截图后自动解析目标人群...")
+        self.prompt_status_var.set("已清空受众截图")
+
+    def _restore_prompt_audience_state(self) -> None:
+        parsed_text = str(self.ui_state.get("prompt_audience_parsed_text") or "").strip()
+        if parsed_text:
+            self._textbox_set(self.prompt_audience_parsed_box, parsed_text)
+        shot_path = str(self.ui_state.get("prompt_audience_shot_path") or "").strip()
+        if shot_path and Path(shot_path).exists():
+            try:
+                self._load_prompt_audience_shot_from_path(Path(shot_path), auto_analyze=False, update_status=False)
+            except Exception:
+                self.prompt_audience_shot_path_var.set("")
+
+    def _load_prompt_audience_shot_from_path(
+        self,
+        path: Path,
+        *,
+        auto_analyze: bool = True,
+        update_status: bool = True,
+    ) -> None:
+        target = Path(path)
+        if not target.exists():
+            raise FileNotFoundError(f"截图文件不存在: {target}")
+        with Image.open(target) as image:
+            loaded = image.copy()
+        self._apply_prompt_audience_image(
+            loaded,
+            image_data_url=self._image_file_to_data_url(target),
+            display_path=str(target),
+            auto_analyze=auto_analyze,
+            update_status=update_status,
+        )
+
+    def _apply_prompt_audience_image(
+        self,
+        image: Image.Image,
+        *,
+        image_data_url: str,
+        display_path: str,
+        auto_analyze: bool = True,
+        update_status: bool = True,
+    ) -> None:
+        self.prompt_audience_image_data_url = image_data_url
+        self.prompt_audience_shot_path_var.set(display_path)
+        self._set_prompt_audience_preview(image)
+        if update_status:
+            self.prompt_status_var.set("受众截图已加载" + ("，正在识别..." if auto_analyze else ""))
+        if auto_analyze:
+            self._textbox_set(self.prompt_audience_parsed_box, "正在自动识别截图中的年龄 / 性别 / 地区 / 设备...")
+            self._analyze_prompt_audience_shot()
+
+    def _set_prompt_audience_preview(self, image: Image.Image | None) -> None:
+        if self.prompt_audience_preview_label is None:
+            return
+        if image is None:
+            self.prompt_audience_preview_image = None
+            self.prompt_audience_preview_label.configure(image=None, text="未选择截图")
+            return
+        preview = image.copy()
+        preview.thumbnail((360, 220))
+        self.prompt_audience_preview_image = ctk.CTkImage(light_image=preview, dark_image=preview, size=preview.size)
+        self.prompt_audience_preview_label.configure(image=self.prompt_audience_preview_image, text="")
+
+    def _image_file_to_data_url(self, path: Path) -> str:
+        mime_type = mimetypes.guess_type(str(path))[0] or "image/png"
+        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        return f"data:{mime_type};base64,{encoded}"
+
+    def _image_to_data_url(self, image: Image.Image) -> str:
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+        return f"data:image/png;base64,{encoded}"
+
+    def _analyze_prompt_audience_shot(self) -> None:
+        if self.prompt_audience_analysis_busy:
+            return
+        if not self.prompt_audience_image_data_url:
+            messagebox.showwarning("缺少截图", "请先选择或粘贴一张 YouTube 后台受众截图。")
+            return
+        api_preset = self._current_api_preset()
+        if not api_preset.get("baseUrl") or not api_preset.get("apiKey") or not api_preset.get("model"):
+            tip = "自动识别已跳过：请先配置可用的 Base URL / API Key / 模型。"
+            self._textbox_set(self.prompt_audience_parsed_box, tip)
+            self.prompt_status_var.set(tip)
+            return
+
+        self.prompt_audience_analysis_busy = True
+        self._textbox_set(self.prompt_audience_parsed_box, "正在自动识别截图中的年龄 / 性别 / 地区 / 设备...")
+        self.prompt_status_var.set("正在识别受众截图...")
+        image_data_url = self.prompt_audience_image_data_url
+        preset = clone_json(api_preset)
+
+        def worker() -> None:
+            try:
+                result = analyze_audience_screenshot(preset, image_data_url)
+            except Exception as exc:
+                self.after(0, lambda: self._finish_prompt_audience_analysis(error=str(exc)))
+                return
+            self.after(0, lambda: self._finish_prompt_audience_analysis(result=result))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_prompt_audience_analysis(self, *, result: dict | None = None, error: str = "") -> None:
+        self.prompt_audience_analysis_busy = False
+        if error:
+            self._textbox_set(self.prompt_audience_parsed_box, f"自动识别失败：{error}")
+            self.prompt_status_var.set("受众截图识别失败")
+            self._append_log(f"[提示词] 受众截图识别失败: {error}")
+            return
+
+        formatted_text = str((result or {}).get("formatted_text") or "").strip()
+        audience_summary = str((result or {}).get("audience_summary") or "").strip()
+        self._textbox_set(self.prompt_audience_parsed_box, formatted_text or "未识别到可用受众数据")
+        if audience_summary:
+            self.content_audience_var.set(audience_summary)
+            self.prompt_status_var.set("已自动识别受众截图，并同步到目标受众")
+            self._append_log(f"[提示词] 已自动识别受众截图: {audience_summary}")
+        else:
+            self.prompt_status_var.set("截图已识别，但没有提取到可用的目标受众摘要")
 
     def _collect_group_upload_settings(self) -> dict:
         visibility = self.group_upload_visibility_var.get().strip() or "public"
@@ -1857,6 +2078,8 @@ class CommandCenterApp(ctk.CTk):
             "text_style": self.text_style_var.get(),
             "api_preset_name": self.api_preset_name_var.get(),
             "content_template_name": self.content_template_name_var.get(),
+            "prompt_audience_shot_path": self.prompt_audience_shot_path_var.get().strip(),
+            "prompt_audience_parsed_text": self._textbox_get(self.prompt_audience_parsed_box),
         }
 
     def _textbox_get(self, box: ctk.CTkTextbox | None) -> str:

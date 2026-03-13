@@ -29,6 +29,7 @@ from prompt_studio import (
 
 
 DEFAULT_TIMEOUT_SECONDS = 70
+AUDIENCE_ANALYSIS_MAX_TOKENS = 1400
 
 
 def _float_value(value: Any, default: float) -> float:
@@ -111,6 +112,119 @@ def _parse_json_like(raw: str) -> dict[str, Any]:
     parsed["tagList"] = parsed["tagList"] if isinstance(parsed.get("tagList"), list) else []
     parsed["thumbnails"] = parsed["thumbnails"] if isinstance(parsed.get("thumbnails"), list) else []
     return parsed
+
+
+def _extract_json_object(raw: str) -> dict[str, Any]:
+    cleaned = str(raw or "").strip()
+    cleaned = re.sub(r"^```json\s*", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"^```\s*", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"```$", "", cleaned, flags=re.I)
+    first = cleaned.find("{")
+    last = cleaned.rfind("}")
+    if first < 0 or last < 0 or last <= first:
+        raise ValueError("模型返回内容里没有可解析的 JSON 对象")
+    parsed = json.loads(cleaned[first : last + 1])
+    if not isinstance(parsed, dict):
+        raise ValueError("模型返回的 JSON 不是对象")
+    return parsed
+
+
+def _normalize_percent(value: Any) -> float | None:
+    text = str(value or "").strip().replace("%", "")
+    if not text:
+        return None
+    try:
+        return round(float(text), 2)
+    except Exception:
+        return None
+
+
+def _normalize_ranked_items(items: Any, *label_keys: str) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        label = ""
+        for key in label_keys:
+            candidate = str(item.get(key) or "").strip()
+            if candidate:
+                label = candidate
+                break
+        percent = _normalize_percent(item.get("percent"))
+        if not label or percent is None:
+            continue
+        normalized.append({"label": label, "percent": percent})
+    normalized.sort(key=lambda row: row["percent"], reverse=True)
+    return normalized
+
+
+def _normalize_audience_payload(parsed: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "devices": _normalize_ranked_items(parsed.get("devices"), "name", "device"),
+        "age": _normalize_ranked_items(parsed.get("age"), "range", "name"),
+        "gender": _normalize_ranked_items(parsed.get("gender"), "name", "range"),
+        "regions": _normalize_ranked_items(parsed.get("regions"), "name", "region"),
+        "summary": str(parsed.get("summary") or "").strip(),
+    }
+
+
+def format_audience_analysis(payload: dict[str, Any]) -> str:
+    def format_rows(rows: list[dict[str, Any]]) -> str:
+        return " | ".join(f"{row['label']}: {row['percent']:.1f}%" for row in rows)
+
+    lines: list[str] = []
+    devices = format_rows(payload.get("devices") or [])
+    age = format_rows(payload.get("age") or [])
+    gender = format_rows(payload.get("gender") or [])
+    regions = format_rows(payload.get("regions") or [])
+    if devices:
+        lines.append(f"设备占比: {devices}")
+    if age:
+        lines.append(f"年龄段占比: {age}")
+    if gender:
+        lines.append(f"性别占比: {gender}")
+    if regions:
+        lines.append(f"地区占比: {regions}")
+    if payload.get("summary"):
+        lines.append(f"总结: {payload['summary']}")
+    return "\n".join(lines) if lines else "未识别到可用受众数据"
+
+
+def build_audience_summary(payload: dict[str, Any]) -> str:
+    parts: list[str] = []
+    devices = payload.get("devices") or []
+    age = payload.get("age") or []
+    gender = payload.get("gender") or []
+    regions = payload.get("regions") or []
+    if regions:
+        parts.append(f"{regions[0]['label']}占比约{regions[0]['percent']:.1f}%")
+    if age:
+        parts.append(f"{age[0]['label']}人群占比约{age[0]['percent']:.1f}%")
+    if gender:
+        parts.append(f"{gender[0]['label']}占比约{gender[0]['percent']:.1f}%")
+    if devices:
+        parts.append(f"{devices[0]['label']}设备占比约{devices[0]['percent']:.1f}%")
+    summary = str(payload.get("summary") or "").strip()
+    if summary and parts:
+        parts.append(summary)
+    return "，".join(parts)
+
+
+def _parse_audience_json(raw: str) -> dict[str, Any]:
+    return _normalize_audience_payload(_extract_json_object(raw))
+
+
+def _repair_audience_json(raw: str, api_preset: dict) -> dict[str, Any]:
+    repair_prompt = (
+        "把下面内容改写成严格 JSON，只允许 devices/age/gender/regions/summary 这五个字段。"
+        "如果某个维度没有识别到数据，就返回空数组。不要输出 markdown。\n\n"
+        f"原始内容:\n{str(raw or '').strip()[:4000]}"
+    )
+    repair_preset = clone_json(api_preset)
+    repair_preset["temperature"] = "0"
+    repair_preset["maxTokens"] = "900"
+    repaired_raw = call_text_model(repair_preset, repair_prompt)
+    return _parse_audience_json(repaired_raw)
 
 
 def _build_generation_prompt(content_template: dict, image_data_url: str | None = None) -> str:
@@ -305,6 +419,71 @@ def call_text_model(api_preset: dict, user_prompt: str, image_data_url: str | No
     if provider == "gemini":
         return _call_gemini(api_preset, user_prompt, image_data_url=image_data_url)
     return _call_openai_compatible(api_preset, user_prompt, image_data_url=image_data_url)
+
+
+def analyze_audience_screenshot(api_preset: dict, image_data_url: str) -> dict[str, Any]:
+    if not str(image_data_url or "").startswith("data:image/"):
+        raise ValueError("截图数据无效，请重新选择受众截图")
+
+    output_language = str(api_preset.get("outputLanguage") or "zh-TW")
+    ui_language, _ = language_meta(output_language)
+    analysis_preset = clone_json(api_preset)
+    image_base_url = str(api_preset.get("imageBaseUrl") or "").strip()
+    image_model = str(api_preset.get("imageModel") or "").strip()
+    image_api_key = str(api_preset.get("imageApiKey") or api_preset.get("apiKey") or "").strip()
+    if image_base_url and image_model:
+        analysis_preset["baseUrl"] = image_base_url
+        analysis_preset["model"] = image_model
+        analysis_preset["apiKey"] = image_api_key
+        lowered_image_base = image_base_url.lower()
+        if "generativelanguage.googleapis.com" in lowered_image_base:
+            analysis_preset["provider"] = "gemini"
+        elif "anthropic.com" in lowered_image_base:
+            analysis_preset["provider"] = "anthropic"
+        elif "chat/completions" in lowered_image_base or "/v1/" in lowered_image_base:
+            analysis_preset["provider"] = "openai_compatible"
+
+    if not analysis_preset.get("baseUrl") or not analysis_preset.get("apiKey") or not analysis_preset.get("model"):
+        raise ValueError("当前 API 模板缺少可用的截图识别模型配置（baseUrl / apiKey / model）")
+
+    analysis_preset["temperature"] = "0.1"
+    analysis_preset["maxTokens"] = str(
+        min(
+            AUDIENCE_ANALYSIS_MAX_TOKENS,
+            _int_value(api_preset.get("maxTokens"), AUDIENCE_ANALYSIS_MAX_TOKENS),
+        )
+    )
+    prompt = (
+        "你是 YouTube Analytics 受众截图解析器。"
+        "只根据截图里明确可见的信息返回严格 JSON，禁止臆测，禁止输出 markdown。\n"
+        f"summary 字段请使用 {ui_language}，其余字段按原始截图中的标签语义归类即可。\n"
+        "JSON schema:\n"
+        "{\n"
+        '  "devices": [{"name": "Mobile", "percent": 72.1}],\n'
+        '  "age": [{"range": "18-24", "percent": 12.3}],\n'
+        '  "gender": [{"name": "男性", "percent": 61.2}],\n'
+        '  "regions": [{"name": "台湾", "percent": 34.5}],\n'
+        '  "summary": "一句话总结主要受众信号"\n'
+        "}\n"
+        "要求:\n"
+        "1. 只提取截图里能看见的数据。\n"
+        "2. percent 必须返回数字，不要带 % 符号。\n"
+        "3. 没识别到的维度返回空数组。\n"
+        "4. 如果截图内容不完整，也不要补猜。"
+    )
+
+    raw = call_text_model(analysis_preset, prompt, image_data_url=image_data_url)
+    try:
+        payload = _parse_audience_json(raw)
+    except Exception:
+        payload = _repair_audience_json(raw, analysis_preset)
+
+    return {
+        "raw_text": raw,
+        "parsed": payload,
+        "formatted_text": format_audience_analysis(payload),
+        "audience_summary": build_audience_summary(payload),
+    }
 
 
 def _repair_output_if_needed(

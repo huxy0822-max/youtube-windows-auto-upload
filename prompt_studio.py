@@ -187,8 +187,11 @@ def language_meta(code: str) -> tuple[str, str]:
         "zh-TW": ("繁体中文", "Traditional Chinese"),
         "zh-CN": ("简体中文", "Simplified Chinese"),
         "en": ("英文", "English"),
+        "en-US": ("英文", "English"),
         "ja": ("日语", "Japanese"),
+        "ja-JP": ("日语", "Japanese"),
         "ko": ("韩语", "Korean"),
+        "ko-KR": ("韩语", "Korean"),
         "es": ("西班牙语", "Spanish"),
     }
     return mapping.get(code or "zh-TW", mapping["zh-TW"])
