@@ -148,6 +148,11 @@ GROUP_UPLOAD_CATEGORY_VALUES = [
 TASK_MODE_VALUES = ["upload_only", "render_only", "render_and_upload"]
 UPLOAD_SOURCE_MODE_VALUES = ["render_output", "ready_folder"]
 UPLOAD_METADATA_MODE_VALUES = ["prompt_api", "daily_content"]
+UPLOAD_METADATA_MODE_LABELS = {
+    "prompt_api": "提示词那套",
+    "daily_content": "原先那套",
+}
+UPLOAD_METADATA_MODE_DISPLAY_VALUES = [UPLOAD_METADATA_MODE_LABELS[item] for item in UPLOAD_METADATA_MODE_VALUES]
 BOOL_OVERRIDE_VALUES = ["yes", "no"]
 
 UPLOAD_ENTRY_MODE_LABELS = {
@@ -190,6 +195,20 @@ def normalize_upload_entry_mode(value: str) -> str:
         "同分组现成视频": "group_folder",
     }
     return aliases.get(str(value or "").strip(), "window_plan")
+
+
+def normalize_upload_metadata_mode(value: str) -> str:
+    normalized = str(value or "").strip()
+    if normalized in UPLOAD_METADATA_MODE_VALUES:
+        return normalized
+    if normalized in {"提示词（Prompt API）", "提示词那套"}:
+        return "prompt_api"
+    if normalized in {"当日内容", "原先那套"}:
+        return "daily_content"
+    for key, label in UPLOAD_METADATA_MODE_LABELS.items():
+        if normalized == label:
+            return key
+    return "prompt_api"
 
 
 def normalize_yes_no_choice(value: str, fallback: str = "no") -> str:
@@ -388,6 +407,8 @@ class CommandCenterApp(ctk.CTk):
         self.upload_window_buttons_frame: ctk.CTkScrollableFrame | None = None
         self.upload_tag_menu: ctk.CTkOptionMenu | None = None
         self.channel_menu: ctk.CTkOptionMenu | None = None
+        self.upload_metadata_mode_menu: ctk.CTkOptionMenu | None = None
+        self.upload_ready_source_section: ctk.CTkFrame | None = None
         self.upload_picker_tag_menu: ctk.CTkOptionMenu | None = None
         self.group_upload_tag_menu: ctk.CTkOptionMenu | None = None
         self.group_upload_preview_box: ctk.CTkTextbox | None = None
@@ -419,7 +440,12 @@ class CommandCenterApp(ctk.CTk):
         self.song_count_var = ctk.StringVar(value=self.ui_state["song_count"])
         self.today_task_mode_var = ctk.StringVar(value=self.ui_state.get("today_task_mode", "render_and_upload"))
         self.upload_source_mode_var = ctk.StringVar(value=self.ui_state.get("upload_source_mode", "render_output"))
-        self.upload_metadata_mode_var = ctk.StringVar(value=self.ui_state.get("upload_metadata_mode", "prompt_api"))
+        self.upload_metadata_mode_var = ctk.StringVar(
+            value=normalize_upload_metadata_mode(self.ui_state.get("upload_metadata_mode", "prompt_api"))
+        )
+        self.upload_metadata_mode_label_var = ctk.StringVar(
+            value=UPLOAD_METADATA_MODE_LABELS.get(self.upload_metadata_mode_var.get(), UPLOAD_METADATA_MODE_LABELS["prompt_api"])
+        )
         self.upload_entry_mode_var = ctk.StringVar(
             value=normalize_upload_entry_mode(self.ui_state.get("upload_entry_mode", "window_plan"))
         )
@@ -565,6 +591,8 @@ class CommandCenterApp(ctk.CTk):
         ):
             traced_var.trace_add("write", self._handle_quick_mode_change)
 
+        self.upload_metadata_mode_var.trace_add("write", self._handle_upload_metadata_mode_change)
+
     def _build_ui(self) -> None:
         top = ctk.CTkFrame(self, corner_radius=16)
         top.pack(fill="x", padx=18, pady=(18, 10))
@@ -662,6 +690,38 @@ class CommandCenterApp(ctk.CTk):
         self.upload_window_category_override_var.set(defaults["category"])
         self.upload_window_made_for_kids_override_var.set(defaults["made_for_kids"])
         self.upload_window_altered_content_override_var.set(defaults["altered_content"])
+
+    def _upload_metadata_mode_label(self) -> str:
+        mode = normalize_upload_metadata_mode(self.upload_metadata_mode_var.get())
+        return UPLOAD_METADATA_MODE_LABELS.get(mode, UPLOAD_METADATA_MODE_LABELS["prompt_api"])
+
+    def _handle_upload_metadata_mode_change(self, *_args) -> None:
+        self._sync_upload_metadata_mode_ui()
+
+    def _set_upload_metadata_mode_from_label(self, selected: str) -> None:
+        mode = normalize_upload_metadata_mode(selected)
+        if self.upload_metadata_mode_var.get() != mode:
+            self.upload_metadata_mode_var.set(mode)
+            return
+        self._sync_upload_metadata_mode_ui()
+
+    def _sync_upload_metadata_mode_ui(self) -> None:
+        mode = normalize_upload_metadata_mode(self.upload_metadata_mode_var.get())
+        if self.upload_metadata_mode_var.get() != mode:
+            self.upload_metadata_mode_var.set(mode)
+            return
+        label = UPLOAD_METADATA_MODE_LABELS.get(mode, UPLOAD_METADATA_MODE_LABELS["prompt_api"])
+        if self.upload_metadata_mode_label_var.get() != label:
+            self.upload_metadata_mode_label_var.set(label)
+        if self.upload_ready_source_section is not None:
+            should_show_ready_inputs = mode != "prompt_api"
+            is_visible = bool(self.upload_ready_source_section.winfo_manager())
+            if should_show_ready_inputs and not is_visible:
+                self.upload_ready_source_section.pack(fill="x", padx=14, pady=(0, 12))
+            elif not should_show_ready_inputs and is_visible:
+                self.upload_ready_source_section.pack_forget()
+        if mode == "prompt_api" and self.upload_source_mode_var.get().strip() == "ready_folder":
+            self.upload_source_mode_var.set("render_output")
 
     def _selected_serials_for_picker_tag(self, tag: str) -> set[int]:
         selected: set[int] = set()
@@ -899,21 +959,31 @@ class CommandCenterApp(ctk.CTk):
 
         source_row2 = ctk.CTkFrame(source, fg_color="transparent")
         source_row2.pack(fill="x", padx=14, pady=(0, 8))
-        self._labeled_option(source_row2, "文案来源", self.upload_metadata_mode_var, UPLOAD_METADATA_MODE_VALUES, width=150)
+        self.upload_metadata_mode_menu = self._labeled_option(
+            source_row2,
+            "文案来源",
+            self.upload_metadata_mode_label_var,
+            UPLOAD_METADATA_MODE_DISPLAY_VALUES,
+            width=160,
+            command=self._set_upload_metadata_mode_from_label,
+        )
         ctk.CTkSwitch(source_row2, text="生成标题/简介/标签", variable=self.upload_fill_text_var).pack(side="left", padx=(0, 16), pady=(20, 0))
         ctk.CTkSwitch(source_row2, text="处理缩略图", variable=self.upload_fill_thumbnails_var).pack(side="left", padx=(0, 16), pady=(20, 0))
         ctk.CTkSwitch(source_row2, text="同步到当日内容", variable=self.upload_sync_daily_content_var).pack(side="left", padx=(0, 16), pady=(20, 0))
 
-        source_row3 = ctk.CTkFrame(source, fg_color="transparent")
+        self.upload_ready_source_section = ctk.CTkFrame(source, fg_color="transparent")
+        self.upload_ready_source_section.pack(fill="x", padx=14, pady=(0, 12))
+
+        source_row3 = ctk.CTkFrame(self.upload_ready_source_section, fg_color="transparent")
         source_row3.pack(fill="x", padx=14, pady=(0, 8))
         self._labeled_entry(source_row3, "现成视频文件夹", self.group_upload_source_dir_var, placeholder="只在“上传现成视频文件夹”时需要", expand=True)
         ctk.CTkButton(source_row3, text="选择视频目录", width=110, fg_color="#334155", command=lambda: self._pick_directory_for_var(self.group_upload_source_dir_var)).pack(side="left", padx=(0, 10), pady=(20, 0))
 
-        source_row4 = ctk.CTkFrame(source, fg_color="transparent")
+        source_row4 = ctk.CTkFrame(self.upload_ready_source_section, fg_color="transparent")
         source_row4.pack(fill="x", padx=14, pady=(0, 12))
         self._labeled_entry(source_row4, "现成缩略图文件夹", self.group_upload_thumb_dir_var, placeholder="可选，不填就自动处理", expand=True)
         ctk.CTkButton(source_row4, text="选择缩略图目录", width=120, fg_color="#334155", command=lambda: self._pick_directory_for_var(self.group_upload_thumb_dir_var)).pack(side="left", padx=(0, 10), pady=(20, 0))
-        ctk.CTkLabel(source, text="说明：上传渲染产物时，上面两个目录可以留空。", text_color="#9aa0aa").pack(anchor="w", padx=14, pady=(0, 12))
+        ctk.CTkLabel(self.upload_ready_source_section, text="说明：如果走原先那套，这里可以指定现成视频和现成缩略图目录。", text_color="#9aa0aa").pack(anchor="w", padx=14, pady=(0, 0))
 
         defaults = self._section_card(
             scroll,
@@ -999,6 +1069,7 @@ class CommandCenterApp(ctk.CTk):
         ctk.CTkLabel(preview, textvariable=self.window_plan_status_var, text_color="#a3e635").pack(anchor="w", padx=14, pady=(0, 12))
 
         self.window_scope_mode_var.set(SCOPE_MANUAL)
+        self._sync_upload_metadata_mode_ui()
         self._refresh_upload_window_buttons()
 
     def _build_group_upload_tab(self, parent) -> None:
@@ -2007,7 +2078,7 @@ class CommandCenterApp(ctk.CTk):
     def _refresh_quick_upload_mode_summary(self) -> None:
         task_mode = self._task_mode_label()
         source_mode = "现成视频文件夹" if self._current_upload_entry_mode() == "group_folder" else "渲染产物目录"
-        metadata_mode = "提示词/API" if self.upload_metadata_mode_var.get().strip() == "prompt_api" else "当日内容"
+        metadata_mode = self._upload_metadata_mode_label()
         try:
             plan = self._build_window_plan()
             groups = plan.get("groups", {})
