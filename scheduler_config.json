@@ -1,0 +1,8 @@
+{
+  "music_dir": "workspace/music",
+  "base_image_dir": "workspace/base_image",
+  "output_root": "workspace/AutoTask",
+  "upload_config": "config/upload_config.json",
+  "ffmpeg_bin": "ffmpeg",
+  "ffmpeg_path": "ffmpeg"
+}

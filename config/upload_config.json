@@ -1,0 +1,34 @@
+{
+  "browser_provider": "bitbrowser",
+  "browser_api": {
+    "provider": "bitbrowser",
+    "base_url": "http://127.0.0.1:54345",
+    "list_endpoint": "/browser/list",
+    "open_endpoint": "/browser/open",
+    "stop_endpoint": "/browser/close",
+    "list_payload": {
+      "page": 0,
+      "pageSize": 200
+    },
+    "open_payload": {},
+    "stop_payload": {},
+    "open_payload_id_key": "id",
+    "stop_payload_id_key": "id"
+  },
+  "video_folder": "workspace/AutoTask",
+  "projects_folder": "workspace/projects",
+  "tag_to_project": {
+    "示例分组": {
+      "project_name": "示例分组",
+      "video_keyword": "示例分组",
+      "ypp_serials": [],
+      "non_ypp_serials": [
+        90
+      ]
+    }
+  },
+  "ypp_settings": {
+    "ab_test_titles": 3,
+    "ab_test_thumbnails": 3
+  }
+}

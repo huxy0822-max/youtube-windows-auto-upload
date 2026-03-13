@@ -1,0 +1,13 @@
+{
+  "version": "1.0",
+  "last_updated": "2026-03-13",
+  "description": "BitBrowser channel mapping template for public repo",
+  "channels": {
+    "your_browser_env_id_here": {
+      "serial_number": 90,
+      "tag": "示例分组",
+      "channel_name": "your-channel-name",
+      "channel_id": ""
+    }
+  }
+}
