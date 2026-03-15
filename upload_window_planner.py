@@ -19,6 +19,7 @@ UPLOAD_OPTION_KEYS = {
     "made_for_kids",
     "altered_content",
     "scheduled_publish_at",
+    "schedule_timezone",
 }
 
 
@@ -55,7 +56,7 @@ def _normalize_override(task: dict[str, Any], key: str, value: str) -> None:
     value = value.strip()
     if not key:
         return
-    if key in {"visibility", "category", "title", "description", "scheduled_publish_at", "channel_name"}:
+    if key in {"visibility", "category", "title", "description", "scheduled_publish_at", "schedule_timezone", "channel_name"}:
         task[key] = value
         return
     if key in {"made_for_kids", "altered_content"}:
@@ -97,6 +98,7 @@ def _finalize_task(task: dict[str, Any], index: int) -> dict[str, Any]:
         "made_for_kids",
         "altered_content",
         "scheduled_publish_at",
+        "schedule_timezone",
     ):
         if key in task:
             finalized[key] = task[key]

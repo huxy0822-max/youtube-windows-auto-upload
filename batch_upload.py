@@ -499,7 +499,7 @@ async def ensure_upload_radio_selected(
     return False
 
 
-async def set_video_category_music(page, max_attempts: int = 3) -> bool:
+async def set_video_category_music(page, max_attempts: int = 5) -> bool:
     """在上传详情页将 Category 固定为 Music。"""
 
     async def _read_category_state() -> Dict[str, Any]:
@@ -512,32 +512,80 @@ async def set_video_category_music(page, max_attempts: int = 3) -> bool:
                     el.offsetHeight > 0 ||
                     el.getClientRects().length > 0
                 );
+                const textOf = (el) => ((el && (el.innerText || el.textContent)) || "").trim();
+                const attrText = (el) => [
+                    el?.getAttribute?.("aria-label") || "",
+                    el?.getAttribute?.("label") || "",
+                    el?.getAttribute?.("title") || "",
+                    el?.getAttribute?.("name") || "",
+                    el?.getAttribute?.("id") || "",
+                ].join(" ");
                 const catRe = /category|分類|分类/i;
-                const categoryValueRe = /people\\s*&\\s*blogs|music|education|entertainment|news|gaming|sports|travel/i;
+                const categoryValueRe = /people\\s*&\\s*blogs|people\\s+and\\s+blogs|music|education|entertainment|news|gaming|sports|travel/i;
                 const musicRe = /(^|\\s)music(\\s|$)|音樂|音乐/i;
 
-                const forms = Array.from(
-                    document.querySelectorAll("ytcp-uploads-dialog ytcp-form-select, ytcp-form-select")
-                ).filter(visible);
-
+                const roots = [document];
+                const seen = new Set([document]);
                 let best = null;
-                for (const form of forms) {
-                    const wholeText = (form.innerText || form.textContent || "").trim();
-                    if (!wholeText) continue;
-                    const lower = wholeText.toLowerCase();
-                    let score = 0;
-                    if (catRe.test(wholeText)) score += 4;
-                    if (categoryValueRe.test(lower)) score += 2;
-                    if (/people\\s*&\\s*blogs|people\\s+and\\s+blogs/i.test(lower)) score += 4;
-                    if (score <= 0) continue;
 
-                    const selectedText =
-                        (form.querySelector("#label")?.innerText || "").trim() ||
-                        (form.querySelector("[aria-haspopup='listbox']")?.innerText || "").trim() ||
-                        wholeText;
+                while (roots.length) {
+                    const root = roots.shift();
+                    const allNodes = root.querySelectorAll ? root.querySelectorAll("*") : [];
+                    for (const node of allNodes) {
+                        if (node && node.shadowRoot && !seen.has(node.shadowRoot)) {
+                            seen.add(node.shadowRoot);
+                            roots.push(node.shadowRoot);
+                        }
+                    }
 
-                    if (!best || score > best.score) {
-                        best = { form, selectedText, score };
+                    const candidates = Array.from(
+                        root.querySelectorAll
+                            ? root.querySelectorAll(
+                                [
+                                    "ytcp-form-select",
+                                    "tp-yt-paper-dropdown-menu",
+                                    "ytcp-dropdown-trigger",
+                                    "[aria-haspopup='listbox']",
+                                    "[role='combobox']",
+                                    "[role='button']",
+                                ].join(",")
+                            )
+                            : []
+                    ).filter(visible);
+
+                    for (const el of candidates) {
+                        const scope =
+                            el.closest?.(
+                                [
+                                    "ytcp-form-select",
+                                    "tp-yt-paper-dropdown-menu",
+                                    "ytcp-form-input-container",
+                                    "ytcp-video-metadata-editor-basics",
+                                    "ytcp-video-metadata-editor-advanced",
+                                    "ytcp-uploads-dialog",
+                                ].join(",")
+                            ) ||
+                            el.parentElement ||
+                            el;
+                        const wholeText = [textOf(scope), textOf(el), attrText(el)].join(" ").trim();
+                        if (!wholeText) continue;
+                        const lower = wholeText.toLowerCase();
+                        let score = 0;
+                        if (catRe.test(wholeText)) score += 5;
+                        if (categoryValueRe.test(lower)) score += 3;
+                        if (/people\\s*&\\s*blogs|people\\s+and\\s+blogs/i.test(lower)) score += 4;
+                        if (/music/.test(lower)) score += 2;
+                        if (score <= 0) continue;
+
+                        const selectedText =
+                            textOf(scope.querySelector?.("#label")) ||
+                            textOf(scope.querySelector?.("[aria-haspopup='listbox']")) ||
+                            textOf(el) ||
+                            textOf(scope);
+
+                        if (!best || score > best.score) {
+                            best = { score, selectedText };
+                        }
                     }
                 }
 
@@ -551,7 +599,7 @@ async def set_video_category_music(page, max_attempts: int = 3) -> bool:
                     found: true,
                     selected,
                     method: selected ? "already_music" : "category_found",
-                    value
+                    value,
                 };
             }
             """
@@ -567,80 +615,115 @@ async def set_video_category_music(page, max_attempts: int = 3) -> bool:
                     el.offsetHeight > 0 ||
                     el.getClientRects().length > 0
                 );
+                const textOf = (el) => ((el && (el.innerText || el.textContent)) || "").trim();
+                const attrText = (el) => [
+                    el?.getAttribute?.("aria-label") || "",
+                    el?.getAttribute?.("label") || "",
+                    el?.getAttribute?.("title") || "",
+                    el?.getAttribute?.("name") || "",
+                    el?.getAttribute?.("id") || "",
+                ].join(" ");
                 const clickEl = (el) => {
-                    if (!el) return false;
-                    const target = el instanceof HTMLElement ? el : null;
-                    if (!target) return false;
+                    if (!(el instanceof HTMLElement)) return false;
                     try {
-                        target.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+                        el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
                     } catch (_) {}
-                    const events = ["pointerdown", "mousedown", "pointerup", "mouseup", "click"];
-                    for (const type of events) {
+                    for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
                         try {
-                            target.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, composed: true }));
+                            el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, composed: true }));
                         } catch (_) {}
                     }
                     try {
-                        target.click();
+                        el.click();
                     } catch (_) {}
                     return true;
                 };
 
                 const catRe = /category|分類|分类/i;
-                const categoryValueRe = /people\\s*&\\s*blogs|music|education|entertainment|news|gaming|sports|travel/i;
-                const forms = Array.from(
-                    document.querySelectorAll("ytcp-uploads-dialog ytcp-form-select, ytcp-form-select")
-                ).filter(visible);
-
+                const categoryValueRe = /people\\s*&\\s*blogs|people\\s+and\\s+blogs|music|education|entertainment|news|gaming|sports|travel/i;
+                const roots = [document];
+                const seen = new Set([document]);
                 let best = null;
-                for (const form of forms) {
-                    const wholeText = (form.innerText || form.textContent || "").trim();
-                    if (!wholeText) continue;
-                    const lower = wholeText.toLowerCase();
-                    let score = 0;
-                    if (catRe.test(wholeText)) score += 4;
-                    if (categoryValueRe.test(lower)) score += 2;
-                    if (/people\\s*&\\s*blogs|people\\s+and\\s+blogs/i.test(lower)) score += 4;
-                    if (score <= 0) continue;
 
-                    const selectedText =
-                        (form.querySelector("#label")?.innerText || "").trim() ||
-                        (form.querySelector("[aria-haspopup='listbox']")?.innerText || "").trim() ||
-                        wholeText;
-                    if (!best || score > best.score) {
-                        best = { form, selectedText, score };
+                while (roots.length) {
+                    const root = roots.shift();
+                    const allNodes = root.querySelectorAll ? root.querySelectorAll("*") : [];
+                    for (const node of allNodes) {
+                        if (node && node.shadowRoot && !seen.has(node.shadowRoot)) {
+                            seen.add(node.shadowRoot);
+                            roots.push(node.shadowRoot);
+                        }
+                    }
+
+                    const candidates = Array.from(
+                        root.querySelectorAll
+                            ? root.querySelectorAll(
+                                [
+                                    "ytcp-form-select",
+                                    "tp-yt-paper-dropdown-menu",
+                                    "ytcp-dropdown-trigger",
+                                    "[aria-haspopup='listbox']",
+                                    "[role='combobox']",
+                                    "[role='button']",
+                                ].join(",")
+                            )
+                            : []
+                    ).filter(visible);
+
+                    for (const el of candidates) {
+                        const scope =
+                            el.closest?.(
+                                [
+                                    "ytcp-form-select",
+                                    "tp-yt-paper-dropdown-menu",
+                                    "ytcp-form-input-container",
+                                    "ytcp-video-metadata-editor-basics",
+                                    "ytcp-video-metadata-editor-advanced",
+                                    "ytcp-uploads-dialog",
+                                ].join(",")
+                            ) ||
+                            el.parentElement ||
+                            el;
+                        const wholeText = [textOf(scope), textOf(el), attrText(el)].join(" ").trim();
+                        if (!wholeText) continue;
+                        const lower = wholeText.toLowerCase();
+                        let score = 0;
+                        if (catRe.test(wholeText)) score += 5;
+                        if (categoryValueRe.test(lower)) score += 3;
+                        if (/people\\s*&\\s*blogs|people\\s+and\\s+blogs/i.test(lower)) score += 4;
+                        if (/music/.test(lower)) score += 2;
+                        if (score <= 0) continue;
+
+                        const triggerCandidates = [
+                            scope.querySelector?.("#trigger"),
+                            scope.querySelector?.("ytcp-dropdown-trigger"),
+                            scope.querySelector?.("[aria-haspopup='listbox']"),
+                            scope.querySelector?.("[role='combobox']"),
+                            scope.querySelector?.("[role='button']"),
+                            el,
+                            scope,
+                        ].filter(Boolean);
+
+                        if (!best || score > best.score) {
+                            best = {
+                                score,
+                                value: textOf(scope.querySelector?.("#label")) || textOf(el) || textOf(scope),
+                                triggers: triggerCandidates,
+                            };
+                        }
                     }
                 }
 
-                if (!best) return { opened: false, found: false, method: "category_not_found" };
+                if (!best) return { opened: false, found: false, method: "category_not_found", value: "" };
 
-                const triggerCandidates = [
-                    best.form.querySelector("#trigger"),
-                    best.form.querySelector("ytcp-dropdown-trigger"),
-                    best.form.querySelector("[aria-haspopup='listbox']"),
-                    best.form.querySelector("[role='button']"),
-                    best.form.querySelector("tp-yt-paper-dropdown-menu"),
-                    best.form,
-                ].filter(Boolean);
-
-                for (const trigger of triggerCandidates) {
+                for (const trigger of best.triggers) {
                     if (!visible(trigger)) continue;
                     if (clickEl(trigger)) {
-                        return {
-                            opened: true,
-                            found: true,
-                            method: "opened_by_dom",
-                            value: best.selectedText || ""
-                        };
+                        return { opened: true, found: true, method: "opened_by_dom", value: best.value || "" };
                     }
                 }
 
-                return {
-                    opened: false,
-                    found: true,
-                    method: "trigger_not_clickable",
-                    value: best.selectedText || ""
-                };
+                return { opened: false, found: true, method: "trigger_not_clickable", value: best.value || "" };
             }
             """
         )
@@ -652,16 +735,17 @@ async def set_video_category_music(page, max_attempts: int = 3) -> bool:
             "ytcp-form-select:has-text('分类') ytcp-dropdown-trigger",
             "ytcp-form-select:has-text('People & Blogs') ytcp-dropdown-trigger",
             "ytcp-form-select:has-text('People and Blogs') ytcp-dropdown-trigger",
-            "ytcp-form-select:has-text('Category') [aria-haspopup='listbox']",
-            "ytcp-form-select:has-text('People & Blogs') [aria-haspopup='listbox']",
-            "ytcp-form-select:has-text('People and Blogs') [aria-haspopup='listbox']",
+            "ytcp-form-select:has-text('Music') ytcp-dropdown-trigger",
+            "tp-yt-paper-dropdown-menu:has-text('Category')",
+            "tp-yt-paper-dropdown-menu:has-text('People & Blogs')",
+            "tp-yt-paper-dropdown-menu:has-text('Music')",
+            "[aria-haspopup='listbox']",
+            "[role='combobox']",
         ]
         for sel in selectors:
             try:
                 locator = page.locator(sel).first
-                if await locator.count() == 0:
-                    continue
-                if not await locator.is_visible():
+                if await locator.count() == 0 or not await locator.is_visible():
                     continue
                 clicked = await human_click(page, locator, f"Category 下拉 ({sel})")
                 if clicked:
@@ -767,6 +851,10 @@ async def set_video_category_music(page, max_attempts: int = 3) -> bool:
     for attempt in range(1, max_attempts + 1):
         await clear_blocking_overlays(page, f"category-{attempt}")
         try:
+            await page.mouse.wheel(0, 700)
+        except Exception:
+            pass
+        try:
             state = await _read_category_state()
         except Exception as e:
             state = {"found": False, "selected": False, "method": f"evaluate_error:{e}"}
@@ -798,7 +886,7 @@ async def set_video_category_music(page, max_attempts: int = 3) -> bool:
 
         if opened:
             try:
-                await asyncio.sleep(0.8)
+                await asyncio.sleep(1.2)
                 picked = await _pick_music_option_dom()
                 clicked = bool(picked.get("clicked"))
                 if clicked:
@@ -936,7 +1024,112 @@ def _format_schedule_strings(schedule_text: str) -> tuple[list[str], list[str]]:
     return date_candidates, time_candidates
 
 
-async def fill_schedule_inputs(page, schedule_text: str) -> bool:
+def _schedule_timezone_candidates(schedule_timezone: str | None) -> list[str]:
+    raw = str(schedule_timezone or "").strip()
+    if not raw:
+        return []
+
+    candidates = [raw]
+    lowered = raw.lower()
+    if "taipei" in lowered or "+08:00" in lowered or "asia/taipei" in lowered:
+        candidates.extend(
+            [
+                "Asia/Taipei",
+                "Taipei",
+                "台北",
+                "UTC+08:00",
+                "GMT+08:00",
+                "UTC+8",
+                "GMT+8",
+                "+08:00",
+            ]
+        )
+
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        key = item.strip().lower()
+        if key and key not in seen:
+            ordered.append(item)
+            seen.add(key)
+    return ordered
+
+
+async def fill_schedule_timezone(page, schedule_timezone: str | None) -> bool:
+    candidates = _schedule_timezone_candidates(schedule_timezone)
+    if not candidates:
+        return True
+
+    try:
+        opened = await page.evaluate(
+            """
+            () => {
+                const visible = (el) => !!el && (
+                    el.offsetParent !== null ||
+                    el.offsetWidth > 0 ||
+                    el.offsetHeight > 0
+                );
+                const metaText = (el) => [
+                    el.innerText || '',
+                    el.textContent || '',
+                    el.getAttribute?.('aria-label') || '',
+                    el.getAttribute?.('title') || '',
+                    el.getAttribute?.('placeholder') || '',
+                    el.closest?.('ytcp-datetime-picker, ytcp-form-input-container, tp-yt-paper-dialog')?.innerText || '',
+                ].join(' ').toLowerCase();
+
+                const controls = Array.from(
+                    document.querySelectorAll('button, [role="button"], tp-yt-paper-button, ytcp-dropdown-trigger')
+                ).filter((el) => visible(el) && /timezone|時區|时区/.test(metaText(el)));
+
+                if (!controls.length) {
+                    return false;
+                }
+
+                const target = controls[0].querySelector?.('button, [role="button"]') || controls[0];
+                target.click();
+                return true;
+            }
+            """,
+        )
+        if not opened:
+            return False
+
+        await asyncio.sleep(0.8)
+        matched = await page.evaluate(
+            """
+            ({ candidates }) => {
+                const visible = (el) => !!el && (
+                    el.offsetParent !== null ||
+                    el.offsetWidth > 0 ||
+                    el.offsetHeight > 0
+                );
+                const items = Array.from(
+                    document.querySelectorAll('tp-yt-paper-item, [role="option"], [role="menuitem"], [role="menuitemradio"], ytcp-text-menu-item-renderer')
+                ).filter(visible);
+                const normalizedCandidates = candidates.map((item) => String(item).toLowerCase());
+
+                for (const item of items) {
+                    const text = (item.innerText || item.textContent || '').trim();
+                    const lowered = text.toLowerCase();
+                    if (!lowered) continue;
+                    if (normalizedCandidates.some((candidate) => lowered.includes(candidate))) {
+                        (item.querySelector('button, [role="option"], [role="menuitem"], [role="menuitemradio"]') || item).click();
+                        return text;
+                    }
+                }
+                return '';
+            }
+            """,
+            {"candidates": candidates},
+        )
+        return bool(matched)
+    except Exception as e:
+        log(f"定时发布时区填写异常: {e}", "WARN")
+        return False
+
+
+async def fill_schedule_inputs(page, schedule_text: str, schedule_timezone: str | None = None) -> bool:
     date_candidates, time_candidates = _format_schedule_strings(schedule_text)
     try:
         result = await page.evaluate(
@@ -1005,13 +1198,24 @@ async def fill_schedule_inputs(page, schedule_text: str) -> bool:
         )
         if result.get("dateFilled") and result.get("timeFilled"):
             await asyncio.sleep(1.0)
+            if schedule_timezone:
+                timezone_selected = await fill_schedule_timezone(page, schedule_timezone)
+                if timezone_selected:
+                    log(f"定时发布时区已设置: {schedule_timezone}", "OK")
+                else:
+                    log("未找到时区下拉，继续使用当前频道默认时区", "WARN")
             return True
     except Exception as e:
         log(f"定时发布时间填写异常: {e}", "WARN")
     return False
 
 
-async def apply_visibility_settings(page, visibility: str, scheduled_publish_at: str | None = None) -> bool:
+async def apply_visibility_settings(
+    page,
+    visibility: str,
+    scheduled_publish_at: str | None = None,
+    schedule_timezone: str | None = None,
+) -> bool:
     target = str(visibility or "public").strip().lower()
     if target == "public":
         public_radio = page.locator("tp-yt-paper-radio-button[name='PUBLIC']").first
@@ -1046,7 +1250,7 @@ async def apply_visibility_settings(page, visibility: str, scheduled_publish_at:
         return False
 
     if target == "schedule" and scheduled_publish_at:
-        return await fill_schedule_inputs(page, scheduled_publish_at)
+        return await fill_schedule_inputs(page, scheduled_publish_at, schedule_timezone=schedule_timezone)
     return True
 
 
@@ -2470,6 +2674,7 @@ async def upload_single_with_browser_recovery(
     tags: Optional[List[str]] = None,
     visibility: str = "public",
     scheduled_publish_at: Optional[str] = None,
+    schedule_timezone: Optional[str] = None,
     made_for_kids: bool = False,
     altered_content: bool = True,
     category: str = "Music",
@@ -2500,6 +2705,7 @@ async def upload_single_with_browser_recovery(
             tags=tags,
             visibility=visibility,
             scheduled_publish_at=scheduled_publish_at,
+            schedule_timezone=schedule_timezone,
             made_for_kids=made_for_kids,
             altered_content=altered_content,
             category=category,
@@ -4397,6 +4603,32 @@ async def is_channel_creation_required(page) -> bool:
     return any(marker in lowered for marker in markers)
 
 
+async def is_google_login_required(page) -> bool:
+    """Detect account chooser / sign-in challenge pages and fail fast."""
+    current_url = (getattr(page, "url", "") or "").lower()
+    if "accounts.google.com" in current_url:
+        return True
+
+    try:
+        body_text = await page.locator("body").inner_text(timeout=6000)
+    except Exception:
+        return False
+
+    lowered = body_text.lower()
+    markers = [
+        "choose an account",
+        "use another account",
+        "sign in",
+        "password",
+        "已退出账号",
+        "使用其他账号",
+        "请选择账号",
+        "登录",
+        "登入",
+    ]
+    return any(marker in lowered for marker in markers)
+
+
 # ============ 主上传函数 ============
 async def upload_single(
     container_code: str,
@@ -4411,6 +4643,7 @@ async def upload_single(
     tags: Optional[List[str]] = None,
     visibility: str = "public",
     scheduled_publish_at: Optional[str] = None,
+    schedule_timezone: Optional[str] = None,
     made_for_kids: bool = False,
     altered_content: bool = True,
     category: str = "Music",
@@ -4514,6 +4747,15 @@ async def upload_single(
             if await is_channel_creation_required(page):
                 log("当前账号尚未创建 YouTube 频道，无法执行上传", "ERR")
                 return make_upload_result(False, True, "当前账号尚未创建 YouTube 频道", "channel_not_created")
+            if await is_google_login_required(page):
+                log("当前窗口未登录 Google / YouTube Studio，无法自动上传", "ERR")
+                return make_upload_result(
+                    False,
+                    False,
+                    "当前窗口未登录 Google / YouTube Studio",
+                    "login_required",
+                    extra={"debug_port": debug_port},
+                )
             
             # ========== 智能上传入口 (多语言通用) ==========
             # 策略: 优先使用 ID 选择器，自动检测是否需要下拉菜单
@@ -5163,7 +5405,12 @@ async def upload_single(
             await random_delay(2, 3)
             
             log(f"设置可见性 = {visibility}...")
-            visibility_ok = await apply_visibility_settings(page, visibility, scheduled_publish_at=scheduled_publish_at)
+            visibility_ok = await apply_visibility_settings(
+                page,
+                visibility,
+                scheduled_publish_at=scheduled_publish_at,
+                schedule_timezone=schedule_timezone,
+            )
             await random_delay(1, 2)
             if not visibility_ok:
                 return make_upload_result(
@@ -5659,6 +5906,7 @@ async def batch_upload(
             upload_options = ch_manifest.get("upload_options", {}) if isinstance(ch_manifest.get("upload_options", {}), dict) else {}
             visibility = str(upload_options.get("visibility") or "public").strip().lower()
             scheduled_publish_at = str(upload_options.get("scheduled_publish_at") or "").strip() or None
+            schedule_timezone = str(upload_options.get("schedule_timezone") or "").strip() or None
             made_for_kids = bool(upload_options.get("made_for_kids", False))
             altered_content = bool(upload_options.get("altered_content", True))
             category = str(upload_options.get("category") or "Music").strip() or "Music"
@@ -5726,6 +5974,7 @@ async def batch_upload(
                 tags=tag_list,
                 visibility=visibility,
                 scheduled_publish_at=scheduled_publish_at,
+                schedule_timezone=schedule_timezone,
                 made_for_kids=made_for_kids,
                 altered_content=altered_content,
                 category=category,

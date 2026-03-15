@@ -12,7 +12,10 @@ downloaded_projects/
 upload_records/
 
 data/upload_history.json
+data/metadata_history.json
+data/window_upload_plan_*.json
 render_history.json
+dashboard_state.json
 
 workspace/AutoTask/
 workspace/base_image/
@@ -20,3 +23,4 @@ workspace/music/
 workspace/projects/
 
 config/*.local.json
+_tmp_render_smoke/

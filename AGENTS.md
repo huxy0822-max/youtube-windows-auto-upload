@@ -1,51 +1,60 @@
 # AGENTS.md
 
-This repository is a Windows-oriented YouTube automation project.
-The main focus is:
+This repository is the public-safe Windows version of a YouTube automation project.
 
-- rendering long-form music videos
-- scheduling render jobs
-- uploading through BitBrowser / HubStudio-compatible browser APIs
+Current daily workflow is centered on:
 
-When working in this repo, follow these rules first.
+- `dashboard.py`
+- `dashboard_app.py`
+- `workflow_core.py`
+- `batch_upload.py`
+- `daily_scheduler.py`
+
+Old GUI entry points and old batch wrappers were removed. Do not guide users toward deleted scripts.
 
 ## 1. Read order
 
-Before making changes, read files in this order:
+Before changing code, read in this order:
 
 1. `README.md`
-2. `docs/统一控制台说明.md`
-3. `docs/实操配置与提示词说明.md`
-4. `docs/GitHub协作入门.md`
-5. the target Python file you plan to edit
+2. `docs/新控制台使用说明.md`
+3. the target Python file you plan to edit
 
-If the task is about uploading, inspect these files first:
+If the task is mainly about uploading, inspect:
 
+- `dashboard_app.py`
+- `workflow_core.py`
 - `batch_upload.py`
-- `bulk_upload.py`
-- `group_upload_batch.py`
-- `group_upload_workflow.py`
 - `browser_api.py`
+- `upload_window_planner.py`
+- `group_upload_workflow.py`
 - `utils.py`
 - `config/upload_config.json`
 - `config/channel_mapping.json`
-- `config/upload_batch_settings.json`
 
-If the task is about rendering, inspect these files first:
+If the task is mainly about rendering, inspect:
 
+- `dashboard_app.py`
+- `workflow_core.py`
 - `daily_scheduler.py`
-- `render_engine.py`
 - `effects_library.py`
 - `scheduler_config.json`
 
+If the task is mainly about prompt generation, inspect:
+
+- `dashboard_app.py`
+- `content_generation.py`
+- `prompt_studio.py`
+- `config/prompt_studio.json`
+
 ## 2. Important project facts
 
-- This is a public-safe repo copy.
-- Config files under `config/` are templates, not production secrets.
-- Do not assume the template browser IDs, channel mapping, paths, or tags are real.
-- Real local assets are intentionally not committed.
+- This is a public repo copy.
+- Files under `config/` are templates, not production secrets.
+- Real browser IDs, real mappings, local assets, and local API keys must not be committed.
+- Runtime state should stay untracked.
 
-Expected local folders for actual use:
+Expected local folders for real usage:
 
 - `workspace/music/`
 - `workspace/base_image/`
@@ -56,123 +65,93 @@ These may be empty in the public repo.
 
 ## 3. What not to commit
 
-Never commit these kinds of files unless the user explicitly asks:
+Never commit:
 
-- real browser environment IDs
+- real API keys
+- real browser env IDs
 - real channel mappings
+- local path bindings
 - upload history
 - rendered videos
-- audio assets
-- thumbnails or private project素材
-- large binary files
-- tokens, cookies, local secrets
+- private thumbnails or source assets
+- large binary archives
+- local runtime state
 
-Respect `.gitignore`.
+Respect `.gitignore`. If unsure whether a value is safe, treat it as private.
 
-## 4. Default workflow for Codex
+## 4. Default Codex workflow
 
-When the user asks for help operating this repo, prefer this workflow:
+When helping operate this repo:
 
-1. Prefer `dashboard.py` as the daily entry point.
-2. If the user has multiple tags for one day, use the multi-tag task list in `dashboard.py` or `bulk_upload.py`.
-3. If the user already has rendered videos and wants to upload a whole folder to one browser group, use `dashboard.py -> 分组批量上传` or `group_upload_batch.py`.
-4. Verify config files exist and explain what fields the user must fill.
-5. Verify required local files exist for the requested task.
-6. Run the smallest realistic command for the requested workflow.
-7. If automation fails, diagnose from `batch_upload.py`, `bulk_upload.py`, `group_upload_batch.py`, or the relevant runtime logs.
-8. Update docs when the operating method changes.
-
-Do not jump straight to broad refactors if the user asked for an operational fix.
+1. Prefer `dashboard.py` as the only user-facing entry point.
+2. Use the `上传` tab to define which BitBrowser windows work today.
+3. Use the `提示词` tab for API presets and content templates.
+4. Use the `当日内容` tab only for hand-editing one channel/day payload.
+5. Use `路径配置` for global folders and long-term group bindings.
+6. Run the smallest realistic flow first.
+7. If behavior changes, update `README.md` and `docs/新控制台使用说明.md`.
 
 ## 5. Upload workflow
 
-Use this flow for upload-related help:
+Use this flow:
 
-1. Confirm `config/upload_config.json` is filled with the user's local BitBrowser API and tag mapping.
-2. Confirm `config/channel_mapping.json` contains the user's real browser env IDs and serial numbers.
-3. Confirm the target video exists under `workspace/AutoTask/<date_tag>/`.
-4. Confirm title/description/cover data exists in `workspace/base_image/<tag>/generation_map.json`.
-5. Confirm BitBrowser is running before starting Playwright automation.
-6. Prefer single-channel verification before batch upload.
+1. Confirm `config/upload_config.json` has the user’s local BitBrowser API settings.
+2. Confirm `config/channel_mapping.json` reflects the user’s real local mapping.
+3. Confirm the `上传` tab has the correct windows in the task area.
+4. Confirm metadata mode is either:
+   - `提示词那套`
+   - `原先那套`
+5. Confirm the source folder is either:
+   - the long-term group binding
+   - or the one-off source override entered on the `上传` tab
+6. Prefer a dry or short render simulation before a real long upload.
 
-Typical command:
+Important behavior:
 
-```bash
-py -3 batch_upload.py --tag 面壁者 --date 3.12 --channel 90 --auto-confirm --auto-close-browser
-```
-
-For multiple tags in one day:
-
-```bash
-py -3 bulk_upload.py --date 3.12 --tags 面壁者,芝加哥蓝调 --auto-confirm --auto-close-browser
-```
-
-For an existing video folder that should be assigned to channels in one tag:
-
-```bash
-py -3 group_upload_batch.py --tag 面壁者 --date 3.12 --source-dir F:\待上传视频 --generation-mode site_api --visibility public --auto-confirm --auto-close-browser
-```
-
-Known behavior:
-
-- `Altered content` should be selected as `Yes`.
-- `Category` should be selected as `Music`.
-- The new group-upload manifest can also carry tags, made-for-kids, visibility, and schedule settings.
-- For large files, the first `Next` button may not appear until upload progresses much further.
+- `上传 = 单个或批量的统一入口`
+- if the task area has 1 window, that is a single upload
+- if the task area has multiple windows, that is a batch upload
+- `Altered content` should be `Yes`
+- `Category` should usually be `Music`
 
 ## 6. Render workflow
 
-Use this flow for rendering help:
+Use this flow:
 
-1. Prefer launching `dashboard.py` or `启动统一控制台.bat`.
-2. If the user has more than one tag today, fill the multi-tag task list in `dashboard.py`.
-3. Check `scheduler_config.json`.
-4. Confirm music files exist under `workspace/music/<tag>/`.
-5. Confirm base images exist under `workspace/base_image/<tag>/`.
-6. Run render-only first.
-7. Verify output under `workspace/AutoTask/`.
+1. Confirm `scheduler_config.json`
+2. Confirm source assets exist in the bound source folder
+3. Run `模拟 1-2 分钟` first when testing
+4. Then run real render or render+upload
 
-Typical command:
+Current encoder behavior:
 
-```bash
-py -3 daily_scheduler.py --standard 0312 --tags=面壁者 --render-only --song-count=1
-```
+- macOS prefers `h264_videotoolbox`
+- Windows with usable NVIDIA runtime prefers `h264_nvenc`
+- Windows with usable AMD AMF runtime prefers `h264_amf`
+- otherwise it falls back to `libx264`
 
-Recommended daily GUI entry:
+If Windows render is still slow after GPU encode is active, the likely bottleneck is the filter/effects chain, not the encoder.
 
-```bash
-py -3 dashboard.py
-```
+## 7. Prompt generation behavior
 
-## 7. Setup notes
+- Metadata generation now tracks recent history and tries to avoid reusing recent title/description/tag/thumbnail prompt combinations.
+- Runtime metadata history is local-only and should not be committed.
+- Public `config/prompt_studio.json` must remain sanitized.
 
-Typical local setup on Windows:
+## 8. Editing rules
 
-```bash
-py -3 -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-playwright install chromium
-```
-
-If Playwright is missing, install browser dependencies before debugging upload issues.
-
-## 8. Editing rules for Codex
-
-- Prefer minimal, targeted fixes.
+- Prefer minimal targeted fixes.
 - Preserve Windows compatibility.
 - Preserve BitBrowser support.
-- Keep user-facing docs in Chinese unless the user asks otherwise.
-- Add concise comments only where the logic is genuinely non-obvious.
-- If behavior changes, update the matching docs in `docs/`.
+- Keep user-facing docs in Chinese unless asked otherwise.
+- Add comments only when logic is genuinely non-obvious.
+- Do not reintroduce deleted legacy entry points without a clear reason.
 
-## 9. Collaboration expectations
+## 9. Collaboration
 
 If multiple people maintain this repo:
 
-- prefer small commits
-- explain why an automation change is needed
-- update docs with any workflow change
-- avoid mixing private production config with public template files
-
-When unsure whether a config value is safe to publish, treat it as private.
+- keep commits small
+- explain workflow changes
+- keep docs in sync with behavior
+- keep public config sanitized

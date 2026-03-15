@@ -136,6 +136,11 @@ def load_runtime_paths(script_dir: Path, scheduler_config_path: Path) -> dict[st
 
 def _link_or_copy(source: Path, target: Path) -> Path:
     target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if source.resolve(strict=False) == target.resolve(strict=False):
+            return target
+    except Exception:
+        pass
     if target.exists():
         target.unlink()
     try:

@@ -1,152 +1,143 @@
-# YouTube 自动化项目说明
+# YouTube 自动化控制台
 
-这是一个已经整理成 **Windows + BitBrowser** 日常可用形态的 YouTube 自动化项目，当前包含：
-
-- 长视频渲染
-- 随机视觉特效
-- 单频道上传
-- 多赛道批量上传
-- 同分组多视频批量上传
-- 提示词 / 标题 / 简介 / 缩略图配置
-- 路径集中配置
-
-日常推荐入口：
+当前仓库只保留这一套主流程：
 
 - `dashboard.py`
-- `启动统一控制台.bat`
+- `dashboard_app.py`
+- `workflow_core.py`
+- `batch_upload.py`
+- `daily_scheduler.py`
 
-如果你重点关心“参数在哪里改 / 提示词怎么改 / 模型怎么换 / 多赛道怎么跑”，优先看这些文档：
+旧版 GUI、旧批量入口、重复说明文档和历史归档已经清掉，不再推荐单独记一堆旧脚本名。
 
-- `docs/统一控制台说明.md`
-- `docs/实操配置与提示词说明.md`
-- `docs/文件用途说明.md`
+## 启动
 
-## 当前这版能做什么
+```powershell
+cd C:\youtube自动化
+py -3 dashboard.py
+```
 
-1. 用 `dashboard.py` 统一管理渲染、上传、提示词、当日内容和路径。
-2. 在“快捷开始”里直接选择上传方式：`单频道上传 / 多赛道任务清单 / 同分组现成视频`。
-3. 在“快捷开始”里维护多赛道任务清单，一天可以连跑多个赛道。
-4. 在“路径配置”里统一改音乐目录、底图目录、输出目录，并预览多赛道目录结构。
-5. 在“提示词”里维护文本模型 / 图片模型 / 主提示词 / 标题库 / 生成数量。
-6. 在“当日内容”里直接改 `generation_map.json`，保存后同步 `upload_manifest.json`。
-7. 上传侧固定执行：
-   - `Altered content = Yes`
-   - `Category = Music`
+或者双击：
 
-## 推荐使用方式
+- `C:\youtube自动化\启动统一控制台.bat`
 
-1. 启动 `dashboard.py`
-2. 在“路径配置”确认目录
-3. 在“提示词”确认模板
-4. 在“当日内容”确认标题、简介、封面
-5. 在“快捷开始”选择今天的上传方式
-6. 如果是多赛道，再填写多赛道任务清单
-7. 点“开始当前流程”，或者点“仅跑当前上传方式”
+## 当前逻辑
 
-如果你是“一个文件夹里有多条现成视频，要按顺序上传到同一个比特浏览器分组下的多个频道”，以后推荐这样走：
+### 1. 快捷开始
 
-1. `dashboard.py -> 快捷开始 -> 上传方式 = 同分组现成视频`
-2. 点“打开当前上传设置页”
-3. 在 `分组批量上传` 页里配置并执行
+这里只决定今天做什么：
+
+- `本日只剪辑`
+- `本日只上传`
+- `本日剪辑并上传`
+
+说明：
+
+- 现在的 `本日只上传` 不会再直接吃旧 `upload_manifest.json`
+- 它会先按上传页当前素材目录准备新视频、新标题、新简介、新标签、新缩略图，再进入上传
+
+### 2. 上传页
+
+这是唯一上传入口。
+
+你只需要在这里做几件事：
+
+- 选择 BitBrowser 分组
+- 点窗口按钮，把今天要处理的窗口加入任务区
+- 可选填本次临时素材目录覆盖
+- 选择文案来源：
+  - `提示词那套`
+  - `原先那套`
+- 设置默认规则：
+  - 可见性
+  - 分类
+  - 儿童内容
+  - AI 内容
+  - 定时发布日期 / 时间 / 时区
+  - 上传完成后自动关闭窗口
+
+任务区里只有 1 个窗口就是单个上传，多个窗口就是批量上传，不再分两个 tab。
+
+### 3. 提示词页
+
+这里只管两类模板：
+
+- API 模板
+- 内容模板
+
+支持：
+
+- 多套模板保存
+- 绑定到不同 BitBrowser 分组
+- 文本 API / 图片 API 连通性测试
+- 受众截图自动识别
+
+### 4. 当日内容页
+
+这里只改某个频道某一天的落地内容：
+
+- 标题
+- 简介
+- 封面
+- A/B 标题
+- YPP
+
+可以同步回 `upload_manifest.json`。
+
+### 5. 路径配置页
+
+这里只管：
+
+- 音乐目录
+- 底图目录
+- 输出目录
+- FFmpeg
+- 已用素材目录
+- 上传后保留天数
+- 分组 -> 素材目录 的长期绑定
+
+## 渲染与加速
+
+当前程序会按机器实际能力自动选择编码器：
+
+- macOS: `h264_videotoolbox`
+- Windows + NVIDIA 可用: `h264_nvenc`
+- Windows + AMD AMF 可用: `h264_amf`
+- 否则回退 `libx264`
+
+注意：
+
+- 你这台机器实测是 `NVIDIA GeForce RTX 3070`
+- 所以正确的 GPU 路线是 `NVENC`，不是 `AMF`
+- 日志里现在会直接打印当前编码器，避免再靠猜
+- 如果仍然慢，瓶颈通常在特效滤镜链，而不是编码器没启用
+
+## 当前保留文档
+
+- `C:\youtube自动化\docs\新控制台使用说明.md`
 
 ## 主要文件
 
 ```text
-youtube自动化/
-├── dashboard.py              # 统一控制台，日常主入口
-├── group_upload_batch.py     # 同分组多视频批量上传入口
-├── group_upload_workflow.py  # 同分组批量上传的编排层（扫文件夹/分配频道/写manifest）
-├── bulk_upload.py            # 多赛道批量上传入口
-├── batch_upload.py           # 单 tag / 单频道上传主脚本
-├── daily_scheduler.py        # 批量渲染调度入口，可顺带触发上传
-├── app.py                    # 旧版渲染工作站 GUI
-├── scheduler_gui.py          # 旧版调度器 GUI
-├── content_generation.py     # 网页版 API 文案/标签/缩略图提示词生成逻辑
-├── prompt_studio.py          # 提示词模板 / generation_map / manifest 辅助
-├── render_engine.py          # FFmpeg 渲染核心
-├── browser_api.py            # HubStudio / BitBrowser API 适配层
-├── utils.py                  # 上传侧配置 / 元数据 / 频道工具函数
-├── path_helpers.py           # 路径与配置文件查找辅助
-├── effects_library.py        # 频谱 / 粒子 / 文字等特效生成
-├── scheduler_config.json     # 本地路径配置
-├── config/
-│   ├── upload_config.json    # 上传 / 浏览器配置模板
-│   ├── channel_mapping.json  # 频道映射模板
-│   ├── prompt_studio.json    # 提示词 / 模型 / 内容模板配置
-│   └── upload_batch_settings.json # 分组批量上传默认设置
-├── docs/                     # 中文说明文档
-├── fonts/                    # 字体资源
-├── overlays/                 # 粒子叠层视频
-└── workspace/                # 本地素材 / 输出目录
+C:\youtube自动化
+├── dashboard.py
+├── dashboard_app.py
+├── workflow_core.py
+├── batch_upload.py
+├── browser_api.py
+├── daily_scheduler.py
+├── content_generation.py
+├── prompt_studio.py
+├── upload_window_planner.py
+├── group_upload_workflow.py
+├── path_helpers.py
+├── effects_library.py
+├── utils.py
+├── scheduler_config.json
+├── config\
+│   ├── upload_config.json
+│   ├── channel_mapping.json
+│   └── prompt_studio.json
+└── docs\
+    └── 新控制台使用说明.md
 ```
-
-## BitBrowser 适配方式
-
-浏览器提供方已经支持在 `config/upload_config.json` 里切换，默认就是 `bitbrowser`。
-
-```json
-{
-  "browser_provider": "bitbrowser",
-  "browser_api": {
-    "provider": "bitbrowser",
-    "base_url": "http://127.0.0.1:54345",
-    "list_endpoint": "/browser/list",
-    "open_endpoint": "/browser/open",
-    "open_payload_id_key": "id"
-  }
-}
-```
-
-如果你本地 BitBrowser 的接口字段不同，优先改这个 JSON，不要先改 Python。
-
-## 2026-03-13 新增：按窗口任务上传
-
-现在总控制台里新增了一个更清晰的主上传入口：`按窗口任务上传`。
-
-它先解决 3 个问题：
-
-1. 今天要上传的是同一个分组里的几号窗口？
-2. 还是多个分组，各自有哪些窗口？
-3. 还是每个窗口都要单独配置标题 / 可见性 / 分类 / 是否 AI 内容？
-
-对应 3 种范围模式：
-
-- `同一分组的一批窗口`
-  直接填：`90,91,92`
-- `多个分组，各自列窗口`
-  每行写：`tag: 90,91`
-- `逐窗口单独配置`
-  每行写：`窗口号 | tag | key=value | key=value`
-
-逐窗口模式示例：
-
-```text
-90 | 面壁者
-91 | 面壁者 | visibility=private | category=Music
-95 | 芝加哥蓝调 | title=自定义标题 | altered_content=true
-```
-
-支持的覆盖字段包括：
-
-- `visibility`
-- `category`
-- `made_for_kids`
-- `altered_content`
-- `scheduled_publish_at`
-- `title`
-- `description`
-- `tag_list`
-- `thumbnails`
-- `ab_titles`
-
-默认规则在控制台 `上传` 页统一设置：
-
-- 可见性
-- 分类
-- 是否儿童内容
-- 是否 AI / 合成内容
-- 是否定时发布
-- 定时开始时间
-- 定时间隔
-
-单个窗口没有单独写覆盖项时，就使用这组默认规则。

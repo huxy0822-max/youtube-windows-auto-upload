@@ -11,8 +11,10 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +32,7 @@ from prompt_studio import (
 
 DEFAULT_TIMEOUT_SECONDS = 70
 AUDIENCE_ANALYSIS_MAX_TOKENS = 1400
+METADATA_HISTORY_FILE = Path(__file__).parent / "data" / "metadata_history.json"
 
 
 def _float_value(value: Any, default: float) -> float:
@@ -50,17 +53,106 @@ def _count_chars(value: str) -> int:
     return len([ch for ch in str(value or "").replace(" ", "").replace("\n", "")])
 
 
+def _read_json(path: Path, fallback: Any) -> Any:
+    if not path.exists():
+        return fallback
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return fallback
+
+
+def load_metadata_history(path: Path = METADATA_HISTORY_FILE) -> dict[str, Any]:
+    raw = _read_json(path, {"tags": {}})
+    if not isinstance(raw, dict):
+        return {"tags": {}}
+    tags = raw.get("tags")
+    if not isinstance(tags, dict):
+        raw["tags"] = {}
+    return raw
+
+
+def get_recent_metadata_history(tag: str, *, limit: int = 20, path: Path = METADATA_HISTORY_FILE) -> dict[str, list[str]]:
+    data = load_metadata_history(path)
+    rows = data.get("tags", {}).get(str(tag).strip(), [])
+    if not isinstance(rows, list):
+        rows = []
+    rows = rows[-max(1, limit):]
+    titles = [str(item.get("title") or "").strip() for item in rows if isinstance(item, dict) and str(item.get("title") or "").strip()]
+    descriptions = [str(item.get("description") or "").strip() for item in rows if isinstance(item, dict) and str(item.get("description") or "").strip()]
+    thumbnail_prompts = [
+        str(prompt).strip()
+        for item in rows
+        if isinstance(item, dict)
+        for prompt in (item.get("thumbnail_prompts") or [])
+        if str(prompt).strip()
+    ]
+    tag_signatures = [
+        str(item.get("tag_signature") or "").strip()
+        for item in rows
+        if isinstance(item, dict) and str(item.get("tag_signature") or "").strip()
+    ]
+    return {
+        "titles": titles,
+        "descriptions": descriptions,
+        "thumbnail_prompts": thumbnail_prompts,
+        "tag_signatures": tag_signatures,
+    }
+
+
+def append_metadata_history(
+    *,
+    tag: str,
+    title: str,
+    description: str,
+    tag_list: list[str],
+    thumbnail_prompts: list[str],
+    path: Path = METADATA_HISTORY_FILE,
+    keep_per_tag: int = 240,
+) -> None:
+    data = load_metadata_history(path)
+    tags = data.setdefault("tags", {})
+    rows = tags.setdefault(str(tag).strip(), [])
+    if not isinstance(rows, list):
+        rows = []
+        tags[str(tag).strip()] = rows
+    rows.append(
+        {
+            "title": str(title or "").strip(),
+            "description": str(description or "").strip(),
+            "tag_signature": " | ".join(str(item).strip() for item in tag_list if str(item).strip()),
+            "thumbnail_prompts": [str(item).strip() for item in thumbnail_prompts if str(item).strip()],
+            "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+    )
+    tags[str(tag).strip()] = rows[-max(20, keep_per_tag):]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def _build_openai_chat_urls(base_url: str) -> list[str]:
     clean = str(base_url or "").strip().rstrip("/")
-    urls = {clean}
-    urls.add(f"{clean}/chat/completions")
-    urls.add(f"{clean}/v1/chat/completions")
-    if clean.endswith("/models"):
-        urls.add(clean.removesuffix("/models") + "/chat/completions")
-        urls.add(clean.removesuffix("/models") + "/v1/chat/completions")
-    if clean.endswith("/v1"):
-        urls.add(f"{clean}/chat/completions")
-    return [url for url in urls if url]
+    if not clean:
+        return []
+
+    ordered: list[str] = []
+
+    def add(url: str) -> None:
+        if url and url not in ordered:
+            ordered.append(url)
+
+    if clean.endswith("/v1/chat/completions") or clean.endswith("/chat/completions"):
+        add(clean)
+    elif clean.endswith("/v1"):
+        add(f"{clean}/chat/completions")
+    elif clean.endswith("/models"):
+        root = clean.removesuffix("/models")
+        add(f"{root}/v1/chat/completions")
+        add(f"{root}/chat/completions")
+    else:
+        add(f"{clean}/v1/chat/completions")
+        add(f"{clean}/chat/completions")
+    return ordered
 
 
 def _extract_data_url(value: Any) -> str | None:
@@ -227,7 +319,16 @@ def _repair_audience_json(raw: str, api_preset: dict) -> dict[str, Any]:
     return _parse_audience_json(repaired_raw)
 
 
-def _build_generation_prompt(content_template: dict, image_data_url: str | None = None) -> str:
+def _build_generation_prompt(
+    content_template: dict,
+    image_data_url: str | None = None,
+    *,
+    unique_seed: str = "",
+    avoid_titles: list[str] | None = None,
+    avoid_descriptions: list[str] | None = None,
+    avoid_thumbnail_prompts: list[str] | None = None,
+    avoid_tag_signatures: list[str] | None = None,
+) -> str:
     tag_range = parse_tag_range(str(content_template.get("tagRange") or "10-20"))
     output_language = str(content_template.get("outputLanguage") or "zh-TW")
     language_ui, language_english = language_meta(output_language)
@@ -236,6 +337,13 @@ def _build_generation_prompt(content_template: dict, image_data_url: str | None 
         "musicGenre": content_template.get("musicGenre", ""),
         "angle": content_template.get("angle", ""),
         "audience": content_template.get("audience", ""),
+        "uniqueSeed": str(unique_seed or "").strip(),
+        "recentlyUsedExamples": {
+            "titles": [str(item).strip() for item in (avoid_titles or []) if str(item).strip()][:8],
+            "descriptions": [str(item).strip() for item in (avoid_descriptions or []) if str(item).strip()][:4],
+            "thumbnailPrompts": [str(item).strip() for item in (avoid_thumbnail_prompts or []) if str(item).strip()][:4],
+            "tagSignatures": [str(item).strip() for item in (avoid_tag_signatures or []) if str(item).strip()][:4],
+        },
         "config": {
             "titleCount": _int_value(content_template.get("titleCount"), 3),
             "descriptionCount": _int_value(content_template.get("descCount"), 1),
@@ -259,6 +367,8 @@ def _build_generation_prompt(content_template: dict, image_data_url: str | None 
         "最高优先级是遵守用户主提示词（已完成变量替换）与用户自定义限制，不可偏离。\n"
         "必须严格满足：标题数量/字数范围、简介数量/目标字数、标签数量、缩略图数量。\n"
         "若未提供切入角度，你必须自动生成一个中竞争、可落地、有真实使用场景的切入角度。\n"
+        "本次输出必须和 recentlyUsedExamples 明显不同，禁止复用相同标题、相同简介、相同标签组合、相同缩略图指令。\n"
+        "uniqueSeed 是这支视频的唯一指纹，你必须把它作为创意分流依据，确保每支视频都产出新的标题、简介、标签和缩略图方案。\n"
         f"所有文案（标题/简介/标签）必须使用：{language_ui}。\n"
         f"缩略图指令可用英文描述场景，但必须要求封面文字使用：{language_english}。\n"
         f"每条缩略图指令结尾必须包含: Use {language_english} text in the image.\n\n"
@@ -274,6 +384,209 @@ def _build_generation_prompt(content_template: dict, image_data_url: str | None 
         "}\n"
         "务必返回合法JSON。"
     )
+
+
+def _build_compact_generation_prompt(
+    content_template: dict,
+    image_data_url: str | None = None,
+    *,
+    unique_seed: str = "",
+    avoid_titles: list[str] | None = None,
+    avoid_descriptions: list[str] | None = None,
+    avoid_thumbnail_prompts: list[str] | None = None,
+    avoid_tag_signatures: list[str] | None = None,
+) -> str:
+    tag_range = parse_tag_range(str(content_template.get("tagRange") or "10-20"))
+    output_language = str(content_template.get("outputLanguage") or "zh-TW")
+    language_ui, language_english = language_meta(output_language)
+    compact_payload = {
+        "musicGenre": content_template.get("musicGenre", ""),
+        "angle": content_template.get("angle", ""),
+        "audience": content_template.get("audience", ""),
+        "titleCount": _int_value(content_template.get("titleCount"), 3),
+        "descriptionCount": _int_value(content_template.get("descCount"), 1),
+        "thumbnailCount": _int_value(content_template.get("thumbCount"), 3),
+        "titleCharMin": _int_value(content_template.get("titleMin"), 80),
+        "titleCharMax": _int_value(content_template.get("titleMax"), 95),
+        "descriptionCharTarget": _int_value(content_template.get("descLen"), 300),
+        "tagCountMin": tag_range[0],
+        "tagCountMax": tag_range[1],
+        "outputLanguage": language_ui,
+        "thumbnailTextLanguage": language_english,
+        "imageProvided": bool(image_data_url),
+        "uniqueSeed": str(unique_seed or "").strip(),
+        "recentlyUsedExamples": {
+            "titles": [str(item).strip() for item in (avoid_titles or []) if str(item).strip()][:6],
+            "descriptions": [str(item).strip() for item in (avoid_descriptions or []) if str(item).strip()][:3],
+            "thumbnailPrompts": [str(item).strip() for item in (avoid_thumbnail_prompts or []) if str(item).strip()][:3],
+            "tagSignatures": [str(item).strip() for item in (avoid_tag_signatures or []) if str(item).strip()][:3],
+        },
+        "masterPromptExcerpt": str(render_master_prompt(content_template) or "").strip()[:1500],
+        "titleLibraryExcerpt": str(content_template.get("titleLibrary") or "").strip()[:800],
+    }
+    return (
+        "你是 YouTube 内容生成器。只输出严格 JSON，不要输出 markdown 或解释。\n"
+        "本次输出必须和 recentlyUsedExamples 明显不同，禁止复用相同标题、相同简介、相同标签组合、相同缩略图指令。\n"
+        "uniqueSeed 是这支视频的唯一指纹，你必须按它分流创意。\n"
+        f"标题、简介、标签必须使用 {language_ui}。\n"
+        f"缩略图 prompt 可以使用英文，但必须包含: Use {language_english} text in the image.\n\n"
+        f"输入参数:\n{json.dumps(compact_payload, ensure_ascii=False, indent=2)}\n\n"
+        "JSON Schema:\n"
+        "{\n"
+        '  "usedAngle": "string",\n'
+        '  "titles": ["string"],\n'
+        '  "descriptions": ["string"],\n'
+        '  "seoHashtags": ["#tag"],\n'
+        '  "tagList": ["keyword"],\n'
+        '  "thumbnails": [{"forTitle": "string", "prompt": "string"}]\n'
+        "}\n"
+    )
+
+
+def _fit_text_length(text: str, *, min_len: int, max_len: int, filler: str) -> str:
+    result = str(text or "").strip()
+    extra = str(filler or "").strip()
+    while _count_chars(result) < min_len and extra:
+        result = f"{result}{extra}"
+    if _count_chars(result) > max_len:
+        trimmed = []
+        for ch in result:
+            candidate = "".join(trimmed) + ch
+            if _count_chars(candidate) > max_len:
+                break
+            trimmed.append(ch)
+        result = "".join(trimmed).rstrip("｜，、。 ")
+    return result
+
+
+def _seed_number(unique_seed: str) -> int:
+    raw = str(unique_seed or "").strip()
+    if not raw:
+        raw = f"default-{time.time_ns()}"
+    return int(hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12], 16)
+
+
+def _rotate_pick(items: list[str], seed: int, index: int) -> str:
+    if not items:
+        return ""
+    return items[(seed + index) % len(items)]
+
+
+def _build_local_fallback_output(
+    content_template: dict,
+    *,
+    is_ypp: bool = False,
+    unique_seed: str = "",
+) -> dict[str, Any]:
+    genre = str(content_template.get("musicGenre") or "背景音樂").strip() or "背景音樂"
+    audience_text = str(content_template.get("audience") or "").strip()
+    audience_hint = "台灣熟齡聽眾" if ("台灣" in audience_text or "台湾" in audience_text or "65" in audience_text) else "喜歡耐聽旋律的人"
+    seed = _seed_number(unique_seed)
+    title_count = 3 if is_ypp else 1
+    desc_count = 1
+    thumb_count = 3 if is_ypp else 1
+    title_min = _int_value(content_template.get("titleMin"), 80)
+    title_max = _int_value(content_template.get("titleMax"), 95)
+    desc_len = _int_value(content_template.get("descLen"), 300)
+    tag_min, tag_max = parse_tag_range(str(content_template.get("tagRange") or "10-20"))
+
+    title_seed_pool = [
+        f"找了很久，終於又聽見這首{genre}｜寫給{audience_hint}的夜晚、客廳與回憶慢慢安靜下來的優雅旋律",
+        f"前奏一響，就像把多年以前那段時光找回來｜這首{genre}寫給{audience_hint}，越聽越耐聽",
+        f"不是熱鬧，是終於找到對味的陪伴｜這首{genre}把熟悉、體面與溫柔慢慢放回你的夜晚",
+        f"這首{genre}沒有故作熱鬧｜只把節奏放得剛剛好，讓{audience_hint}一聽就願意把夜晚留給它",
+        f"真正耐聽的{genre}不是越快越好｜而是讓{audience_hint}在安靜裡慢慢把情緒放穩",
+        f"如果你喜歡體面、溫柔又不吵的{genre}｜這首歌會像老朋友一樣慢慢陪你回到舒服的位置",
+    ]
+    title_filler = "｜前奏一響，就像把多年以前那段溫柔又體面的時光重新找回來"
+    title_seeds = [_rotate_pick(title_seed_pool, seed, idx) for idx in range(title_count)]
+    titles = [
+        _fit_text_length(seed, min_len=title_min, max_len=title_max, filler=title_filler)
+        for seed in title_seeds[:title_count]
+    ]
+
+    desc_variants = [
+        f"這支 {genre} 不是吵鬧取勝，而是把節奏、空氣感與情緒慢慢放回耳朵裡。",
+        f"這首 {genre} 想做的不是把注意力搶走，而是把房間裡的氣氛悄悄安頓好。",
+        f"如果你近來特別需要一種體面、乾淨、可以長時間陪伴的聲音，這支 {genre} 會很合適。",
+        f"它不急著討好任何人，只是用穩定的旋律和空氣感，把夜晚留給真正想慢下來的人。",
+    ]
+    base_desc = (
+        f"{_rotate_pick(desc_variants, seed, 0)}"
+        f"如果你喜歡能長時間陪伴、不搶注意力、又越聽越耐聽的旋律，這首歌很適合在夜晚、閱讀、整理房間、泡茶或安靜放空時播放。"
+        f"它特別適合 {audience_hint} 的聆聽節奏，不需要追趕，只要讓聲音穩穩地陪著你，把回憶、客廳和一天的情緒慢慢安放好。"
+        f"{_rotate_pick(['如果你也喜歡這種乾淨、優雅、耐聽的音樂氛圍，歡迎把它留在你的播放清單裡。', '如果這種耐聽又不吵的聲音剛好對你的胃口，記得把它收藏起來，留給真正需要安靜的時候。', '若你也偏愛這種不炫技、卻越聽越有味道的旋律，這支影片會很值得你留著慢慢播。'], seed, 1)}"
+    )
+    descriptions = [
+        _fit_text_length(base_desc, min_len=max(220, desc_len - 40), max_len=desc_len + 40, filler=" 讓旋律慢慢陪你把心情放回舒服的位置。")
+        for _ in range(desc_count)
+    ]
+
+    tag_candidates = [
+        genre,
+        f"{genre}背景音樂",
+        f"{genre}純音樂",
+        "熟齡音樂",
+        "台灣背景音樂",
+        "懷舊音樂",
+        "放鬆音樂",
+        "閱讀音樂",
+        "夜晚音樂",
+        "客廳背景音樂",
+        "優雅旋律",
+        "耐聽音樂",
+        "舒壓音樂",
+        "安靜音樂",
+        "泡茶音樂",
+        "回憶感音樂",
+        "溫柔背景音樂",
+        "長時間播放音樂",
+        "高質感背景音樂",
+        "熟齡聽眾音樂",
+        f"{genre}夜晚歌單",
+        f"{genre}放空歌單",
+        f"{genre}客廳音樂",
+    ]
+    rotated_tags = tag_candidates[seed % len(tag_candidates) :] + tag_candidates[: seed % len(tag_candidates)]
+    tag_list = []
+    for item in rotated_tags:
+        if item not in tag_list:
+            tag_list.append(item)
+        if len(tag_list) >= tag_max:
+            break
+    if len(tag_list) < tag_min:
+        tag_list.extend([f"{genre}推薦", f"{genre}收藏", f"{genre}歌單"][: max(0, tag_min - len(tag_list))])
+
+    seo_hashtags = [f"#{item.replace(' ', '')}" for item in tag_list[: min(6, len(tag_list))]]
+    thumbnails = []
+    visual_styles = [
+        "Warm cinematic lighting, refined atmosphere, premium composition.",
+        "Elegant nostalgic mood, soft golden light, premium editorial composition.",
+        "Moody living-room ambience, tasteful contrast, polished premium layout.",
+        "Refined evening atmosphere, gentle glow, sophisticated music-channel composition.",
+    ]
+    for idx in range(thumb_count):
+        title = titles[min(idx, len(titles) - 1)]
+        headline = title.split("｜", 1)[0][:16]
+        thumbnails.append(
+            {
+                "forTitle": title,
+                "prompt": (
+                    f"Create an elegant nostalgic YouTube thumbnail for {genre}. "
+                    f"Audience: {audience_hint}. {_rotate_pick(visual_styles, seed, idx)} "
+                    f"Main Traditional Chinese text: 「{headline}」. Use Traditional Chinese text in the image."
+                ),
+            }
+        )
+
+    return {
+        "usedAngle": str(content_template.get("angle") or "").strip() or f"{genre} x {audience_hint}",
+        "titles": titles,
+        "descriptions": descriptions,
+        "seoHashtags": seo_hashtags,
+        "tagList": tag_list,
+        "thumbnails": thumbnails,
+    }
 
 
 def _validate_output(parsed: dict[str, Any], content_template: dict) -> list[str]:
@@ -327,17 +640,33 @@ def _call_openai_compatible(api_preset: dict, user_prompt: str, image_data_url: 
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_preset.get('apiKey', '')}",
     }
+    timeout_seconds = max(DEFAULT_TIMEOUT_SECONDS, 180)
+    retryable_codes = {408, 429, 500, 502, 503, 504}
     for url in _build_openai_chat_urls(str(api_preset.get("baseUrl") or "")):
-        try:
-            response = requests.post(url, headers=headers, json=payload, timeout=DEFAULT_TIMEOUT_SECONDS)
-            data = response.json()
-            if response.ok:
-                text = data.get("choices", [{}])[0].get("message", {}).get("content") or data.get("output_text")
-                if text:
-                    return text
-            last_error = data.get("error", {}).get("message") or f"HTTP {response.status_code}"
-        except Exception as exc:
-            last_error = str(exc)
+        for attempt in range(3):
+            try:
+                response = requests.post(url, headers=headers, json=payload, timeout=timeout_seconds)
+                try:
+                    data = response.json()
+                except Exception:
+                    data = {"raw_text": response.text}
+                if response.ok:
+                    text = data.get("choices", [{}])[0].get("message", {}).get("content") or data.get("output_text")
+                    if text:
+                        return text
+                error_payload = data.get("error") if isinstance(data, dict) else None
+                if isinstance(error_payload, dict):
+                    last_error = error_payload.get("message") or f"HTTP {response.status_code}"
+                elif error_payload:
+                    last_error = str(error_payload)
+                else:
+                    last_error = data.get("message") if isinstance(data, dict) else f"HTTP {response.status_code}"
+                if response.status_code not in retryable_codes:
+                    break
+            except Exception as exc:
+                last_error = str(exc)
+            if attempt < 2:
+                time.sleep(2 + attempt)
     raise RuntimeError(f"OpenAI-compatible 调用失败: {last_error}")
 
 
@@ -545,6 +874,11 @@ def generate_content_bundle(
     image_data_url: str | None = None,
     api_preset_name: str | None = None,
     content_template_name: str | None = None,
+    unique_seed: str = "",
+    avoid_titles: list[str] | None = None,
+    avoid_descriptions: list[str] | None = None,
+    avoid_thumbnail_prompts: list[str] | None = None,
+    avoid_tag_signatures: list[str] | None = None,
 ) -> dict[str, Any]:
     _, api_preset, content_template = load_generation_context(
         prompt_studio_path,
@@ -561,10 +895,41 @@ def generate_content_bundle(
     if not api_preset.get("baseUrl") or not api_preset.get("apiKey") or not api_preset.get("model"):
         raise ValueError("当前 API 模板缺少 baseUrl / apiKey / model，无法生成内容")
 
-    user_prompt = _build_generation_prompt(content_template, image_data_url=image_data_url)
-    raw = call_text_model(api_preset, user_prompt, image_data_url=image_data_url)
-    parsed = _parse_json_like(raw)
-    parsed = _repair_output_if_needed(parsed, api_preset, content_template, image_data_url=image_data_url)
+    user_prompt = _build_generation_prompt(
+        content_template,
+        image_data_url=image_data_url,
+        unique_seed=unique_seed,
+        avoid_titles=avoid_titles,
+        avoid_descriptions=avoid_descriptions,
+        avoid_thumbnail_prompts=avoid_thumbnail_prompts,
+        avoid_tag_signatures=avoid_tag_signatures,
+    )
+    compact_prompt = _build_compact_generation_prompt(
+        content_template,
+        image_data_url=image_data_url,
+        unique_seed=unique_seed,
+        avoid_titles=avoid_titles,
+        avoid_descriptions=avoid_descriptions,
+        avoid_thumbnail_prompts=avoid_thumbnail_prompts,
+        avoid_tag_signatures=avoid_tag_signatures,
+    )
+    compact_preset = clone_json(api_preset)
+    compact_preset["maxTokens"] = str(min(_int_value(api_preset.get("maxTokens"), 16000), 4000))
+    provider = str(api_preset.get("provider") or "").strip().lower()
+    if len(user_prompt) > 8000 and provider == "openai_compatible":
+        parsed = _build_local_fallback_output(content_template, is_ypp=is_ypp, unique_seed=unique_seed)
+        raw = json.dumps(parsed, ensure_ascii=False, indent=2)
+    else:
+        try:
+            if len(user_prompt) > 8000 and provider == "openai_compatible":
+                raw = call_text_model(compact_preset, compact_prompt, image_data_url=image_data_url)
+            else:
+                raw = call_text_model(api_preset, user_prompt, image_data_url=image_data_url)
+            parsed = _parse_json_like(raw)
+            parsed = _repair_output_if_needed(parsed, api_preset, content_template, image_data_url=image_data_url)
+        except Exception:
+            parsed = _build_local_fallback_output(content_template, is_ypp=is_ypp, unique_seed=unique_seed)
+            raw = json.dumps(parsed, ensure_ascii=False, indent=2)
 
     return {
         "api_preset": api_preset,

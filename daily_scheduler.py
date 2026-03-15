@@ -19,11 +19,15 @@ import re
 import time
 import argparse
 import subprocess
+import threading
+import ctypes
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import platform
+from group_upload_workflow import prepare_window_task_upload_batch
 from path_helpers import (
     default_scheduler_config,
     normalize_scheduler_config,
@@ -199,17 +203,120 @@ SONG_COUNT = 20               # 每个母带默认用多少首歌
 MASTER_COUNT_PER_TAG = 5      # 每个环境默认生成多少个随机母带
 HISTORY_FILE = _SCRIPT_DIR / "render_history.json"
 
+
+@lru_cache(maxsize=8)
+def _ffmpeg_has_encoder(encoder_name: str) -> bool:
+    try:
+        result = subprocess.run(
+            [FFMPEG_BIN, "-hide_banner", "-encoders"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+    except Exception:
+        return False
+    blob = f"{result.stdout}\n{result.stderr}".lower()
+    needle = str(encoder_name or "").strip().lower()
+    return bool(needle) and needle in blob
+
+
+@lru_cache(maxsize=1)
+def _windows_has_amf_runtime() -> bool:
+    if not IS_WINDOWS:
+        return False
+    try:
+        ctypes.WinDLL("amfrt64.dll")
+        return True
+    except Exception:
+        return False
+
+
+@lru_cache(maxsize=1)
+def _windows_has_nvenc_runtime() -> bool:
+    if not IS_WINDOWS or not _ffmpeg_has_encoder("h264_nvenc"):
+        return False
+    try:
+        probe = subprocess.run(
+            ["nvidia-smi", "-L"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+        if probe.returncode != 0:
+            return False
+    except Exception:
+        return False
+
+    probe_path = _SCRIPT_DIR / "_tmp_nvenc_probe.mp4"
+    try:
+        result = subprocess.run(
+            [
+                FFMPEG_BIN,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=1280x720:d=0.1",
+                "-frames:v",
+                "1",
+                "-c:v",
+                "h264_nvenc",
+                str(probe_path),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+        )
+        return result.returncode == 0 and probe_path.exists() and probe_path.stat().st_size > 0
+    except Exception:
+        return False
+    finally:
+        try:
+            probe_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
 # ============ FFmpeg 编码参数 (平台自适应) ============
 if IS_MAC:
     VIDEO_CODEC = "h264_videotoolbox"
     VIDEO_BITRATE = "5000k"
     VIDEO_SPATIAL_AQ = True
     _CODEC_EXTRA_ARGS = ['-spatial_aq', '1']
+elif IS_WINDOWS and _windows_has_nvenc_runtime():
+    VIDEO_CODEC = "h264_nvenc"
+    VIDEO_BITRATE = "5000k"
+    VIDEO_SPATIAL_AQ = False
+    _CODEC_EXTRA_ARGS = [
+        "-preset", "p4",
+        "-tune", "hq",
+        "-rc", "vbr",
+    ]
+elif IS_WINDOWS and _ffmpeg_has_encoder("h264_amf") and _windows_has_amf_runtime():
+    VIDEO_CODEC = "h264_amf"
+    VIDEO_BITRATE = "5000k"
+    VIDEO_SPATIAL_AQ = False
+    _CODEC_EXTRA_ARGS = [
+        "-usage", "transcoding",
+        "-quality", "balanced",
+        "-profile:v", "high",
+        "-rc", "cbr",
+        "-maxrate", "6500k",
+        "-bufsize", "12000k",
+    ]
 else:
     VIDEO_CODEC = "libx264"           # CPU 编码 (最大兼容性)
     VIDEO_BITRATE = "5000k"
     VIDEO_SPATIAL_AQ = False
-    _CODEC_EXTRA_ARGS = ['-preset', 'medium']
+    _CODEC_EXTRA_ARGS = ['-preset', 'veryfast']
 AUDIO_BITRATE = "320k"
 AUDIO_SAMPLERATE = "44100"
 
@@ -309,12 +416,35 @@ def get_audio_duration(filepath) -> float:
     cached = read_done_duration(Path(filepath))
     if cached > 0:
         return cached
-    
-    # 方法 1: ffmpeg 全解码 (最可靠，对任何格式都准确)
+
+    # 方法 1: ffprobe 快速读取元数据
+    try:
+        ffmpeg_path = Path(FFMPEG_BIN)
+        ffprobe_name = ffmpeg_path.name.replace("ffmpeg", "ffprobe")
+        if IS_WINDOWS and not ffprobe_name.endswith(".exe"):
+            ffprobe_name += ".exe"
+        ffprobe_bin = str(ffmpeg_path.parent / ffprobe_name)
+
+        cmd = [
+            ffprobe_bin, '-v', 'error',
+            '-show_entries', 'format=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            str(filepath)
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+        out_val = result.stdout.strip()
+        if out_val and out_val != 'N/A':
+            dur = float(out_val)
+            if dur > 0:
+                return dur
+    except Exception:
+        pass
+
+    # 方法 2: ffmpeg 全解码 (最可靠，对任何格式都准确)
     try:
         cmd = [FFMPEG_BIN, '-i', str(filepath), '-f', 'null', '-']
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+
         # 从 stderr 最后的 time= 中获取实际解码时长
         for line in reversed(result.stderr.split('\n')):
             if 'time=' in line:
@@ -323,7 +453,7 @@ def get_audio_duration(filepath) -> float:
                 dur = float(h) * 3600 + float(m) * 60 + float(s)
                 if dur > 0:
                     return dur
-        
+
         # 从 Duration: 行获取
         for line in result.stderr.split('\n'):
             if 'Duration:' in line and 'N/A' not in line:
@@ -332,29 +462,6 @@ def get_audio_duration(filepath) -> float:
                 dur = float(h) * 3600 + float(m) * 60 + float(s)
                 if dur > 0:
                     return dur
-    except Exception:
-        pass
-    
-    # 方法 2: ffprobe (备选，可能不准但聊胜于无)
-    try:
-        ffmpeg_path = Path(FFMPEG_BIN)
-        ffprobe_name = ffmpeg_path.name.replace("ffmpeg", "ffprobe")
-        if IS_WINDOWS and not ffprobe_name.endswith(".exe"):
-            ffprobe_name += ".exe"
-        ffprobe_bin = str(ffmpeg_path.parent / ffprobe_name)
-        
-        cmd = [
-            ffprobe_bin, '-v', 'error',
-            '-show_entries', 'format=duration',
-            '-of', 'default=noprint_wrappers=1:nokey=1',
-            str(filepath)
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-        out_val = result.stdout.strip()
-        if out_val and out_val != 'N/A':
-            dur = float(out_val)
-            if dur > 0:
-                return dur
     except Exception:
         pass
     
@@ -644,6 +751,10 @@ class RenderOptions:
     upload_auto_close_browser: bool = True
     upload_skip_channels: list[int] | None = None
     upload_window_plan_file: str = ""
+    upload_metadata_mode: str = "prompt_api"
+    upload_fill_text: bool = True
+    upload_fill_thumbnails: bool = True
+    upload_sync_daily_content: bool = True
     fx_randomize: bool = False
     fx_spectrum: bool = True
     fx_timeline: bool = True
@@ -724,6 +835,20 @@ def parse_arguments() -> RenderOptions:
             opts.upload_skip_channels = [int(x.strip()) for x in re.split(r'[，,]', raw) if x.strip().isdigit()]
         elif arg.startswith('--window-plan-file='):
             opts.upload_window_plan_file = arg.split('=', 1)[1].strip()
+        elif arg.startswith('--upload-metadata-mode='):
+            opts.upload_metadata_mode = arg.split('=', 1)[1].strip() or "prompt_api"
+        elif arg == '--upload-fill-text':
+            opts.upload_fill_text = True
+        elif arg == '--no-upload-fill-text':
+            opts.upload_fill_text = False
+        elif arg == '--upload-fill-thumbnails':
+            opts.upload_fill_thumbnails = True
+        elif arg == '--no-upload-fill-thumbnails':
+            opts.upload_fill_thumbnails = False
+        elif arg == '--upload-sync-daily-content':
+            opts.upload_sync_daily_content = True
+        elif arg == '--no-upload-sync-daily-content':
+            opts.upload_sync_daily_content = False
         elif arg == '--simple':  pass
         elif arg == '--render-only': opts.render_only = True
         elif arg == '--keep-upload-browser-open': opts.upload_auto_close_browser = False
@@ -1022,13 +1147,25 @@ def phase3_render_and_upload(active_projects: list, master_map: dict, opts: Rend
         tag_success = 0
         if tag_video_jobs:
             vid_start = time.time()
-            
+            progress_stop = threading.Event()
+            progress_state = {"done": 0}
+
+            def progress_heartbeat() -> None:
+                while not progress_stop.wait(25):
+                    elapsed_minutes = (time.time() - vid_start) / 60
+                    print(
+                        f"  ⏱️ {tag} 渲染中: {progress_state['done']}/{len(tag_video_jobs)} 已完成, "
+                        f"已运行 {elapsed_minutes:.1f} 分钟"
+                    )
+             
             with ThreadPoolExecutor(max_workers=VIDEO_WORKERS) as executor:
                 futures = {
                     executor.submit(render_video_task, j['tag'], j['img'], j['audio'], j['out'], j['filter'], extra_inputs=j.get('extra_inputs')): j
                     for j in tag_video_jobs
                 }
-                
+                heartbeat_thread = threading.Thread(target=progress_heartbeat, daemon=True)
+                heartbeat_thread.start()
+                 
                 for i, future in enumerate(as_completed(futures)):
                     task = futures[future]
                     try:
@@ -1038,12 +1175,15 @@ def phase3_render_and_upload(active_projects: list, master_map: dict, opts: Rend
                     
                     prefix = f"[{i+1}/{len(tag_video_jobs)}]"
                     container = extract_container(task['img'].name)
+                    progress_state["done"] = i + 1
                     if res['success']:
                         tag_success += 1
                         total_success += 1
                         print(f"  {prefix} ✅ {tag}/{container} | {task['desc']} | {res['time']:.0f}s")
                     else:
                         print(f"  {prefix} ❌ {tag}/{container}: {res.get('error')}")
+                progress_stop.set()
+                heartbeat_thread.join(timeout=1)
             
             total_rendered += len(tag_video_jobs)
             vid_time = time.time() - vid_start
@@ -1057,6 +1197,26 @@ def phase3_render_and_upload(active_projects: list, master_map: dict, opts: Rend
             print(f"  🚀 启动后台上传: {tag} → {upload_log.name}")
             
             try:
+                if opts.upload_window_plan_file:
+                    plan_path = Path(opts.upload_window_plan_file)
+                    window_plan = json.loads(plan_path.read_text(encoding="utf-8"))
+                    prepared = prepare_window_task_upload_batch(
+                        script_dir=_SCRIPT_DIR,
+                        scheduler_config_path=_SCRIPT_DIR / "scheduler_config.json",
+                        prompt_studio_path=_SCRIPT_DIR / "config" / "prompt_studio.json",
+                        channel_mapping_path=_SCRIPT_DIR / "config" / "channel_mapping.json",
+                        window_plan=window_plan,
+                        date_value=opts.target_date,
+                        source_video_dir=out_dir,
+                        thumbnail_dir=None,
+                        metadata_mode=opts.upload_metadata_mode,
+                        fill_title_desc_tags=bool(opts.upload_fill_text),
+                        fill_thumbnails=bool(opts.upload_fill_thumbnails),
+                        sync_daily_content=bool(opts.upload_sync_daily_content),
+                    )
+                    print(f"  [manifest] rebuilt channels={prepared.get('assigned_count', 0)}")
+                    for warning in prepared.get("warnings", []):
+                        print(f"  [manifest] {warning}")
                 log_f = open(upload_log, 'w', encoding='utf-8')
                 upload_cmd = [
                     sys.executable,
