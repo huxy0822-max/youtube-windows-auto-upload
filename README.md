@@ -114,6 +114,8 @@ py -3 dashboard.py
 
 ## 当前保留文档
 
+- `C:\youtube自动化\docs\项目功能总纲-2026-03-17.md`
+- `C:\youtube自动化\docs\重构阶段1审阅-2026-03-17.md`
 - `C:\youtube自动化\docs\新控制台使用说明.md`
 
 ## 主要文件
