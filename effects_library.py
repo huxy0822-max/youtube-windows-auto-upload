@@ -18,6 +18,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 OVERLAY_DIR = BASE_DIR / "overlays"
 FONT_DIR = BASE_DIR / "fonts"
+OVERLAY_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv"}
 
 PALETTES = {
     "WhiteGold": {"spectrum": "white|#FFD700", "timeline": "#FFD700", "text": "#FFF5D6"},
@@ -81,6 +82,67 @@ def list_effects() -> list[str]:
     return ["bar", "bar_mirror", "wave", "circular"]
 
 
+def discover_particle_files() -> dict[str, str]:
+    mapping = dict(PARTICLE_FILES)
+    if OVERLAY_DIR.exists():
+        for path in sorted(OVERLAY_DIR.iterdir()):
+            if not path.is_file() or path.suffix.lower() not in OVERLAY_EXTENSIONS:
+                continue
+            mapping.setdefault(path.stem, path.name)
+    return mapping
+
+
+def list_palette_names() -> list[str]:
+    return list(PALETTES.keys())
+
+
+def list_zoom_modes() -> list[str]:
+    return list(ZOOM_SPEEDS.keys())
+
+
+def list_tint_names() -> list[str]:
+    return list(TINT_FILTERS.keys())
+
+
+def list_particle_effects() -> list[str]:
+    return ["none", *discover_particle_files().keys()]
+
+
+def list_text_positions() -> list[str]:
+    return list(TEXT_POSITIONS.keys())
+
+
+def list_text_styles() -> list[str]:
+    return ["Classic", "Glow", "Neon", "Bold", "Box"]
+
+
+def list_font_names() -> list[str]:
+    return list(FONT_FILES.keys())
+
+
+def _overlay_needs_colorkey(path: Path) -> bool:
+    return path.suffix.lower() in {".mp4", ".mkv"}
+
+
+def _particle_overlay_plan(name: str) -> dict[str, float]:
+    lower = name.lower()
+    if any(token in lower for token in ("snow", "glitter", "dust", "spark", "magic", "fairy", "bokeh")):
+        scale = random.uniform(0.42, 0.95)
+    elif any(token in lower for token in ("smoke", "rain", "fireflies", "light", "flare")):
+        scale = random.uniform(0.72, 1.22)
+    else:
+        scale = random.uniform(0.55, 1.05)
+    return {
+        "scale": scale,
+        "base_x": random.uniform(-0.15, 1.05),
+        "base_y": random.uniform(-0.12, 0.98),
+        "sway_px": random.uniform(10.0, 58.0),
+        "sway_speed": random.uniform(0.18, 0.75),
+        "drift_px": random.uniform(6.0, 28.0),
+        "drift_speed": random.uniform(0.12, 0.48),
+    }
+
+
 def _pick_palette(name: str) -> dict:
     if name == "random":
         name = random.choice(list(PALETTES.keys()))
@@ -100,9 +162,10 @@ def _pick_style(name: str) -> str:
 
 
 def _pick_particle(name: str) -> str:
+    particle_files = discover_particle_files()
     if name == "random":
-        return random.choice(["none", *list(PARTICLE_FILES.keys())])
-    return name
+        return random.choice(["none", *list(particle_files.keys())])
+    return name if name in particle_files or name == "none" else "none"
 
 
 def _pick_tint(name: str) -> str:
@@ -294,18 +357,35 @@ def get_effect(
         )
         current = next_label
 
+    particle_files = discover_particle_files()
     if particle_name != "none":
-        overlay_file = OVERLAY_DIR / PARTICLE_FILES.get(particle_name, "")
+        overlay_file = OVERLAY_DIR / particle_files.get(particle_name, "")
         if overlay_file.exists():
+            overlay_plan = _particle_overlay_plan(particle_name)
             input_index = 2
             extra_inputs.extend(["-stream_loop", "-1", "-i", str(overlay_file)])
             overlay_label = "overlay0"
             next_label = "base6"
-            chains.append(
-                f"[{input_index}:v]scale=1920:1080,setpts=PTS/{particle_speed:.3f},format=rgba,"
-                f"colorchannelmixer=aa={particle_opacity:.3f}[{overlay_label}]"
+            overlay_parts = [
+                f"scale='trunc(iw*{overlay_plan['scale']:.3f}/2)*2':'trunc(ih*{overlay_plan['scale']:.3f}/2)*2'",
+                f"setpts=PTS/{particle_speed:.3f}",
+                "format=rgba",
+            ]
+            if _overlay_needs_colorkey(overlay_file):
+                overlay_parts.append("colorkey=0x000000:0.20:0.10")
+            overlay_parts.append(f"colorchannelmixer=aa={particle_opacity:.3f}")
+            chains.append(f"[{input_index}:v]{','.join(overlay_parts)}[{overlay_label}]")
+            x_expr = (
+                f"min(max({overlay_plan['base_x']:.3f}*(W-w)+{overlay_plan['sway_px']:.1f}*sin(t*{overlay_plan['sway_speed']:.3f}),"
+                f"-w*0.20),W-w*0.05)"
             )
-            chains.append(f"[{current}][{overlay_label}]overlay=shortest=1:format=auto[{next_label}]")
+            y_expr = (
+                f"min(max({overlay_plan['base_y']:.3f}*(H-h)+{overlay_plan['drift_px']:.1f}*sin(t*{overlay_plan['drift_speed']:.3f}),"
+                f"-h*0.20),H-h*0.05)"
+            )
+            chains.append(
+                f"[{current}][{overlay_label}]overlay=x='{x_expr}':y='{y_expr}':shortest=1:format=auto[{next_label}]"
+            )
             current = next_label
 
     if spectrum:

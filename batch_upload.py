@@ -113,6 +113,115 @@ HUBSTUDIO_TAG_ALIASES = {
 def get_hubstudio_tag_name(tag: str) -> str:
     return HUBSTUDIO_TAG_ALIASES.get(tag, tag)
 
+
+def _normalize_tag_for_match(tag: str) -> str:
+    text = str(tag or "").strip().replace(" ", "")
+    return text.translate(
+        str.maketrans(
+            {
+                "風": "风",
+                "樂": "乐",
+                "薩": "萨",
+                "館": "馆",
+                "臺": "台",
+                "牆": "墙",
+                "試": "试",
+                "藍": "蓝",
+                "龍": "龙",
+            }
+        )
+    )
+
+
+def _get_tag_config(config: Dict, tag: str, default: Optional[Dict] = None) -> Dict:
+    tag_to_project = config.get("tag_to_project", {}) or {}
+    direct = tag_to_project.get(tag)
+    if isinstance(direct, dict):
+        return direct
+    wanted = _normalize_tag_for_match(tag)
+    for raw_tag, raw_value in tag_to_project.items():
+        if _normalize_tag_for_match(raw_tag) == wanted and isinstance(raw_value, dict):
+            return raw_value
+    return dict(default or {})
+
+
+def _iter_window_plan_source_dirs(window_plan: Optional[Dict[str, Any]], tag: str) -> List[Path]:
+    if not isinstance(window_plan, dict):
+        return []
+    wanted = _normalize_tag_for_match(tag)
+    seen: set[str] = set()
+    paths: list[Path] = []
+    for task in window_plan.get("tasks", []) or []:
+        if _normalize_tag_for_match(task.get("tag") or "") != wanted:
+            continue
+        folder_text = str(task.get("source_dir") or "").strip()
+        if not folder_text:
+            continue
+        key = folder_text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        paths.append(Path(folder_text))
+    return paths
+
+
+def _count_matching_output_videos(folder: Path, date_key: str) -> int:
+    if not folder.exists() or not folder.is_dir():
+        return 0
+    count = 0
+    for item in folder.iterdir():
+        if not item.is_file() or item.suffix.lower() not in SUPPORTED_VIDEO_EXTENSIONS:
+            continue
+        if re.match(rf"^{re.escape(date_key)}_(\\d+)\\.[^.]+$", item.name):
+            count += 1
+    return count
+
+
+def _resolve_plan_output_dir(window_plan: Optional[Dict[str, Any]], tag: str, date_key: str) -> Optional[Path]:
+    if not isinstance(window_plan, dict):
+        return None
+
+    plan_tag_output_dirs = window_plan.get("tag_output_dirs", {}) if isinstance(window_plan, dict) else {}
+    tag_output_dir_text = str(plan_tag_output_dirs.get(tag) or "").strip()
+    if not tag_output_dir_text and isinstance(plan_tag_output_dirs, dict):
+        wanted_tag_key = _normalize_tag_for_match(tag)
+        for raw_tag, raw_folder in plan_tag_output_dirs.items():
+            if _normalize_tag_for_match(raw_tag) == wanted_tag_key:
+                tag_output_dir_text = str(raw_folder or "").strip()
+                break
+    if tag_output_dir_text:
+        candidate = Path(tag_output_dir_text)
+        if candidate.exists():
+            return candidate
+
+    wanted = _normalize_tag_for_match(tag)
+    candidates: list[tuple[int, Path]] = []
+    for source_dir in _iter_window_plan_source_dirs(window_plan, tag):
+        possible_dirs = [source_dir]
+        if source_dir.exists() and source_dir.is_dir():
+            possible_dirs.extend(item for item in source_dir.iterdir() if item.is_dir())
+        for folder in possible_dirs:
+            if not folder.exists() or not folder.is_dir():
+                continue
+            score = 0
+            if (folder / "upload_manifest.json").exists():
+                score += 100
+            match_count = _count_matching_output_videos(folder, date_key)
+            if match_count:
+                score += match_count * 10
+            normalized_name = _normalize_tag_for_match(folder.name)
+            if wanted and wanted in normalized_name:
+                score += 25
+            if folder.name.startswith(f"{date_key}_"):
+                score += 20
+            if score > 0:
+                candidates.append((score, folder))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (-item[0], str(item[1]).lower()))
+    return candidates[0][1]
+
 def get_playlist_name(tag: str) -> str:
     """根据标签获取播放列表名称"""
     if tag in TAG_TO_PLAYLIST:
@@ -500,6 +609,116 @@ async def ensure_upload_radio_selected(
 
 
 async def set_video_category_music(page, max_attempts: int = 5) -> bool:
+    # Keep locator logic focused on the actual Category field.
+    async def _strict_read_state() -> Dict[str, Any]:
+        return await page.evaluate(
+            """
+            () => {
+                const visible = (el) => !!el && (
+                    el.offsetParent !== null ||
+                    el.offsetWidth > 0 ||
+                    el.offsetHeight > 0 ||
+                    el.getClientRects().length > 0
+                );
+                const textOf = (el) => ((el && (el.innerText || el.textContent)) || "").trim();
+                const attrText = (el) => [
+                    el?.getAttribute?.("aria-label") || "",
+                    el?.getAttribute?.("label") || "",
+                    el?.getAttribute?.("title") || "",
+                    el?.getAttribute?.("name") || "",
+                    el?.getAttribute?.("id") || "",
+                ].join(" ");
+                const catRe = /category|鍒嗛|鍒嗙被/i;
+                const badRe = /recording\\s+date|record\\s+date|錄製日期|录制日期/i;
+                const musicRe = /(^|\\s)music(\\s|$)|闊虫▊|闊充箰/i;
+                const nodes = Array.from(document.querySelectorAll("ytcp-form-select, tp-yt-paper-dropdown-menu"));
+                let best = null;
+                for (const node of nodes) {
+                    if (!visible(node)) continue;
+                    const labelText = [
+                        attrText(node),
+                        textOf(node.querySelector?.("label")),
+                        textOf(node.querySelector?.("tp-yt-paper-input-label")),
+                        textOf(node.querySelector?.("[slot='label']")),
+                    ].join(" ").trim();
+                    const wholeText = [labelText, textOf(node)].join(" ").trim();
+                    if (!catRe.test(labelText) && !catRe.test(wholeText)) continue;
+                    const selectedText =
+                        textOf(node.querySelector?.("#label")) ||
+                        textOf(node.querySelector?.("ytcp-dropdown-trigger")) ||
+                        textOf(node.querySelector?.("[aria-haspopup='listbox']")) ||
+                        textOf(node);
+                    if (badRe.test((selectedText || "").toLowerCase()) && !catRe.test(labelText)) continue;
+                    const score =
+                        (catRe.test(labelText) ? 10 : 0) +
+                        (catRe.test(wholeText) ? 4 : 0) +
+                        (musicRe.test(selectedText.toLowerCase()) || musicRe.test(selectedText) ? 3 : 0);
+                    if (!best || score > best.score) {
+                        best = { value: selectedText, score };
+                    }
+                }
+                if (!best) {
+                    return { found: false, selected: false, value: "", method: "strict_not_found" };
+                }
+                const value = (best.value || "").trim();
+                const selected = musicRe.test(value.toLowerCase()) || musicRe.test(value);
+                return { found: true, selected, value, method: selected ? "strict_already_music" : "strict_found" };
+            }
+            """
+        )
+
+    async def _strict_open_dropdown() -> bool:
+        selectors = [
+            "ytcp-form-select:has-text('Category') ytcp-dropdown-trigger",
+            "ytcp-form-select:has-text('鍒嗛') ytcp-dropdown-trigger",
+            "ytcp-form-select:has-text('鍒嗙被') ytcp-dropdown-trigger",
+            "tp-yt-paper-dropdown-menu:has-text('Category')",
+            "tp-yt-paper-dropdown-menu:has-text('鍒嗛')",
+            "tp-yt-paper-dropdown-menu:has-text('鍒嗙被')",
+        ]
+        for sel in selectors:
+            try:
+                locator = page.locator(sel).first
+                if await locator.count() == 0 or not await locator.is_visible():
+                    continue
+                if await human_click(page, locator, f"Category strict dropdown ({sel})"):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _strict_set_category_music() -> bool:
+        for attempt in range(1, max_attempts + 1):
+            await clear_blocking_overlays(page, f"category-strict-{attempt}")
+            state = await _strict_read_state()
+            log(
+                f"Category 严格检查#{attempt}: found={state.get('found')} selected={state.get('selected')} "
+                f"method={state.get('method')} value={state.get('value', '')}",
+                "INFO",
+            )
+            if state.get("selected"):
+                log(f"Category 已确认是 Music ({state.get('value', '')})", "OK")
+                return True
+            opened = await _strict_open_dropdown()
+            log(f"Category 严格打开下拉#{attempt}: opened={opened}", "INFO")
+            if not opened:
+                await asyncio.sleep(0.8)
+                continue
+            await asyncio.sleep(1.2)
+            clicked = await _pick_music_option_locator()
+            if clicked:
+                await asyncio.sleep(1.0)
+                verify = await _strict_read_state()
+                if verify.get("selected"):
+                    log(f"Category 已设置为 Music ({verify.get('value', '')})", "OK")
+                    return True
+            await asyncio.sleep(0.8)
+        log("Category 严格模式仍未成功设置为 Music", "WARN")
+        return False
+
+    strict_ok = await _strict_set_category_music()
+    if strict_ok:
+        return True
     """在上传详情页将 Category 固定为 Music。"""
 
     async def _read_category_state() -> Dict[str, Any]:
@@ -908,6 +1127,188 @@ async def set_video_category_music(page, max_attempts: int = 5) -> bool:
         await asyncio.sleep(0.8)
 
     log("Category 仍未成功设置为 Music", "WARN")
+    return False
+
+
+async def set_video_category_music(page, max_attempts: int = 5) -> bool:
+    async def _read_state() -> Dict[str, Any]:
+        return await page.evaluate(
+            """
+            () => {
+                const visible = (el) => !!el && (
+                    el.offsetParent !== null ||
+                    el.offsetWidth > 0 ||
+                    el.offsetHeight > 0 ||
+                    el.getClientRects().length > 0
+                );
+                const textOf = (el) => ((el && (el.innerText || el.textContent)) || "").trim();
+                const roots = [document];
+                const seen = new Set([document]);
+                const categoryRe = /category|分類|分类/i;
+                const musicRe = /(^|\\s)music(\\s|$)|音樂|音乐/i;
+
+                while (roots.length) {
+                    const root = roots.shift();
+                    const allNodes = root.querySelectorAll ? root.querySelectorAll("*") : [];
+                    for (const node of allNodes) {
+                        if (node && node.shadowRoot && !seen.has(node.shadowRoot)) {
+                            seen.add(node.shadowRoot);
+                            roots.push(node.shadowRoot);
+                        }
+                    }
+                    const fields = Array.from(
+                        root.querySelectorAll ? root.querySelectorAll("ytcp-form-select, tp-yt-paper-dropdown-menu") : []
+                    ).filter(visible);
+                    for (const field of fields) {
+                        const labelText = [
+                            textOf(field.querySelector?.("label")),
+                            textOf(field.querySelector?.("tp-yt-paper-input-label")),
+                            textOf(field.querySelector?.("[slot='label']")),
+                            textOf(field),
+                        ].join(" ").trim();
+                        if (!categoryRe.test(labelText)) continue;
+                        const selectedText =
+                            textOf(field.querySelector?.("#label")) ||
+                            textOf(field.querySelector?.("ytcp-dropdown-trigger")) ||
+                            textOf(field.querySelector?.("[aria-haspopup='listbox']")) ||
+                            "";
+                        return {
+                            found: true,
+                            selected: musicRe.test(selectedText.toLowerCase()) || musicRe.test(selectedText),
+                            value: selectedText,
+                        };
+                    }
+                }
+                return { found: false, selected: false, value: "" };
+            }
+            """
+        )
+
+    async def _open_dropdown() -> bool:
+        return bool(
+            await page.evaluate(
+                """
+                () => {
+                    const visible = (el) => !!el && (
+                        el.offsetParent !== null ||
+                        el.offsetWidth > 0 ||
+                        el.offsetHeight > 0 ||
+                        el.getClientRects().length > 0
+                    );
+                    const textOf = (el) => ((el && (el.innerText || el.textContent)) || "").trim();
+                    const clickEl = (el) => {
+                        if (!(el instanceof HTMLElement)) return false;
+                        try {
+                            el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+                        } catch (_) {}
+                        try { el.click(); } catch (_) {}
+                        for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+                            try {
+                                el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, composed: true }));
+                            } catch (_) {}
+                        }
+                        return true;
+                    };
+                    const roots = [document];
+                    const seen = new Set([document]);
+                    const categoryRe = /category|分類|分类/i;
+                    while (roots.length) {
+                        const root = roots.shift();
+                        const allNodes = root.querySelectorAll ? root.querySelectorAll("*") : [];
+                        for (const node of allNodes) {
+                            if (node && node.shadowRoot && !seen.has(node.shadowRoot)) {
+                                seen.add(node.shadowRoot);
+                                roots.push(node.shadowRoot);
+                            }
+                        }
+                        const fields = Array.from(
+                            root.querySelectorAll ? root.querySelectorAll("ytcp-form-select, tp-yt-paper-dropdown-menu") : []
+                        ).filter(visible);
+                        for (const field of fields) {
+                            const labelText = [
+                                textOf(field.querySelector?.("label")),
+                                textOf(field.querySelector?.("tp-yt-paper-input-label")),
+                                textOf(field.querySelector?.("[slot='label']")),
+                                textOf(field),
+                            ].join(" ").trim();
+                            if (!categoryRe.test(labelText)) continue;
+                            const trigger =
+                                field.querySelector?.("ytcp-dropdown-trigger") ||
+                                field.querySelector?.("[aria-haspopup='listbox']") ||
+                                field.querySelector?.("[role='button']") ||
+                                field;
+                            if (clickEl(trigger)) {
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                }
+                """
+            )
+        )
+
+    async def _pick_music_option() -> bool:
+        selectors = [
+            "tp-yt-paper-item:has-text('Music')",
+            "[role='option']:has-text('Music')",
+            "ytcp-menu-service-item-renderer:has-text('Music')",
+            "tp-yt-paper-item:has-text('音樂')",
+            "[role='option']:has-text('音樂')",
+            "ytcp-menu-service-item-renderer:has-text('音樂')",
+            "tp-yt-paper-item:has-text('音乐')",
+            "[role='option']:has-text('音乐')",
+            "ytcp-menu-service-item-renderer:has-text('音乐')",
+        ]
+        for selector in selectors:
+            try:
+                locator = page.locator(selector).last
+                if await locator.count() == 0 or not await locator.is_visible():
+                    continue
+                if await human_click(page, locator, f"Category option ({selector})"):
+                    return True
+                await locator.click(force=True, timeout=3000)
+                return True
+            except Exception:
+                continue
+        return False
+
+    for attempt in range(1, max_attempts + 1):
+        await clear_blocking_overlays(page, f"category-music-{attempt}")
+        try:
+            await page.mouse.wheel(0, 600)
+        except Exception:
+            pass
+        state = await _read_state()
+        log(
+            f"Category strict check#{attempt}: found={state.get('found')} selected={state.get('selected')} value={state.get('value', '')}",
+            "INFO",
+        )
+        if state.get("selected"):
+            log(f"Category confirmed as Music ({state.get('value', '')})", "OK")
+            return True
+        opened = await _open_dropdown()
+        log(f"Category strict open#{attempt}: opened={opened}", "INFO")
+        if not opened:
+            await asyncio.sleep(0.8)
+            continue
+        await asyncio.sleep(1.0)
+        picked = await _pick_music_option()
+        log(f"Category strict pick#{attempt}: picked={picked}", "INFO")
+        if not picked:
+            await asyncio.sleep(0.8)
+            continue
+        await asyncio.sleep(1.0)
+        verify = await _read_state()
+        log(
+            f"Category strict verify#{attempt}: found={verify.get('found')} selected={verify.get('selected')} value={verify.get('value', '')}",
+            "INFO",
+        )
+        if verify.get("selected"):
+            log(f"Category set to Music ({verify.get('value', '')})", "OK")
+            return True
+
+    log("Category still failed to become Music", "WARN")
     return False
 
 
@@ -2515,9 +2916,14 @@ def get_containers_by_tag(tag: str) -> List[Dict]:
     """按标签获取环境（兼容 tagName/tag 两种字段）。"""
     containers = get_all_containers()
     hubstudio_tag = get_hubstudio_tag_name(tag)
+    wanted = {
+        _normalize_tag_for_match(tag),
+        _normalize_tag_for_match(hubstudio_tag),
+    }
     matched = [
         c for c in containers
-        if (c.get("tagName") == hubstudio_tag or c.get("tag") == hubstudio_tag)
+        if _normalize_tag_for_match(c.get("tagName", "")) in wanted
+        or _normalize_tag_for_match(c.get("tag", "")) in wanted
     ]
     return sorted(matched, key=lambda x: int(x.get("serialNumber", 0) or 0))
 
@@ -2841,7 +3247,7 @@ def show_available_uploads(grouped: Dict[str, Dict[str, List[Path]]], config: Di
         print("-" * 40)
         
         for tag, videos in tags.items():
-            tag_cfg = config.get("tag_to_project", {}).get(tag, {})
+            tag_cfg = _get_tag_config(config, tag, {})
             project_name = tag_cfg.get("project_name", "未配置")
             
             # ========== 动态从 API 获取环境列表 ==========
@@ -5617,13 +6023,13 @@ async def batch_upload(
     config = load_config()
     
     # 检查标签配置
-    if tag not in config["tag_to_project"]:
-        log(f"未找到标签配置: {tag}", "ERR")
+    tag_config = _get_tag_config(config, tag, {})
+    if not tag_config:
+        log(f"未找到标签配置: {tag}，将使用实时分组和计划文件继续上传", "WARN")
         log(f"可用标签: {list(config['tag_to_project'].keys())}")
-        return make_batch_result(0, 0, 1)
-    
-    tag_config = config["tag_to_project"][tag]
-    project_name = tag_config["project_name"]
+        tag_config = {"project_name": "", "video_keyword": tag}
+
+    project_name = tag_config.get("project_name", "")
     video_keyword = tag_config.get("video_keyword", tag)  # 使用配置的关键词或标签名
     project_folder = Path(config["projects_folder"]) / project_name if project_name else None
     
@@ -5683,7 +6089,19 @@ async def batch_upload(
         log(f"加载频道名称: {len(serial_to_channel_name)} 个 (channels.md)", "OK")
     
     # 查找视频（使用配置的 video_keyword）
-    videos = find_videos(config["video_folder"], video_keyword, date_key, tag=tag)
+    tag_output_dir = _resolve_plan_output_dir(window_plan, tag, date_key)
+    if tag_output_dir and tag_output_dir.exists():
+        videos = sorted(
+            [
+                item
+                for item in tag_output_dir.iterdir()
+                if item.is_file() and item.suffix.lower() in SUPPORTED_VIDEO_EXTENSIONS
+            ],
+            key=lambda item: item.name.lower(),
+        )
+        log(f"使用计划指定成品目录: {tag_output_dir}", "OK")
+    else:
+        videos = find_videos(config["video_folder"], video_keyword, date_key, tag=tag)
     
     if not videos:
         log(f"未找到匹配的视频文件 (日期: {date}, 关键词: {video_keyword})", "ERR")
@@ -5698,7 +6116,8 @@ async def batch_upload(
     # 如果不存在，fallback 到旧模式（实时读 metadata_channels.md）
     manifest_data = None
     video_folder_path = Path(config["video_folder"])
-    manifest_path = video_folder_path / f"{date_key}_{tag}" / "upload_manifest.json"
+    resolved_video_dir = tag_output_dir if tag_output_dir and tag_output_dir.exists() else (video_folder_path / f"{date_key}_{tag}")
+    manifest_path = resolved_video_dir / "upload_manifest.json"
     
     if manifest_path.exists():
         try:
@@ -5958,6 +6377,11 @@ async def batch_upload(
         # 上传
         await wait_for_window_slot()
         playlist_name = get_playlist_name(tag)
+        if thumbnails:
+            thumb_preview = ", ".join(str(path) for path in thumbnails[:3])
+            log(f"序号 {serial}: 本次上传缩略图 -> {thumb_preview}", "INFO")
+        else:
+            log(f"序号 {serial}: 本次未提供缩略图", "WARN")
         upload_result = make_upload_result(False, True, "未开始上传", "not_started")
         tail_watcher_started = False
         try:
@@ -5985,12 +6409,13 @@ async def batch_upload(
         finally:
             success = bool(upload_result.get("success"))
             close_browser_now = bool(upload_result.get("close_browser", True))
+            stage = str(upload_result.get("stage") or "").strip()
 
             # 可选：每个频道处理后关闭容器浏览器
             if auto_close_browser:
-                if close_browser_now:
+                if success and close_browser_now:
                     stop_browser(container_code)
-                else:
+                elif not success and stage == "publish_pending_monitor" and not close_browser_now:
                     if upload_result.get("stage") == "publish_pending_monitor":
                         tail_watcher_started = launch_tail_close_watcher(
                             serial=serial,
@@ -6007,12 +6432,15 @@ async def batch_upload(
                             f"序号 {serial}: 监控尚未确认可关闭浏览器，已保留容器现场继续观察",
                             "WARN",
                         )
-            elif not success and close_browser_now:
-                # 失败不计入保留窗口，立刻关闭释放资源
-                stop_browser(container_code)
+                elif not success:
+                    log(
+                        f"序号 {serial}: 上传失败(stage={stage or 'unknown'})，保留浏览器窗口供人工检查",
+                        "WARN",
+                    )
 
         success = bool(upload_result.get("success"))
         close_browser_now = bool(upload_result.get("close_browser", True))
+        stage = str(upload_result.get("stage") or "").strip()
 
         if success:
             success_count += 1
@@ -6067,16 +6495,14 @@ async def batch_upload(
         )
         
         if not success:
-            if close_browser_now:
-                log(f"序号 {serial} 上传失败，跳过继续下一个", "ERR")
-            elif tail_watcher_started:
+            if tail_watcher_started:
                 log(
                     f"序号 {serial} 已点击 Publish，主监控超时；尾程 watcher 已接手后续自动关窗",
                     "WARN",
                 )
             else:
                 log(
-                    f"序号 {serial} 已点击 Publish 但监控未确认安全关闭，浏览器已保留待人工接管",
+                    f"序号 {serial} 上传失败(stage={stage or 'unknown'})，浏览器已保留待人工接管",
                     "WARN",
                 )
             failed_serials.append(serial)
@@ -6093,7 +6519,7 @@ async def batch_upload(
     # === 生成 upload_report.json (供 daily_scheduler 清理用) ===
     try:
         video_folder_path = Path(config["video_folder"])
-        report_dir = video_folder_path / f"{date_key}_{tag}"
+        report_dir = tag_output_dir if tag_output_dir and tag_output_dir.exists() else (video_folder_path / f"{date_key}_{tag}")
         if report_dir.exists():
             report_path = report_dir / "upload_report.json"
             report = {
@@ -6332,6 +6758,199 @@ def _run_traditional_mode(args, config, window_plan=None):
     
     print("\n✅ 所有任务完成")
     return 1 if had_failures else 0
+
+async def set_video_category_music(page, max_attempts: int = 6) -> bool:
+    async def _read_state() -> Dict[str, Any]:
+        return await page.evaluate(
+            """
+            () => {
+                const visible = (el) => !!el && (
+                    el.offsetParent !== null ||
+                    el.offsetWidth > 0 ||
+                    el.offsetHeight > 0 ||
+                    el.getClientRects().length > 0
+                );
+                const textOf = (el) => ((el && (el.innerText || el.textContent)) || "").trim();
+                const categoryRe = /category|分類|分类/i;
+                const excludeRe = /recording\\s*date|錄製日期|录制日期/i;
+                const musicRe = /(^|\\s)music(\\s|$)|音樂|音乐/i;
+                const roots = [document];
+                const seen = new Set([document]);
+
+                while (roots.length) {
+                    const root = roots.shift();
+                    const allNodes = root.querySelectorAll ? root.querySelectorAll("*") : [];
+                    for (const node of allNodes) {
+                        if (node && node.shadowRoot && !seen.has(node.shadowRoot)) {
+                            seen.add(node.shadowRoot);
+                            roots.push(node.shadowRoot);
+                        }
+                    }
+                    const fields = Array.from(
+                        root.querySelectorAll ? root.querySelectorAll("ytcp-form-select, tp-yt-paper-dropdown-menu") : []
+                    ).filter(visible);
+                    for (const field of fields) {
+                        const labelText = [
+                            textOf(field.querySelector?.("label")),
+                            textOf(field.querySelector?.("tp-yt-paper-input-label")),
+                            textOf(field.querySelector?.("[slot='label']")),
+                            textOf(field.querySelector?.("yt-formatted-string#label")),
+                        ].join(" ").trim();
+                        if (!categoryRe.test(labelText) || excludeRe.test(labelText)) continue;
+                        const selectedText =
+                            textOf(field.querySelector?.("#label")) ||
+                            textOf(field.querySelector?.("ytcp-dropdown-trigger")) ||
+                            textOf(field.querySelector?.("[aria-haspopup='listbox']")) ||
+                            "";
+                        return {
+                            found: true,
+                            selected: musicRe.test(selectedText.toLowerCase()) || musicRe.test(selectedText),
+                            value: selectedText,
+                        };
+                    }
+                }
+                return { found: false, selected: false, value: "" };
+            }
+            """
+        )
+
+    async def _open_dropdown() -> bool:
+        return bool(
+            await page.evaluate(
+                """
+                () => {
+                    const visible = (el) => !!el && (
+                        el.offsetParent !== null ||
+                        el.offsetWidth > 0 ||
+                        el.offsetHeight > 0 ||
+                        el.getClientRects().length > 0
+                    );
+                    const textOf = (el) => ((el && (el.innerText || el.textContent)) || "").trim();
+                    const categoryRe = /category|分類|分类/i;
+                    const excludeRe = /recording\\s*date|錄製日期|录制日期/i;
+                    const roots = [document];
+                    const seen = new Set([document]);
+                    const clickEl = (el) => {
+                        if (!(el instanceof HTMLElement)) return false;
+                        try { el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" }); } catch (_) {}
+                        try { el.click(); } catch (_) {}
+                        for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+                            try {
+                                el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, composed: true }));
+                            } catch (_) {}
+                        }
+                        return true;
+                    };
+
+                    while (roots.length) {
+                        const root = roots.shift();
+                        const allNodes = root.querySelectorAll ? root.querySelectorAll("*") : [];
+                        for (const node of allNodes) {
+                            if (node && node.shadowRoot && !seen.has(node.shadowRoot)) {
+                                seen.add(node.shadowRoot);
+                                roots.push(node.shadowRoot);
+                            }
+                        }
+                        const fields = Array.from(
+                            root.querySelectorAll ? root.querySelectorAll("ytcp-form-select, tp-yt-paper-dropdown-menu") : []
+                        ).filter(visible);
+                        for (const field of fields) {
+                            const labelText = [
+                                textOf(field.querySelector?.("label")),
+                                textOf(field.querySelector?.("tp-yt-paper-input-label")),
+                                textOf(field.querySelector?.("[slot='label']")),
+                                textOf(field.querySelector?.("yt-formatted-string#label")),
+                            ].join(" ").trim();
+                            if (!categoryRe.test(labelText) || excludeRe.test(labelText)) continue;
+                            const trigger =
+                                field.querySelector?.("ytcp-dropdown-trigger") ||
+                                field.querySelector?.("[aria-haspopup='listbox']") ||
+                                field.querySelector?.("[role='button']") ||
+                                field;
+                            if (clickEl(trigger)) return true;
+                        }
+                    }
+                    return false;
+                }
+                """
+            )
+        )
+
+    async def _pick_music_option() -> bool:
+        selectors = [
+            "tp-yt-paper-item:has-text('Music')",
+            "[role='option']:has-text('Music')",
+            "ytcp-menu-service-item-renderer:has-text('Music')",
+            "tp-yt-paper-item:has-text('音樂')",
+            "[role='option']:has-text('音樂')",
+            "ytcp-menu-service-item-renderer:has-text('音樂')",
+            "tp-yt-paper-item:has-text('音乐')",
+            "[role='option']:has-text('音乐')",
+            "ytcp-menu-service-item-renderer:has-text('音乐')",
+        ]
+        for selector in selectors:
+            try:
+                locator = page.locator(selector).last
+                if await locator.count() == 0 or not await locator.is_visible():
+                    continue
+                if await human_click(page, locator, f"Category option ({selector})"):
+                    return True
+                await locator.click(force=True, timeout=3000)
+                return True
+            except Exception:
+                continue
+        return False
+
+    for attempt in range(1, max_attempts + 1):
+        await clear_blocking_overlays(page, f"category-final-{attempt}")
+        try:
+            await page.mouse.wheel(0, 550)
+        except Exception:
+            pass
+        state = await _read_state()
+        log(
+            f"Category final check#{attempt}: found={state.get('found')} selected={state.get('selected')} value={state.get('value', '')}",
+            "INFO",
+        )
+        if state.get("selected"):
+            log(f"Category confirmed as Music ({state.get('value', '')})", "OK")
+            return True
+        opened = await _open_dropdown()
+        log(f"Category final open#{attempt}: opened={opened}", "INFO")
+        if not opened:
+            await asyncio.sleep(0.8)
+            continue
+        await asyncio.sleep(1.0)
+        picked = await _pick_music_option()
+        log(f"Category final pick#{attempt}: picked={picked}", "INFO")
+        if not picked:
+            try:
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass
+            await asyncio.sleep(0.8)
+            continue
+        await asyncio.sleep(1.0)
+        verify = await _read_state()
+        log(
+            f"Category final verify#{attempt}: found={verify.get('found')} selected={verify.get('selected')} value={verify.get('value', '')}",
+            "INFO",
+        )
+        if verify.get("selected"):
+            log(f"Category set to Music ({verify.get('value', '')})", "OK")
+            return True
+    log("Category still failed to become Music", "WARN")
+    return False
+
+
+async def set_video_category(page, category: str) -> bool:
+    target = str(category or "").strip()
+    if not target:
+        return True
+    if target.lower() == "music":
+        return await set_video_category_music(page)
+    return False
+
 
 def main():
     args = parse_arguments()

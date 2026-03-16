@@ -10,7 +10,6 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +18,16 @@ from PIL import Image, ImageGrab
 from tkinter import filedialog, messagebox, ttk
 
 from content_generation import analyze_audience_screenshot, call_image_model, call_text_model
+from effects_library import (
+    list_effects,
+    list_font_names,
+    list_palette_names,
+    list_particle_effects,
+    list_text_positions,
+    list_text_styles,
+    list_tint_names,
+    list_zoom_modes,
+)
 from prompt_studio import (
     load_generation_map,
     load_prompt_studio_config,
@@ -42,13 +51,17 @@ from workflow_core import (
     describe_group_bindings,
     ensure_prompt_presets,
     execute_direct_media_workflow,
+    execute_metadata_only_workflow,
     get_group_bindings,
     get_group_catalog,
+    get_metadata_root,
     load_prompt_settings,
     load_scheduler_settings,
+    refresh_existing_output_metadata,
     save_scheduler_settings,
     save_window_plan,
     set_group_binding,
+    validate_existing_output_dirs,
     validate_group_sources,
 )
 
@@ -62,6 +75,11 @@ TASK_MODE_VALUES = {
     "本日剪辑并上传": "render_and_upload",
 }
 TASK_MODE_LABELS = {value: label for label, value in TASK_MODE_VALUES.items()}
+MODULE_LABELS = {
+    "metadata": "生成标题/简介/标签/缩略图",
+    "render": "剪辑",
+    "upload": "上传",
+}
 YES_NO_VALUES = ["yes", "no"]
 VISIBILITY_VALUES = ["public", "private", "unlisted", "schedule"]
 CATEGORY_VALUES = [
@@ -84,6 +102,7 @@ METADATA_MODE_LABELS = {
 METADATA_MODE_VALUES = list(METADATA_MODE_LABELS.keys())
 SCHEDULE_TIMEZONE_VALUES = ["Asia/Taipei (+08:00)"]
 WINDOW_BUTTONS_PER_ROW = 6
+VISUAL_TOGGLE_VALUES = ["yes", "no"]
 
 
 ctk.set_appearance_mode("dark")
@@ -184,7 +203,12 @@ class DashboardApp(ctk.CTk):
         self.upload_monitor_thread: threading.Thread | None = None
         self._audience_data_url: str = ""
         self._state = self._load_state()
-        self.window_tasks: list[WindowTask] = self._load_tasks_from_state(self._state.get("window_tasks") or [])
+        self.window_tasks: list[WindowTask] = []
+        if self._state.pop("window_tasks", None) is not None:
+            try:
+                STATE_FILE.write_text(json.dumps(self._state, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception:
+                pass
         self.scheduler_config = load_scheduler_settings()
         self.prompt_config = load_prompt_settings()
         self.group_catalog = get_group_catalog()
@@ -209,10 +233,50 @@ class DashboardApp(ctk.CTk):
         state = self._state
         add_schedule_date, add_schedule_time = _split_schedule_text(state.get("add_schedule", ""))
         default_schedule_date, default_schedule_time = _split_schedule_text(state.get("schedule_start", ""))
-        self.task_mode_var = ctk.StringVar(value=state.get("task_mode", "render_only"))
+        legacy_mode = state.get("task_mode", "render_only")
+        self.task_mode_var = ctk.StringVar(value=legacy_mode)
+        self.run_metadata_var = ctk.BooleanVar(
+            value=bool(
+                state.get(
+                    "run_metadata",
+                    bool(state.get("generate_text", True) or state.get("generate_thumbnails", True)),
+                )
+            )
+        )
+        self.run_render_var = ctk.BooleanVar(
+            value=bool(state.get("run_render", legacy_mode in {"render_only", "render_and_upload"}))
+        )
+        self.run_upload_var = ctk.BooleanVar(
+            value=bool(state.get("run_upload", legacy_mode in {"upload_only", "render_and_upload"}))
+        )
         self.date_var = ctk.StringVar(value=state.get("date_mmdd", _today_mmdd()))
         self.simulate_seconds_var = ctk.StringVar(value=str(state.get("simulate_seconds", 90)))
         self.randomize_effects_var = ctk.BooleanVar(value=bool(state.get("randomize_effects", True)))
+        visual_cfg = dict(self.scheduler_config.get("visual_settings") or {})
+        self.visual_spectrum_var = ctk.StringVar(value=str(state.get("visual_spectrum", visual_cfg.get("spectrum", "yes"))))
+        self.visual_timeline_var = ctk.StringVar(value=str(state.get("visual_timeline", visual_cfg.get("timeline", "yes"))))
+        self.visual_letterbox_var = ctk.StringVar(value=str(state.get("visual_letterbox", visual_cfg.get("letterbox", "no"))))
+        self.visual_zoom_var = ctk.StringVar(value=str(state.get("visual_zoom", visual_cfg.get("zoom", "normal"))))
+        self.visual_style_var = ctk.StringVar(value=str(state.get("visual_style", visual_cfg.get("style", "bar"))))
+        self.visual_color_spectrum_var = ctk.StringVar(value=str(state.get("visual_color_spectrum", visual_cfg.get("color_spectrum", "WhiteGold"))))
+        self.visual_color_timeline_var = ctk.StringVar(value=str(state.get("visual_color_timeline", visual_cfg.get("color_timeline", "WhiteGold"))))
+        self.visual_spectrum_y_var = ctk.StringVar(value=str(state.get("visual_spectrum_y", visual_cfg.get("spectrum_y", 530))))
+        self.visual_spectrum_x_var = ctk.StringVar(value=str(state.get("visual_spectrum_x", visual_cfg.get("spectrum_x", -1))))
+        self.visual_spectrum_w_var = ctk.StringVar(value=str(state.get("visual_spectrum_w", visual_cfg.get("spectrum_w", 1200))))
+        self.visual_film_grain_var = ctk.StringVar(value=str(state.get("visual_film_grain", visual_cfg.get("film_grain", "no"))))
+        self.visual_grain_strength_var = ctk.StringVar(value=str(state.get("visual_grain_strength", visual_cfg.get("grain_strength", 15))))
+        self.visual_vignette_var = ctk.StringVar(value=str(state.get("visual_vignette", visual_cfg.get("vignette", "no"))))
+        self.visual_tint_var = ctk.StringVar(value=str(state.get("visual_tint", visual_cfg.get("color_tint", "none"))))
+        self.visual_soft_focus_var = ctk.StringVar(value=str(state.get("visual_soft_focus", visual_cfg.get("soft_focus", "no"))))
+        self.visual_soft_focus_sigma_var = ctk.StringVar(value=str(state.get("visual_soft_focus_sigma", visual_cfg.get("soft_focus_sigma", 1.5))))
+        self.visual_particle_var = ctk.StringVar(value=str(state.get("visual_particle", visual_cfg.get("particle", "none"))))
+        self.visual_particle_opacity_var = ctk.StringVar(value=str(state.get("visual_particle_opacity", visual_cfg.get("particle_opacity", 0.6))))
+        self.visual_particle_speed_var = ctk.StringVar(value=str(state.get("visual_particle_speed", visual_cfg.get("particle_speed", 1.0))))
+        self.visual_text_var = ctk.StringVar(value=str(state.get("visual_text", visual_cfg.get("text", ""))))
+        self.visual_text_font_var = ctk.StringVar(value=str(state.get("visual_text_font", visual_cfg.get("text_font", "default"))))
+        self.visual_text_pos_var = ctk.StringVar(value=str(state.get("visual_text_pos", visual_cfg.get("text_pos", "center"))))
+        self.visual_text_size_var = ctk.StringVar(value=str(state.get("visual_text_size", visual_cfg.get("text_size", 60))))
+        self.visual_text_style_var = ctk.StringVar(value=str(state.get("visual_text_style", visual_cfg.get("text_style", "Classic"))))
         self.generate_text_var = ctk.BooleanVar(value=bool(state.get("generate_text", True)))
         self.generate_thumbnails_var = ctk.BooleanVar(value=bool(state.get("generate_thumbnails", True)))
         self.sync_daily_content_var = ctk.BooleanVar(value=bool(state.get("sync_daily_content", True)))
@@ -265,6 +329,7 @@ class DashboardApp(ctk.CTk):
 
         self.music_dir_var = ctk.StringVar(value=str(self.scheduler_config.get("music_dir", "")))
         self.base_image_dir_var = ctk.StringVar(value=str(self.scheduler_config.get("base_image_dir", "")))
+        self.metadata_root_var = ctk.StringVar(value=str(get_metadata_root(self.scheduler_config)))
         self.output_root_var = ctk.StringVar(value=str(self.scheduler_config.get("output_root", "")))
         self.ffmpeg_var = ctk.StringVar(value=str(self.scheduler_config.get("ffmpeg_bin", "ffmpeg")))
         self.used_media_root_var = ctk.StringVar(value=str(self.scheduler_config.get("used_media_root", "")))
@@ -389,9 +454,11 @@ class DashboardApp(ctk.CTk):
         self.tabview.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 18))
         for name in ("快捷开始", "上传", "提示词", "当日内容", "路径配置", "日志"):
             self.tabview.add(name)
+        self.tabview.add("高级视觉")
 
         self._build_start_tab()
         self._build_upload_tab()
+        self._build_visual_tab()
         self._build_prompt_tab()
         self._build_daily_tab()
         self._build_paths_tab()
@@ -402,6 +469,9 @@ class DashboardApp(ctk.CTk):
         self.binding_group_var.trace_add("write", lambda *_: self.binding_folder_var.set(get_group_bindings(self.scheduler_config).get(self.binding_group_var.get(), "")))
         self.daily_group_var.trace_add("write", lambda *_: self._refresh_daily_serials())
         self.prompt_group_var.trace_add("write", lambda *_: self._load_prompt_for_group())
+        self.run_metadata_var.trace_add("write", lambda *_: self._preview_plan())
+        self.run_render_var.trace_add("write", lambda *_: self._preview_plan())
+        self.run_upload_var.trace_add("write", lambda *_: self._preview_plan())
         self.add_visibility_var.trace_add("write", self._on_add_visibility_change)
         self.default_visibility_var.trace_add("write", self._on_default_visibility_change)
         self.add_schedule_enabled_var.trace_add("write", self._on_add_schedule_toggle)
@@ -507,7 +577,7 @@ class DashboardApp(ctk.CTk):
         ctk.CTkSwitch(group_frame, text="生成标题/简介/标签", variable=self.generate_text_var).grid(
             row=2, column=2, sticky="w", padx=(0, 12), pady=(0, 10)
         )
-        ctk.CTkSwitch(group_frame, text="处理缩略图", variable=self.generate_thumbnails_var).grid(
+        ctk.CTkSwitch(group_frame, text="重生成缩略图", variable=self.generate_thumbnails_var).grid(
             row=2, column=3, sticky="w", padx=(0, 12), pady=(0, 10)
         )
         ctk.CTkSwitch(group_frame, text="同步到当日内容", variable=self.sync_daily_content_var).grid(
@@ -662,6 +732,96 @@ class DashboardApp(ctk.CTk):
             self.task_tree.heading(key, text=key)
             self.task_tree.column(key, width=width, stretch=key in {"tag", "source", "schedule"})
         self.task_tree.grid(row=1, column=0, sticky="ew", padx=8, pady=(4, 8))
+
+    def _build_visual_tab(self) -> None:
+        base_tab = self.tabview.tab("高级视觉")
+        base_tab.grid_columnconfigure(0, weight=1)
+        base_tab.grid_rowconfigure(0, weight=1)
+        tab = ctk.CTkScrollableFrame(base_tab)
+        tab.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+        tab.grid_columnconfigure(0, weight=1)
+
+        intro = ctk.CTkFrame(tab)
+        intro.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
+        intro.grid_columnconfigure(0, weight=1)
+        intro.grid_columnconfigure(1, weight=0)
+        ctk.CTkLabel(intro, text="高级视觉控制", font=ctk.CTkFont(size=24, weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=16, pady=(14, 8)
+        )
+        ctk.CTkButton(intro, text="保存视觉设置", command=self._save_visual_settings).grid(
+            row=0, column=1, sticky="e", padx=16, pady=(14, 8)
+        )
+        ctk.CTkLabel(
+            intro,
+            text="关闭随机视觉特效后，下面这些手动参数才会生效。这里改的是渲染特效，不影响上传规则。",
+            text_color="#b8c1cc",
+            justify="left",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 14))
+
+        basic = ctk.CTkFrame(tab)
+        basic.grid(row=1, column=0, sticky="ew", padx=8, pady=8)
+        for column in range(4):
+            basic.grid_columnconfigure(column, weight=1)
+        ctk.CTkLabel(basic, text="基础效果", font=ctk.CTkFont(size=22, weight="bold")).grid(
+            row=0, column=0, columnspan=4, sticky="w", padx=16, pady=(14, 12)
+        )
+        self._entry_row(basic, 1, "频谱", self.visual_spectrum_var, values=VISUAL_TOGGLE_VALUES)
+        self._entry_row(basic, 2, "时间轴", self.visual_timeline_var, values=VISUAL_TOGGLE_VALUES)
+        self._entry_row(basic, 3, "黑边", self.visual_letterbox_var, values=VISUAL_TOGGLE_VALUES)
+        self._entry_row(basic, 4, "镜头缩放", self.visual_zoom_var, values=list_zoom_modes())
+        self._entry_row(basic, 5, "频谱样式", self.visual_style_var, values=list_effects())
+        self._entry_row(basic, 6, "频谱 Y", self.visual_spectrum_y_var)
+        self._entry_row(basic, 7, "频谱 X (-1=居中)", self.visual_spectrum_x_var)
+        self._entry_row(basic, 8, "频谱宽度", self.visual_spectrum_w_var)
+
+        mood = ctk.CTkFrame(tab)
+        mood.grid(row=2, column=0, sticky="ew", padx=8, pady=8)
+        for column in range(4):
+            mood.grid_columnconfigure(column, weight=1)
+        ctk.CTkLabel(mood, text="色彩与氛围", font=ctk.CTkFont(size=22, weight="bold")).grid(
+            row=0, column=0, columnspan=4, sticky="w", padx=16, pady=(14, 12)
+        )
+        self._entry_row(mood, 1, "频谱配色", self.visual_color_spectrum_var, values=list_palette_names())
+        self._entry_row(mood, 2, "时间轴配色", self.visual_color_timeline_var, values=list_palette_names())
+        self._entry_row(mood, 3, "胶片颗粒", self.visual_film_grain_var, values=VISUAL_TOGGLE_VALUES)
+        self._entry_row(mood, 4, "颗粒强度", self.visual_grain_strength_var)
+        self._entry_row(mood, 5, "暗角", self.visual_vignette_var, values=VISUAL_TOGGLE_VALUES)
+        self._entry_row(mood, 6, "色调", self.visual_tint_var, values=list_tint_names())
+        self._entry_row(mood, 7, "柔焦", self.visual_soft_focus_var, values=VISUAL_TOGGLE_VALUES)
+        self._entry_row(mood, 8, "柔焦强度", self.visual_soft_focus_sigma_var)
+
+        overlay = ctk.CTkFrame(tab)
+        overlay.grid(row=3, column=0, sticky="ew", padx=8, pady=8)
+        for column in range(4):
+            overlay.grid_columnconfigure(column, weight=1)
+        ctk.CTkLabel(overlay, text="贴纸 / 粒子 / 叠字", font=ctk.CTkFont(size=22, weight="bold")).grid(
+            row=0, column=0, columnspan=4, sticky="w", padx=16, pady=(14, 12)
+        )
+        self._entry_row(overlay, 1, "贴纸 / 粒子", self.visual_particle_var, values=list_particle_effects())
+        self._entry_row(overlay, 2, "贴纸透明度", self.visual_particle_opacity_var)
+        self._entry_row(overlay, 3, "贴纸速度", self.visual_particle_speed_var)
+        self._entry_row(overlay, 4, "叠字内容", self.visual_text_var)
+        self._entry_row(overlay, 5, "字体", self.visual_text_font_var, values=list_font_names())
+        self._entry_row(overlay, 6, "文字位置", self.visual_text_pos_var, values=list_text_positions())
+        self._entry_row(overlay, 7, "文字大小", self.visual_text_size_var)
+        self._entry_row(overlay, 8, "文字样式", self.visual_text_style_var, values=list_text_styles())
+
+        help_frame = ctk.CTkFrame(tab)
+        help_frame.grid(row=4, column=0, sticky="ew", padx=8, pady=(8, 16))
+        help_frame.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(help_frame, text="如何添加更多贴纸 / 特效", font=ctk.CTkFont(size=22, weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=16, pady=(14, 8)
+        )
+        ctk.CTkLabel(
+            help_frame,
+            text=(
+                "1. 把新的 mp4 / mov / webm / mkv 叠层素材直接放进 overlays 文件夹。\n"
+                "2. 重开控制台后，新文件名会自动出现在“贴纸 / 粒子”下拉里。\n"
+                "3. 如果要新增真正的新滤镜，再扩 effects_library.py 里的 get_effect。"
+            ),
+            text_color="#b8c1cc",
+            justify="left",
+        ).grid(row=1, column=0, sticky="w", padx=16, pady=(0, 14))
 
     def _build_prompt_tab(self) -> None:
         base_tab = self.tabview.tab("提示词")
@@ -904,6 +1064,41 @@ class DashboardApp(ctk.CTk):
             widget = ctk.CTkEntry(parent, textvariable=variable, show=show or "")
         widget.grid(row=row, column=1, columnspan=3, sticky="ew", padx=16, pady=(0, 12))
 
+    def _collect_visual_settings(self) -> dict[str, Any]:
+        return {
+            "spectrum": _bool_from_yes_no(self.visual_spectrum_var.get()),
+            "timeline": _bool_from_yes_no(self.visual_timeline_var.get()),
+            "letterbox": _bool_from_yes_no(self.visual_letterbox_var.get()),
+            "zoom": self.visual_zoom_var.get().strip() or "normal",
+            "style": self.visual_style_var.get().strip() or "bar",
+            "color_spectrum": self.visual_color_spectrum_var.get().strip() or "WhiteGold",
+            "color_timeline": self.visual_color_timeline_var.get().strip() or "WhiteGold",
+            "spectrum_y": self.visual_spectrum_y_var.get().strip() or "530",
+            "spectrum_x": self.visual_spectrum_x_var.get().strip() or "-1",
+            "spectrum_w": self.visual_spectrum_w_var.get().strip() or "1200",
+            "film_grain": _bool_from_yes_no(self.visual_film_grain_var.get()),
+            "grain_strength": self.visual_grain_strength_var.get().strip() or "15",
+            "vignette": _bool_from_yes_no(self.visual_vignette_var.get()),
+            "color_tint": self.visual_tint_var.get().strip() or "none",
+            "soft_focus": _bool_from_yes_no(self.visual_soft_focus_var.get()),
+            "soft_focus_sigma": self.visual_soft_focus_sigma_var.get().strip() or "1.5",
+            "particle": self.visual_particle_var.get().strip() or "none",
+            "particle_opacity": self.visual_particle_opacity_var.get().strip() or "0.6",
+            "particle_speed": self.visual_particle_speed_var.get().strip() or "1.0",
+            "text": self.visual_text_var.get(),
+            "text_font": self.visual_text_font_var.get().strip() or "default",
+            "text_pos": self.visual_text_pos_var.get().strip() or "center",
+            "text_size": self.visual_text_size_var.get().strip() or "60",
+            "text_style": self.visual_text_style_var.get().strip() or "Classic",
+        }
+
+    def _save_visual_settings(self) -> None:
+        config = load_scheduler_settings(SCHEDULER_CONFIG_FILE)
+        config["visual_settings"] = self._collect_visual_settings()
+        self.scheduler_config = save_scheduler_settings(config, SCHEDULER_CONFIG_FILE)
+        self._save_state()
+        self._log("[Visual] Saved advanced visual settings")
+
     def _load_state(self) -> dict[str, Any]:
         if STATE_FILE.exists():
             try:
@@ -912,21 +1107,39 @@ class DashboardApp(ctk.CTk):
                 return {}
         return {}
 
-    def _load_tasks_from_state(self, rows: list[dict[str, Any]]) -> list[WindowTask]:
-        tasks: list[WindowTask] = []
-        for row in rows:
-            try:
-                tasks.append(WindowTask(**row))
-            except Exception:
-                continue
-        return tasks
-
     def _save_state(self) -> None:
         state = {
             "task_mode": self.task_mode_var.get(),
+            "run_metadata": bool(self.run_metadata_var.get()),
+            "run_render": bool(self.run_render_var.get()),
+            "run_upload": bool(self.run_upload_var.get()),
             "date_mmdd": self.date_var.get(),
             "simulate_seconds": self.simulate_seconds_var.get(),
             "randomize_effects": bool(self.randomize_effects_var.get()),
+            "visual_spectrum": self.visual_spectrum_var.get(),
+            "visual_timeline": self.visual_timeline_var.get(),
+            "visual_letterbox": self.visual_letterbox_var.get(),
+            "visual_zoom": self.visual_zoom_var.get(),
+            "visual_style": self.visual_style_var.get(),
+            "visual_color_spectrum": self.visual_color_spectrum_var.get(),
+            "visual_color_timeline": self.visual_color_timeline_var.get(),
+            "visual_spectrum_y": self.visual_spectrum_y_var.get(),
+            "visual_spectrum_x": self.visual_spectrum_x_var.get(),
+            "visual_spectrum_w": self.visual_spectrum_w_var.get(),
+            "visual_film_grain": self.visual_film_grain_var.get(),
+            "visual_grain_strength": self.visual_grain_strength_var.get(),
+            "visual_vignette": self.visual_vignette_var.get(),
+            "visual_tint": self.visual_tint_var.get(),
+            "visual_soft_focus": self.visual_soft_focus_var.get(),
+            "visual_soft_focus_sigma": self.visual_soft_focus_sigma_var.get(),
+            "visual_particle": self.visual_particle_var.get(),
+            "visual_particle_opacity": self.visual_particle_opacity_var.get(),
+            "visual_particle_speed": self.visual_particle_speed_var.get(),
+            "visual_text": self.visual_text_var.get(),
+            "visual_text_font": self.visual_text_font_var.get(),
+            "visual_text_pos": self.visual_text_pos_var.get(),
+            "visual_text_size": self.visual_text_size_var.get(),
+            "visual_text_style": self.visual_text_style_var.get(),
             "generate_text": bool(self.generate_text_var.get()),
             "generate_thumbnails": bool(self.generate_thumbnails_var.get()),
             "sync_daily_content": bool(self.sync_daily_content_var.get()),
@@ -960,7 +1173,6 @@ class DashboardApp(ctk.CTk):
             "daily_date": self.daily_date_var.get(),
             "daily_serial": self.daily_serial_var.get(),
             "daily_is_ypp": self.daily_is_ypp_var.get(),
-            "window_tasks": [asdict(task) for task in self.window_tasks],
         }
         STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -1353,6 +1565,7 @@ class DashboardApp(ctk.CTk):
                 "music_dir": self.music_dir_var.get().strip(),
                 "base_image_dir": self.base_image_dir_var.get().strip(),
                 "output_root": self.output_root_var.get().strip(),
+                "metadata_root": self.metadata_root_var.get().strip(),
                 "ffmpeg_bin": self.ffmpeg_var.get().strip() or "ffmpeg",
                 "ffmpeg_path": self.ffmpeg_var.get().strip() or "ffmpeg",
                 "used_media_root": self.used_media_root_var.get().strip(),
@@ -1406,6 +1619,43 @@ class DashboardApp(ctk.CTk):
             "masterPrompt": self.master_prompt_box.get("1.0", "end").strip(),
             "titleLibrary": self.title_library_box.get("1.0", "end").strip(),
         }
+
+    def _persist_prompt_form_for_active_tasks(self) -> None:
+        if METADATA_MODE_LABELS.get(self.metadata_mode_var.get(), "prompt_api") != "prompt_api":
+            return
+
+        task_tags = sorted({task.tag.strip() for task in self.window_tasks if task.tag.strip()})
+        if not task_tags:
+            return
+
+        if len(task_tags) == 1:
+            target_tag = task_tags[0]
+        else:
+            target_tag = self.prompt_group_var.get().strip()
+            if not target_tag or target_tag not in task_tags:
+                self._log("[提示词] 本次包含多个分组，当前表单不会自动覆盖全部分组；将使用各分组已保存绑定")
+                return
+
+        api_name = self.api_save_name_var.get().strip() or self.api_preset_var.get().strip() or "默认API模板"
+        content_name = (
+            self.content_save_name_var.get().strip()
+            or self.content_template_var.get().strip()
+            or "默认内容模板"
+        )
+        ensure_prompt_presets(
+            api_name=api_name,
+            api_payload=self._current_api_form(),
+            content_name=content_name,
+            content_payload=self._current_content_form(),
+            tag=target_tag,
+            path=PROMPT_STUDIO_FILE,
+        )
+        self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
+        self._refresh_prompt_dropdowns()
+        self.prompt_group_var.set(target_tag)
+        self.api_preset_var.set(api_name)
+        self.content_template_var.set(content_name)
+        self._log(f"[提示词] 运行前已同步当前表单 -> {target_tag} | API={api_name} | 内容模板={content_name}")
 
     def _load_prompt_for_group(self) -> None:
         self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
@@ -1663,6 +1913,22 @@ class DashboardApp(ctk.CTk):
             "",
             *plan.get("preview_lines", []),
         ]
+        if self.task_mode_var.get() == "upload_only":
+            errors, warnings, resolved_dirs = validate_existing_output_dirs(
+                self.window_tasks,
+                date_mmdd=defaults.date_mmdd,
+                config=load_scheduler_settings(),
+                log=lambda *_args, **_kwargs: None,
+            )
+            lines.append("")
+            if resolved_dirs:
+                lines.append("现成成品目录:")
+                for tag, folder in resolved_dirs.items():
+                    lines.append(f"  - {tag}: {folder}")
+            if warnings:
+                lines.extend(f"警告: {item}" for item in warnings)
+            if errors:
+                lines.extend(f"错误: {item}" for item in errors)
         self.start_preview.insert("1.0", "\n".join(lines))
         self._save_state()
 
@@ -1670,8 +1936,23 @@ class DashboardApp(ctk.CTk):
         if not self.window_tasks:
             messagebox.showerror("无法检查", "请先去上传页加入窗口任务")
             return
-        errors, warnings = validate_group_sources(self.window_tasks, config=load_scheduler_settings(), log=self._log)
+        if self.task_mode_var.get() == "upload_only":
+            errors, warnings, resolved_dirs = validate_existing_output_dirs(
+                self.window_tasks,
+                date_mmdd=normalize_mmdd(self.date_var.get().strip() or _today_mmdd()),
+                config=load_scheduler_settings(),
+                log=self._log,
+            )
+        else:
+            errors, warnings = validate_group_sources(
+                self.window_tasks,
+                config=load_scheduler_settings(),
+                log=self._log,
+            )
+            resolved_dirs = {}
         text = []
+        if resolved_dirs:
+            text.extend(f"可直接上传: {tag} -> {folder}" for tag, folder in resolved_dirs.items())
         if warnings:
             text.extend(f"警告: {item}" for item in warnings)
         if errors:
@@ -1697,6 +1978,7 @@ class DashboardApp(ctk.CTk):
 
         def job() -> None:
             defaults = self._collect_defaults()
+            self._persist_prompt_form_for_active_tasks()
             seconds = int(self.simulate_seconds_var.get().strip() or "90")
             result = execute_direct_media_workflow(
                 tasks=self.window_tasks,
@@ -1709,8 +1991,30 @@ class DashboardApp(ctk.CTk):
 
         self._run_background(job, task_name="模拟渲染", total_items=len(self.window_tasks), include_upload=False)
 
-    def _run_upload_command(self, defaults: WorkflowDefaults, *, detach: bool = False) -> bool:
+    def _collect_output_dirs_from_result(self, result) -> dict[str, str]:
+        prepared: dict[str, str] = {}
+        if not result:
+            return prepared
+        for item in getattr(result, "items", []) or []:
+            output_video = str(getattr(item, "output_video", "") or "").strip()
+            tag = str(getattr(item, "tag", "") or "").strip()
+            if not output_video or not tag:
+                continue
+            folder = Path(output_video).parent
+            if folder.exists():
+                prepared.setdefault(tag, str(folder))
+        return prepared
+
+    def _run_upload_command(
+        self,
+        defaults: WorkflowDefaults,
+        *,
+        detach: bool = False,
+        prepared_output_dirs: dict[str, str] | None = None,
+    ) -> bool:
         plan = build_window_plan(self.window_tasks, defaults)
+        if prepared_output_dirs:
+            plan["tag_output_dirs"] = dict(prepared_output_dirs)
         plan_path = save_window_plan(plan, defaults.date_mmdd)
         tags, skip_channels = derive_tags_and_skip_channels(plan, lambda tag: get_tag_info(tag) or {})
         retain_days = str(self.cleanup_days_var.get().strip() or "5")
@@ -1790,27 +2094,51 @@ class DashboardApp(ctk.CTk):
 
         def job() -> bool:
             defaults = self._collect_defaults()
+            self._persist_prompt_form_for_active_tasks()
             mode = self.task_mode_var.get()
             if mode == "upload_only":
-                self._log("[开始] 只上传模式：先按当前素材准备新视频与新文案，再执行上传")
-                execute_direct_media_workflow(
+                errors, warnings, prepared_output_dirs = validate_existing_output_dirs(
                     tasks=self.window_tasks,
-                    defaults=defaults,
-                    simulation=SimulationOptions(simulate_seconds=0, consume_sources=True, save_manifest=True),
+                    date_mmdd=defaults.date_mmdd,
+                    config=load_scheduler_settings(),
                     log=self._log,
                 )
-                self._log("[开始] 素材准备完成，上传转入后台继续")
-                return self._run_upload_command(defaults, detach=True)
+                for warning in warnings:
+                    self._log(f"[上传] {warning}")
+                if errors:
+                    raise ValueError("\n".join(errors))
+                self._log("[上传] 只上传模式：按当前提示词重写现成成品的标题/简介/标签/缩略图")
+                refresh_existing_output_metadata(
+                    tasks=self.window_tasks,
+                    defaults=defaults,
+                    prepared_output_dirs=prepared_output_dirs,
+                    config=load_scheduler_settings(),
+                    log=self._log,
+                )
+                self._log("[开始] 只上传模式：检测到现成成品，直接上传")
+                return self._run_upload_command(
+                    defaults,
+                    detach=True,
+                    prepared_output_dirs=prepared_output_dirs,
+                )
             self._log("[开始] 先执行渲染")
-            execute_direct_media_workflow(
+            render_result = execute_direct_media_workflow(
                 tasks=self.window_tasks,
                 defaults=defaults,
                 simulation=SimulationOptions(simulate_seconds=0, consume_sources=True, save_manifest=True),
                 log=self._log,
             )
             if mode == "render_and_upload":
+                prepared_output_dirs = self._collect_output_dirs_from_result(render_result)
+                if not prepared_output_dirs:
+                    _errors, _warnings, prepared_output_dirs = validate_existing_output_dirs(
+                        tasks=self.window_tasks,
+                        date_mmdd=defaults.date_mmdd,
+                        config=load_scheduler_settings(),
+                        log=self._log,
+                    )
                 self._log("[开始] 渲染完成，继续上传")
-                return self._run_upload_command(defaults, detach=True)
+                return self._run_upload_command(defaults, detach=True, prepared_output_dirs=prepared_output_dirs)
             return False
 
         mode_label = TASK_MODE_LABELS.get(self.task_mode_var.get(), self.task_mode_var.get())
@@ -1846,6 +2174,473 @@ class DashboardApp(ctk.CTk):
 
         self.worker_thread = threading.Thread(target=runner, daemon=True)
         self.worker_thread.start()
+
+    def _selected_modules(self) -> dict[str, bool]:
+        return {
+            "metadata": bool(self.run_metadata_var.get()),
+            "render": bool(self.run_render_var.get()),
+            "upload": bool(self.run_upload_var.get()),
+        }
+
+    def _selected_module_labels(self) -> list[str]:
+        selected = self._selected_modules()
+        return [label for key, label in MODULE_LABELS.items() if selected.get(key)]
+
+    def _build_start_tab(self) -> None:
+        tab = self.tabview.tab("快捷开始")
+        tab.grid_columnconfigure(0, weight=1)
+
+        task_frame = ctk.CTkFrame(tab)
+        task_frame.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
+        for column in range(6):
+            task_frame.grid_columnconfigure(column, weight=1)
+        ctk.CTkLabel(task_frame, text="本次任务", font=ctk.CTkFont(size=24, weight="bold")).grid(
+            row=0, column=0, columnspan=6, sticky="w", padx=16, pady=(14, 8)
+        )
+        ctk.CTkLabel(
+            task_frame,
+            text="勾选今天要执行的模块。只勾一个就单独跑那一个，勾多个就按顺序连续执行。",
+            text_color="#b8c1cc",
+        ).grid(row=1, column=0, columnspan=6, sticky="w", padx=16, pady=(0, 10))
+        ctk.CTkCheckBox(task_frame, text="生成标题/简介/标签/缩略图", variable=self.run_metadata_var).grid(
+            row=2, column=0, columnspan=2, sticky="w", padx=(16, 8), pady=(0, 10)
+        )
+        ctk.CTkCheckBox(task_frame, text="剪辑", variable=self.run_render_var).grid(
+            row=2, column=2, columnspan=2, sticky="w", padx=8, pady=(0, 10)
+        )
+        ctk.CTkCheckBox(task_frame, text="上传", variable=self.run_upload_var).grid(
+            row=2, column=4, columnspan=2, sticky="w", padx=8, pady=(0, 10)
+        )
+        ctk.CTkLabel(task_frame, text="日期").grid(row=3, column=0, sticky="w", padx=(16, 8), pady=(0, 8))
+        ctk.CTkEntry(task_frame, textvariable=self.date_var, width=140).grid(
+            row=3, column=1, sticky="w", padx=(0, 12), pady=(0, 8)
+        )
+        ctk.CTkLabel(task_frame, text="模拟时长(秒)").grid(row=3, column=2, sticky="w", padx=(0, 8), pady=(0, 8))
+        ctk.CTkEntry(task_frame, textvariable=self.simulate_seconds_var, width=120).grid(
+            row=3, column=3, sticky="w", padx=(0, 12), pady=(0, 8)
+        )
+        ctk.CTkSwitch(task_frame, text="随机视觉特效", variable=self.randomize_effects_var).grid(
+            row=3, column=4, columnspan=2, sticky="w", padx=8, pady=(0, 8)
+        )
+        ctk.CTkButton(
+            task_frame,
+            text="打开高级视觉",
+            command=lambda: self.tabview.set("高级视觉"),
+            width=140,
+        ).grid(row=4, column=4, columnspan=2, sticky="w", padx=8, pady=(0, 8))
+
+        option_frame = ctk.CTkFrame(tab)
+        option_frame.grid(row=1, column=0, sticky="ew", padx=16, pady=8)
+        option_frame.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            option_frame,
+            text="文案模块只写标题/简介/标签/缩略图到文案输出目录。剪辑模块只生成成品视频。上传模块直接读取上面配置好的目录，如果缺文件会直接报错。",
+            text_color="#b8c1cc",
+            justify="left",
+        ).grid(row=0, column=0, sticky="w", padx=16, pady=16)
+
+        action_frame = ctk.CTkFrame(tab)
+        action_frame.grid(row=2, column=0, sticky="ew", padx=16, pady=8)
+        for column in range(5):
+            action_frame.grid_columnconfigure(column, weight=1)
+        ctk.CTkButton(action_frame, text="预览计划", command=self._preview_plan).grid(
+            row=0, column=0, sticky="ew", padx=12, pady=12
+        )
+        ctk.CTkButton(action_frame, text="路径检查", command=self._validate_paths).grid(
+            row=0, column=1, sticky="ew", padx=12, pady=12
+        )
+        ctk.CTkButton(action_frame, text="模拟 1-2 分钟", command=self._start_simulation).grid(
+            row=0, column=2, sticky="ew", padx=12, pady=12
+        )
+        ctk.CTkButton(action_frame, text="开始真实流程", command=self._start_real_flow).grid(
+            row=0, column=3, sticky="ew", padx=12, pady=12
+        )
+        ctk.CTkButton(action_frame, text="打开当前输出目录", command=self._open_current_output).grid(
+            row=0, column=4, sticky="ew", padx=12, pady=12
+        )
+
+        self.start_preview = ctk.CTkTextbox(tab, height=420)
+        self.start_preview.grid(row=3, column=0, sticky="nsew", padx=16, pady=(8, 16))
+        tab.grid_rowconfigure(3, weight=1)
+
+    def _build_paths_tab(self) -> None:
+        tab = self.tabview.tab("路径配置")
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(1, weight=1)
+
+        path_frame = ctk.CTkFrame(tab)
+        path_frame.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
+        path_frame.grid_columnconfigure(0, weight=0)
+        path_frame.grid_columnconfigure(1, weight=1)
+        path_frame.grid_columnconfigure(2, weight=1)
+        path_frame.grid_columnconfigure(3, weight=1)
+        ctk.CTkLabel(path_frame, text="全局路径", font=ctk.CTkFont(size=24, weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=16, pady=(14, 12)
+        )
+        for row, (label, var) in enumerate(
+            [
+                ("文案输出目录", self.metadata_root_var),
+                ("音乐目录", self.music_dir_var),
+                ("底图目录", self.base_image_dir_var),
+                ("成品视频输出目录", self.output_root_var),
+                ("FFmpeg", self.ffmpeg_var),
+                ("已用素材目录", self.used_media_root_var),
+                ("上传后保留天数", self.cleanup_days_var),
+            ],
+            start=1,
+        ):
+            self._entry_row(path_frame, row, label, var)
+        ctk.CTkButton(path_frame, text="保存路径配置", command=self._save_paths).grid(
+            row=8, column=0, columnspan=4, sticky="w", padx=16, pady=(0, 14)
+        )
+
+        binding_frame = ctk.CTkFrame(tab)
+        binding_frame.grid(row=1, column=0, sticky="nsew", padx=16, pady=(8, 16))
+        for column in range(4):
+            binding_frame.grid_columnconfigure(column, weight=1)
+        binding_frame.grid_rowconfigure(6, weight=1)
+        ctk.CTkLabel(binding_frame, text="分组素材目录绑定", font=ctk.CTkFont(size=24, weight="bold")).grid(
+            row=0, column=0, columnspan=4, sticky="w", padx=16, pady=(14, 12)
+        )
+        ctk.CTkLabel(
+            binding_frame,
+            text="每个 BitBrowser 分组都可以长期绑定一个素材目录。上传页如果不单独覆盖，就自动使用这里的绑定。",
+            text_color="#b8c1cc",
+            justify="left",
+        ).grid(row=1, column=0, columnspan=4, sticky="w", padx=16, pady=(0, 10))
+        ctk.CTkLabel(binding_frame, text="分组").grid(row=2, column=0, sticky="w", padx=(16, 8), pady=(0, 6))
+        self.binding_group_menu = ctk.CTkOptionMenu(binding_frame, variable=self.binding_group_var, values=[""])
+        self.binding_group_menu.grid(row=3, column=0, sticky="ew", padx=(16, 8), pady=(0, 12))
+        ctk.CTkLabel(binding_frame, text="绑定目录").grid(row=2, column=1, sticky="w", padx=8, pady=(0, 6))
+        ctk.CTkEntry(binding_frame, textvariable=self.binding_folder_var).grid(
+            row=3, column=1, columnspan=2, sticky="ew", padx=8, pady=(0, 12)
+        )
+        ctk.CTkButton(binding_frame, text="选择文件夹", command=self._pick_binding_folder).grid(
+            row=3, column=3, sticky="ew", padx=(8, 16), pady=(0, 12)
+        )
+        bar = ctk.CTkFrame(binding_frame, fg_color="transparent")
+        bar.grid(row=4, column=0, columnspan=4, sticky="ew", padx=10, pady=(0, 8))
+        ctk.CTkButton(bar, text="保存绑定", command=self._save_binding).pack(side="left", padx=6)
+        ctk.CTkButton(bar, text="删除绑定", command=self._remove_binding).pack(side="left", padx=6)
+        ctk.CTkButton(bar, text="刷新分组", command=self._refresh_groups).pack(side="left", padx=6)
+        ctk.CTkLabel(binding_frame, text="当前绑定").grid(row=5, column=0, sticky="w", padx=16, pady=(0, 6))
+        self.binding_box = ctk.CTkTextbox(binding_frame, height=220)
+        self.binding_box.grid(row=6, column=0, columnspan=4, sticky="nsew", padx=16, pady=(0, 14))
+
+    def _save_paths(self) -> None:
+        config = load_scheduler_settings(SCHEDULER_CONFIG_FILE)
+        config.update(
+            {
+                "metadata_root": self.metadata_root_var.get().strip(),
+                "music_dir": self.music_dir_var.get().strip(),
+                "base_image_dir": self.base_image_dir_var.get().strip(),
+                "output_root": self.output_root_var.get().strip(),
+                "ffmpeg_bin": self.ffmpeg_var.get().strip() or "ffmpeg",
+                "ffmpeg_path": self.ffmpeg_var.get().strip() or "ffmpeg",
+                "used_media_root": self.used_media_root_var.get().strip(),
+                "render_cleanup_days": int(self.cleanup_days_var.get().strip() or "5"),
+            }
+        )
+        self.scheduler_config = save_scheduler_settings(config, SCHEDULER_CONFIG_FILE)
+        self.metadata_root_var.set(str(get_metadata_root(self.scheduler_config)))
+        self._refresh_bindings_box()
+        self._log("[Paths] Saved path config")
+
+    def _collect_defaults(self) -> WorkflowDefaults:
+        modules = self._selected_modules()
+        return WorkflowDefaults(
+            date_mmdd=normalize_mmdd(self.date_var.get().strip() or _today_mmdd()),
+            visibility="schedule" if self.schedule_enabled_var.get() else self.default_visibility_var.get(),
+            category=self.default_category_var.get(),
+            made_for_kids=_bool_from_yes_no(self.default_kids_var.get()),
+            altered_content=_bool_from_yes_no(self.default_ai_var.get()),
+            schedule_enabled=bool(self.schedule_enabled_var.get()),
+            schedule_start=self._compose_default_schedule(),
+            schedule_interval_minutes=int(self.schedule_interval_var.get().strip() or "60"),
+            schedule_timezone=self.schedule_timezone_var.get().strip() or SCHEDULE_TIMEZONE_VALUES[0],
+            metadata_mode=METADATA_MODE_LABELS.get(self.metadata_mode_var.get(), "prompt_api"),
+            generate_text=bool(modules["metadata"] and self.generate_text_var.get()),
+            generate_thumbnails=bool(modules["metadata"] and self.generate_thumbnails_var.get()),
+            sync_daily_content=bool(modules["metadata"] and self.sync_daily_content_var.get()),
+            randomize_effects=bool(self.randomize_effects_var.get()),
+            visual_settings=self._collect_visual_settings(),
+        )
+
+    def _preview_plan(self) -> None:
+        self.start_preview.delete("1.0", "end")
+        modules = self._selected_modules()
+        labels = self._selected_module_labels()
+        if not any(modules.values()):
+            self.start_preview.insert("1.0", "No module selected. Go to Quick Start and check Metadata / Render / Upload.")
+            return
+        if not self.window_tasks:
+            self.start_preview.insert("1.0", "No window tasks yet. Go to Upload tab and add at least one window.")
+            return
+
+        defaults = self._collect_defaults()
+        lines = [
+            f"Selected modules: {', '.join(labels)}",
+            f"Date: {defaults.date_mmdd}",
+            f"Window count: {len(self.window_tasks)}",
+            f"Metadata root: {self.metadata_root_var.get().strip()}",
+            f"Music root: {self.music_dir_var.get().strip()}",
+            f"Image root: {self.base_image_dir_var.get().strip()}",
+            f"Video output root: {self.output_root_var.get().strip()}",
+            (
+                "Visual mode: Random"
+                if defaults.randomize_effects
+                else "Visual mode: Manual | "
+                f"style={defaults.visual_settings.get('style', 'bar')} | "
+                f"particle={defaults.visual_settings.get('particle', 'none')} | "
+                f"tint={defaults.visual_settings.get('color_tint', 'none')}"
+            ),
+            "",
+        ]
+        try:
+            plan = build_window_plan(self.window_tasks, defaults)
+            lines.extend(plan.get("preview_lines", []))
+        except Exception as exc:
+            lines.append(f"Plan build failed: {exc}")
+            self.start_preview.insert("1.0", "\n".join(lines))
+            return
+
+        config = load_scheduler_settings()
+        if modules["render"] or modules["metadata"]:
+            errors, warnings = validate_group_sources(self.window_tasks, config=config, log=lambda *_args, **_kwargs: None)
+            if warnings:
+                lines.append("")
+                lines.extend(f"Warning: {item}" for item in warnings)
+            if errors:
+                lines.extend(f"Error: {item}" for item in errors)
+        if modules["upload"] and not modules["render"]:
+            errors, warnings, resolved_dirs = validate_existing_output_dirs(
+                self.window_tasks,
+                date_mmdd=defaults.date_mmdd,
+                config=config,
+                log=lambda *_args, **_kwargs: None,
+            )
+            lines.append("")
+            if resolved_dirs:
+                lines.append("Upload will use these existing video folders:")
+                for tag, folder in resolved_dirs.items():
+                    lines.append(f"  - {tag}: {folder}")
+            if warnings:
+                lines.extend(f"Warning: {item}" for item in warnings)
+            if errors:
+                lines.extend(f"Error: {item}" for item in errors)
+
+        self.start_preview.insert("1.0", "\n".join(lines))
+        self._save_state()
+
+    def _validate_paths(self) -> None:
+        modules = self._selected_modules()
+        if not any(modules.values()):
+            messagebox.showerror("Validate Failed", "Select at least one module first.")
+            return
+        if not self.window_tasks:
+            messagebox.showerror("Validate Failed", "Add at least one window task first.")
+            return
+
+        config = load_scheduler_settings()
+        text: list[str] = []
+        errors: list[str] = []
+        if modules["render"] or modules["metadata"]:
+            render_errors, render_warnings = validate_group_sources(self.window_tasks, config=config, log=self._log)
+            text.extend(f"Warning: {item}" for item in render_warnings)
+            text.extend(f"Error: {item}" for item in render_errors)
+            errors.extend(render_errors)
+        if modules["upload"] and not modules["render"]:
+            defaults = self._collect_defaults()
+            upload_errors, upload_warnings, resolved_dirs = validate_existing_output_dirs(
+                self.window_tasks,
+                date_mmdd=defaults.date_mmdd,
+                config=config,
+                log=self._log,
+            )
+            text.extend(f"Ready to upload: {tag} -> {folder}" for tag, folder in resolved_dirs.items())
+            text.extend(f"Warning: {item}" for item in upload_warnings)
+            text.extend(f"Error: {item}" for item in upload_errors)
+            errors.extend(upload_errors)
+
+        if errors:
+            messagebox.showerror("Validate Failed", "\n".join(text) if text else "Validation failed.")
+        else:
+            messagebox.showinfo("Validate OK", "\n".join(text) if text else "Validation passed.")
+        self._preview_plan()
+
+    def _start_simulation(self) -> None:
+        modules = self._selected_modules()
+        if not modules["render"]:
+            messagebox.showerror("Cannot Simulate", "Simulation requires the Render module.")
+            return
+        if not self.window_tasks:
+            messagebox.showerror("Cannot Simulate", "Add at least one window task first.")
+            return
+
+        def job() -> None:
+            defaults = self._collect_defaults()
+            self._persist_prompt_form_for_active_tasks()
+            seconds = int(self.simulate_seconds_var.get().strip() or "90")
+            result = execute_direct_media_workflow(
+                tasks=self.window_tasks,
+                defaults=defaults,
+                simulation=SimulationOptions(simulate_seconds=seconds, consume_sources=False, save_manifest=True),
+                log=self._log,
+            )
+            self._log(f"[Simulate] Finished. Generated {len(result.items)} videos")
+            self._log(json.dumps(result.as_dict(), ensure_ascii=False, indent=2))
+
+        self._run_background(job, task_name="Simulate Render", total_items=len(self.window_tasks), include_upload=False)
+
+    def _start_real_flow(self) -> None:
+        modules = self._selected_modules()
+        if not any(modules.values()):
+            messagebox.showerror("Cannot Start", "Select at least one module first.")
+            return
+        if not self.window_tasks:
+            messagebox.showerror("Cannot Start", "Add at least one window task first.")
+            return
+
+        def job() -> bool:
+            defaults = self._collect_defaults()
+            self._persist_prompt_form_for_active_tasks()
+            config = load_scheduler_settings()
+            prepared_output_dirs: dict[str, str] | None = None
+
+            if modules["render"] or modules["metadata"]:
+                render_errors, render_warnings = validate_group_sources(self.window_tasks, config=config, log=self._log)
+                for warning in render_warnings:
+                    self._log(f"[Validate] {warning}")
+                if render_errors:
+                    raise ValueError("\n".join(render_errors))
+
+            if modules["upload"] and not modules["render"]:
+                upload_errors, upload_warnings, prepared_output_dirs = validate_existing_output_dirs(
+                    tasks=self.window_tasks,
+                    date_mmdd=defaults.date_mmdd,
+                    config=config,
+                    log=self._log,
+                )
+                for warning in upload_warnings:
+                    self._log(f"[Upload] {warning}")
+                if upload_errors:
+                    raise ValueError("\n".join(upload_errors))
+
+            if modules["render"]:
+                self._log("[Start] Render module")
+                render_result = execute_direct_media_workflow(
+                    tasks=self.window_tasks,
+                    defaults=defaults,
+                    simulation=SimulationOptions(simulate_seconds=0, consume_sources=True, save_manifest=True),
+                    log=self._log,
+                )
+                prepared_output_dirs = self._collect_output_dirs_from_result(render_result) or prepared_output_dirs
+                if modules["upload"] and not prepared_output_dirs:
+                    upload_errors, upload_warnings, prepared_output_dirs = validate_existing_output_dirs(
+                        tasks=self.window_tasks,
+                        date_mmdd=defaults.date_mmdd,
+                        config=config,
+                        log=self._log,
+                    )
+                    for warning in upload_warnings:
+                        self._log(f"[Upload] {warning}")
+                    if upload_errors:
+                        raise ValueError("\n".join(upload_errors))
+            elif modules["metadata"]:
+                self._log("[Start] Metadata module")
+                execute_metadata_only_workflow(
+                    tasks=self.window_tasks,
+                    defaults=defaults,
+                    log=self._log,
+                )
+
+            if modules["upload"] and not modules["render"] and modules["metadata"]:
+                self._log("[Upload] Refresh existing manifests using current metadata settings")
+                prepared_output_dirs = refresh_existing_output_metadata(
+                    tasks=self.window_tasks,
+                    defaults=defaults,
+                    prepared_output_dirs=prepared_output_dirs or {},
+                    config=config,
+                    log=self._log,
+                )
+
+            if modules["upload"]:
+                self._log("[Start] Upload module")
+                return self._run_upload_command(
+                    defaults,
+                    detach=True,
+                    prepared_output_dirs=prepared_output_dirs,
+                )
+
+            return False
+
+        task_name = " + ".join(self._selected_module_labels())
+        self._run_background(
+            job,
+            task_name=task_name,
+            total_items=len(self.window_tasks),
+            include_upload=bool(modules["upload"]),
+        )
+
+    def _load_daily_entry(self) -> None:
+        tag = self.daily_group_var.get()
+        serial_text = self.daily_serial_var.get().strip()
+        if not tag or not serial_text.isdigit():
+            messagebox.showerror("Load Failed", "Select a group and window first.")
+            return
+        tag_dir = get_metadata_root(load_scheduler_settings()) / tag
+        generation_map = load_generation_map(tag_dir / "generation_map.json")
+        channel = (generation_map.get("channels") or {}).get(serial_text) or {}
+        day_info = (channel.get("days") or {}).get(self.daily_date_var.get().strip()) or {}
+        self.daily_is_ypp_var.set(_yes_no_from_bool(bool(channel.get("is_ypp", False))))
+        self.daily_title_var.set(str(day_info.get("title") or ""))
+        self.daily_covers_var.set(",".join(day_info.get("covers") or []))
+        self.daily_ab_titles_var.set(",".join(day_info.get("ab_titles") or []))
+        self.daily_description_box.delete("1.0", "end")
+        self.daily_description_box.insert("1.0", str(day_info.get("description") or ""))
+
+    def _save_daily_entry(self) -> None:
+        tag = self.daily_group_var.get()
+        serial_text = self.daily_serial_var.get().strip()
+        if not tag or not serial_text.isdigit():
+            messagebox.showerror("Save Failed", "Select a group and window first.")
+            return
+        tag_dir = get_metadata_root(load_scheduler_settings()) / tag
+        tag_dir.mkdir(parents=True, exist_ok=True)
+        path = tag_dir / "generation_map.json"
+        data = load_generation_map(path)
+        channels = data.setdefault("channels", {})
+        channel = channels.setdefault(serial_text, {"is_ypp": _bool_from_yes_no(self.daily_is_ypp_var.get()), "days": {}})
+        channel["is_ypp"] = _bool_from_yes_no(self.daily_is_ypp_var.get())
+        channel.setdefault("days", {})
+        channel["days"][self.daily_date_var.get().strip()] = {
+            "title": self.daily_title_var.get().strip(),
+            "description": self.daily_description_box.get("1.0", "end").strip(),
+            "covers": [item.strip() for item in self.daily_covers_var.get().split(",") if item.strip()],
+            "ab_titles": [item.strip() for item in self.daily_ab_titles_var.get().split(",") if item.strip()],
+            "set": 1,
+        }
+        save_generation_map(path, data)
+        self._log(f"[Daily] Saved {tag}/{serial_text}/{self.daily_date_var.get().strip()}")
+
+    def _sync_daily_manifest(self) -> None:
+        tag = self.daily_group_var.get()
+        tag_dir = get_metadata_root(load_scheduler_settings()) / tag
+        generation_map = load_generation_map(tag_dir / "generation_map.json")
+        manifest_path, count = sync_manifest_from_generation_map(
+            generation_map,
+            tag_dir,
+            Path(self.output_root_var.get()),
+            tag,
+            self.daily_date_var.get().strip(),
+        )
+        self._log(f"[Daily] Synced manifest: {manifest_path} | channels={count}")
+
+    def _open_daily_tag_dir(self) -> None:
+        tag = self.daily_group_var.get()
+        target = get_metadata_root(load_scheduler_settings()) / tag
+        target.mkdir(parents=True, exist_ok=True)
+        os.startfile(target)
 
     def _on_close(self) -> None:
         self._save_state()

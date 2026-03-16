@@ -24,7 +24,9 @@ from prompt_studio import (
     clone_json,
     language_meta,
     load_prompt_studio_config,
+    normalize_tag_key,
     parse_tag_range,
+    pick_api_preset_name,
     pick_content_template_name,
     render_master_prompt,
 )
@@ -33,6 +35,11 @@ from prompt_studio import (
 DEFAULT_TIMEOUT_SECONDS = 70
 AUDIENCE_ANALYSIS_MAX_TOKENS = 1400
 METADATA_HISTORY_FILE = Path(__file__).parent / "data" / "metadata_history.json"
+
+
+def _history_tag_key(tag: str) -> str:
+    normalized = normalize_tag_key(tag)
+    return normalized or str(tag).strip()
 
 
 def _float_value(value: Any, default: float) -> float:
@@ -74,7 +81,7 @@ def load_metadata_history(path: Path = METADATA_HISTORY_FILE) -> dict[str, Any]:
 
 def get_recent_metadata_history(tag: str, *, limit: int = 20, path: Path = METADATA_HISTORY_FILE) -> dict[str, list[str]]:
     data = load_metadata_history(path)
-    rows = data.get("tags", {}).get(str(tag).strip(), [])
+    rows = data.get("tags", {}).get(_history_tag_key(tag), [])
     if not isinstance(rows, list):
         rows = []
     rows = rows[-max(1, limit):]
@@ -112,10 +119,11 @@ def append_metadata_history(
 ) -> None:
     data = load_metadata_history(path)
     tags = data.setdefault("tags", {})
-    rows = tags.setdefault(str(tag).strip(), [])
+    tag_key = _history_tag_key(tag)
+    rows = tags.setdefault(tag_key, [])
     if not isinstance(rows, list):
         rows = []
-        tags[str(tag).strip()] = rows
+        tags[tag_key] = rows
     rows.append(
         {
             "title": str(title or "").strip(),
@@ -125,7 +133,7 @@ def append_metadata_history(
             "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
     )
-    tags[str(tag).strip()] = rows[-max(20, keep_per_tag):]
+    tags[tag_key] = rows[-max(20, keep_per_tag):]
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -459,6 +467,27 @@ def _fit_text_length(text: str, *, min_len: int, max_len: int, filler: str) -> s
     return result
 
 
+def _normalize_generation_text(value: str) -> str:
+    return "".join(str(value or "").strip().lower().split())
+
+
+def _pick_unique_generation_text(
+    candidates: list[str],
+    avoid_values: list[str] | None,
+    fallback: str,
+) -> str:
+    blocked = {
+        _normalize_generation_text(item)
+        for item in (avoid_values or [])
+        if _normalize_generation_text(item)
+    }
+    cleaned = [str(item or "").strip() for item in candidates if str(item or "").strip()]
+    for item in cleaned:
+        if _normalize_generation_text(item) not in blocked:
+            return item
+    return cleaned[0] if cleaned else str(fallback or "").strip()
+
+
 def _seed_number(unique_seed: str) -> int:
     raw = str(unique_seed or "").strip()
     if not raw:
@@ -477,6 +506,10 @@ def _build_local_fallback_output(
     *,
     is_ypp: bool = False,
     unique_seed: str = "",
+    avoid_titles: list[str] | None = None,
+    avoid_descriptions: list[str] | None = None,
+    avoid_thumbnail_prompts: list[str] | None = None,
+    avoid_tag_signatures: list[str] | None = None,
 ) -> dict[str, Any]:
     genre = str(content_template.get("musicGenre") or "背景音樂").strip() or "背景音樂"
     audience_text = str(content_template.get("audience") or "").strip()
@@ -499,11 +532,21 @@ def _build_local_fallback_output(
         f"如果你喜歡體面、溫柔又不吵的{genre}｜這首歌會像老朋友一樣慢慢陪你回到舒服的位置",
     ]
     title_filler = "｜前奏一響，就像把多年以前那段溫柔又體面的時光重新找回來"
-    title_seeds = [_rotate_pick(title_seed_pool, seed, idx) for idx in range(title_count)]
-    titles = [
-        _fit_text_length(seed, min_len=title_min, max_len=title_max, filler=title_filler)
-        for seed in title_seeds[:title_count]
+    title_seeds = [_rotate_pick(title_seed_pool, seed, idx) for idx in range(max(title_count * 3, 8))]
+    title_candidates = [
+        _fit_text_length(item, min_len=title_min, max_len=title_max, filler=title_filler)
+        for item in title_seeds
     ]
+    titles: list[str] = []
+    blocked_titles = [str(item).strip() for item in (avoid_titles or []) if str(item).strip()]
+    for index in range(title_count):
+        fallback_title = title_candidates[index % len(title_candidates)] if title_candidates else f"{genre} {index + 1}"
+        chosen_title = _pick_unique_generation_text(
+            title_candidates[index:],
+            [*blocked_titles, *titles],
+            fallback_title,
+        )
+        titles.append(chosen_title)
 
     desc_variants = [
         f"這支 {genre} 不是吵鬧取勝，而是把節奏、空氣感與情緒慢慢放回耳朵裡。",
@@ -578,6 +621,172 @@ def _build_local_fallback_output(
                 ),
             }
         )
+
+    return {
+        "usedAngle": str(content_template.get("angle") or "").strip() or f"{genre} x {audience_hint}",
+        "titles": titles,
+        "descriptions": descriptions,
+        "seoHashtags": seo_hashtags,
+        "tagList": tag_list,
+        "thumbnails": thumbnails,
+    }
+
+
+def _build_local_fallback_output_v2(
+    content_template: dict,
+    *,
+    is_ypp: bool = False,
+    unique_seed: str = "",
+    avoid_titles: list[str] | None = None,
+    avoid_descriptions: list[str] | None = None,
+    avoid_thumbnail_prompts: list[str] | None = None,
+    avoid_tag_signatures: list[str] | None = None,
+) -> dict[str, Any]:
+    genre = str(content_template.get("musicGenre") or "背景音樂").strip() or "背景音樂"
+    audience_text = str(content_template.get("audience") or "").strip()
+    audience_hint = "台灣熟齡聽眾" if ("台灣" in audience_text or "台湾" in audience_text or "65" in audience_text) else "喜歡耐聽旋律的人"
+    seed = _seed_number(unique_seed)
+    title_count = 3 if is_ypp else 1
+    desc_count = 1
+    thumb_count = 3 if is_ypp else 1
+    title_min = _int_value(content_template.get("titleMin"), 80)
+    title_max = _int_value(content_template.get("titleMax"), 95)
+    desc_len = _int_value(content_template.get("descLen"), 300)
+    tag_min, tag_max = parse_tag_range(str(content_template.get("tagRange") or "10-20"))
+
+    title_seed_pool = [
+        f"找了很久，終於又聽見這首{genre}｜寫給{audience_hint}的夜晚、客廳與回憶慢慢安靜下來的優雅旋律",
+        f"前奏一響，就像把多年以前那段時光找回來｜這首{genre}寫給{audience_hint}，越聽越耐聽",
+        f"不是熱鬧，是終於找到對味的陪伴｜這首{genre}把熟悉、體面與溫柔慢慢放回你的夜晚",
+        f"這首{genre}沒有故作熱鬧｜只把節奏放得剛剛好，讓{audience_hint}一聽就願意把夜晚留給它",
+        f"真正耐聽的{genre}不是越快越好｜而是讓{audience_hint}在安靜裡慢慢把情緒放穩",
+        f"如果你喜歡體面、溫柔又不吵的{genre}｜這首歌就像老朋友一樣慢慢陪你回到舒服的位置",
+        f"今晚想把房間留給安靜的{genre}｜這支版本更適合{audience_hint}慢慢聽、慢慢想",
+        f"有些{genre}不是拿來炫技｜而是讓{audience_hint}把一天的情緒安穩放下來",
+    ]
+    title_filler = "｜前奏一響，就像把多年以前那段溫柔又體面的時光重新找回來"
+    title_candidates = [
+        _fit_text_length(_rotate_pick(title_seed_pool, seed, idx), min_len=title_min, max_len=title_max, filler=title_filler)
+        for idx in range(max(title_count * 4, 10))
+    ]
+    titles: list[str] = []
+    blocked_titles = [str(item).strip() for item in (avoid_titles or []) if str(item).strip()]
+    for index in range(title_count):
+        fallback_title = title_candidates[index % len(title_candidates)] if title_candidates else f"{genre} {index + 1}"
+        titles.append(
+            _pick_unique_generation_text(
+                title_candidates[index:],
+                [*blocked_titles, *titles],
+                fallback_title,
+            )
+        )
+
+    desc_variants = [
+        f"這支 {genre} 不是喧鬧取勝，而是把節奏、空氣感與情緒慢慢放回耳朵裡。",
+        f"這首 {genre} 想做的不是把注意力搶走，而是把房間裡的氛圍悄悄安頓好。",
+        f"如果你最近特別需要一段體面、輕盈、可以長時間陪伴的聲音，這支 {genre} 很適合。",
+        f"它不急著討好任何人，只是用穩定的旋律和空氣感，把夜晚留給真正想慢下來的人。",
+    ]
+    closing_variants = [
+        "如果你也喜歡這種不喧嘩、優雅、耐聽的音樂氛圍，歡迎把它留在你的播放清單裡。",
+        "如果這種耐聽又不吵的聲音剛好對你的胃口，記得把它收藏起來，留給真正需要安靜的時候。",
+        "若你也偏愛這種不炫技、卻越聽越有味道的旋律，這支影片很值得你留著慢慢播。",
+        "如果你正想找一段夜晚能長時間放著的聊天感音樂，這支版本就很值得留下來作陪伴。",
+    ]
+    desc_candidates = [
+        _fit_text_length(
+            (
+                f"{_rotate_pick(desc_variants, seed, idx)}"
+                f"如果你喜歡能長時間陪伴、不搶注意力、又越聽越耐聽的旋律，這首歌很適合在夜晚、閱讀、整理房間、泡茶或安靜放空時播放。"
+                f"它特別適合 {audience_hint} 的聆聽節奏，不需要追趕，只要讓聲音穩穩地陪著你，把回憶、客廳和一天的情緒慢慢安放好。"
+                f"{_rotate_pick(closing_variants, seed, idx)}"
+            ),
+            min_len=max(220, desc_len - 40),
+            max_len=desc_len + 40,
+            filler=" 讓旋律慢慢陪你把心情放回舒服的位置。",
+        )
+        for idx in range(max(desc_count * 4, 8))
+    ]
+    descriptions: list[str] = []
+    blocked_descriptions = [str(item).strip() for item in (avoid_descriptions or []) if str(item).strip()]
+    for index in range(desc_count):
+        fallback_description = desc_candidates[index % len(desc_candidates)] if desc_candidates else genre
+        descriptions.append(
+            _pick_unique_generation_text(
+                desc_candidates[index:],
+                [*blocked_descriptions, *descriptions],
+                fallback_description,
+            )
+        )
+
+    tag_candidates = [
+        genre,
+        f"{genre}背景音樂",
+        f"{genre}純音樂",
+        "熟齡音樂",
+        "台灣背景音樂",
+        "懷舊音樂",
+        "放鬆音樂",
+        "閱讀音樂",
+        "夜晚音樂",
+        "客廳背景音樂",
+        "優雅旋律",
+        "耐聽音樂",
+        "舒壓音樂",
+        "安靜音樂",
+        "泡茶音樂",
+        "回憶感音樂",
+        "溫柔背景音樂",
+        "長時間播放音樂",
+        "高質感背景音樂",
+        "熟齡聽眾音樂",
+        f"{genre}夜晚歌單",
+        f"{genre}放空歌單",
+        f"{genre}客廳音樂",
+    ]
+    tag_pool: list[str] = []
+    for item in tag_candidates[seed % len(tag_candidates):] + tag_candidates[: seed % len(tag_candidates)]:
+        if item not in tag_pool:
+            tag_pool.append(item)
+    tag_list = tag_pool[:tag_max]
+    blocked_signatures = [str(item).strip() for item in (avoid_tag_signatures or []) if str(item).strip()]
+    blocked_signature_keys = {_normalize_generation_text(item) for item in blocked_signatures}
+    for shift in range(len(tag_pool)):
+        candidate_list = (tag_pool[shift:] + tag_pool[:shift])[:tag_max]
+        if _normalize_generation_text(" | ".join(candidate_list)) not in blocked_signature_keys:
+            tag_list = candidate_list
+            break
+    if len(tag_list) < tag_min:
+        tag_list.extend([f"{genre}推薦", f"{genre}收藏", f"{genre}歌單"][: max(0, tag_min - len(tag_list))])
+
+    seo_hashtags = [f"#{item.replace(' ', '')}" for item in tag_list[: min(6, len(tag_list))]]
+    visual_styles = [
+        "Warm cinematic lighting, refined atmosphere, premium composition.",
+        "Elegant nostalgic mood, soft golden light, premium editorial composition.",
+        "Moody living-room ambience, tasteful contrast, polished premium layout.",
+        "Refined evening atmosphere, gentle glow, sophisticated music-channel composition.",
+        "Painterly ghibli-inspired ambience, soft nostalgic interior, premium composition.",
+        "Quiet late-night room, warm lamp glow, tasteful editorial layout.",
+    ]
+    prompt_candidates = [
+        (
+            f"Create an elegant nostalgic YouTube thumbnail for {genre}. "
+            f"Audience: {audience_hint}. {_rotate_pick(visual_styles, seed, idx)} "
+            f"Use Traditional Chinese text in the image."
+        )
+        for idx in range(max(thumb_count * 4, 8))
+    ]
+    thumbnails: list[dict[str, str]] = []
+    blocked_prompts = [str(item).strip() for item in (avoid_thumbnail_prompts or []) if str(item).strip()]
+    for idx in range(thumb_count):
+        title = titles[min(idx, len(titles) - 1)]
+        fallback_prompt = prompt_candidates[idx % len(prompt_candidates)] if prompt_candidates else f"Thumbnail for {genre}. Use Traditional Chinese text in the image."
+        prompt = _pick_unique_generation_text(
+            prompt_candidates[idx:],
+            [*blocked_prompts, *[item.get('prompt', '') for item in thumbnails]],
+            fallback_prompt,
+        )
+        thumbnails.append({"forTitle": title, "prompt": prompt})
 
     return {
         "usedAngle": str(content_template.get("angle") or "").strip() or f"{genre} x {audience_hint}",
@@ -855,7 +1064,7 @@ def load_generation_context(
     api_presets = prompt_cfg.get("apiPresets", {})
     content_templates = prompt_cfg.get("contentTemplates", {})
 
-    chosen_api_name = api_preset_name or prompt_cfg.get("defaultApiPreset") or next(iter(api_presets), "")
+    chosen_api_name = api_preset_name or pick_api_preset_name(prompt_cfg, tag)
     if chosen_api_name not in api_presets:
         raise ValueError(f"未找到 API 模板: {chosen_api_name}")
 
@@ -887,10 +1096,10 @@ def generate_content_bundle(
         content_template_name=content_template_name,
     )
 
-    # 上传落地时按频道只需要 1 套；YPP 需要 3 套 A/B 标题和更多缩略图。
-    content_template["titleCount"] = "3" if is_ypp else "1"
-    content_template["descCount"] = "1"
-    content_template["thumbCount"] = "3" if is_ypp else "1"
+    # 非 YPP 也生成多组候选，便于在同批视频里避开重复标题。
+    content_template["titleCount"] = str(max(3, _int_value(content_template.get("titleCount"), 1)))
+    content_template["descCount"] = str(max(2, _int_value(content_template.get("descCount"), 1)))
+    content_template["thumbCount"] = str(3 if is_ypp else max(2, _int_value(content_template.get("thumbCount"), 1)))
 
     if not api_preset.get("baseUrl") or not api_preset.get("apiKey") or not api_preset.get("model"):
         raise ValueError("当前 API 模板缺少 baseUrl / apiKey / model，无法生成内容")
@@ -917,7 +1126,15 @@ def generate_content_bundle(
     compact_preset["maxTokens"] = str(min(_int_value(api_preset.get("maxTokens"), 16000), 4000))
     provider = str(api_preset.get("provider") or "").strip().lower()
     if len(user_prompt) > 8000 and provider == "openai_compatible":
-        parsed = _build_local_fallback_output(content_template, is_ypp=is_ypp, unique_seed=unique_seed)
+        parsed = _build_local_fallback_output_v2(
+            content_template,
+            is_ypp=is_ypp,
+            unique_seed=unique_seed,
+            avoid_titles=avoid_titles,
+            avoid_descriptions=avoid_descriptions,
+            avoid_thumbnail_prompts=avoid_thumbnail_prompts,
+            avoid_tag_signatures=avoid_tag_signatures,
+        )
         raw = json.dumps(parsed, ensure_ascii=False, indent=2)
     else:
         try:
@@ -928,7 +1145,15 @@ def generate_content_bundle(
             parsed = _parse_json_like(raw)
             parsed = _repair_output_if_needed(parsed, api_preset, content_template, image_data_url=image_data_url)
         except Exception:
-            parsed = _build_local_fallback_output(content_template, is_ypp=is_ypp, unique_seed=unique_seed)
+            parsed = _build_local_fallback_output_v2(
+                content_template,
+                is_ypp=is_ypp,
+                unique_seed=unique_seed,
+                avoid_titles=avoid_titles,
+                avoid_descriptions=avoid_descriptions,
+                avoid_thumbnail_prompts=avoid_thumbnail_prompts,
+                avoid_tag_signatures=avoid_tag_signatures,
+            )
             raw = json.dumps(parsed, ensure_ascii=False, indent=2)
 
     return {

@@ -6,6 +6,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from prompt_studio import normalize_tag_key
+
 
 SCOPE_SAME_GROUP = "same_group"
 SCOPE_MULTI_GROUP = "multi_group"
@@ -286,11 +288,21 @@ def load_window_upload_plan(path: Path | str | None) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def _same_tag(left: str, right: str) -> bool:
+    left_text = str(left or "").strip()
+    right_text = str(right or "").strip()
+    if not left_text or not right_text:
+        return False
+    if left_text == right_text:
+        return True
+    return normalize_tag_key(left_text) == normalize_tag_key(right_text)
+
+
 def find_window_task(plan: dict[str, Any] | None, tag: str, serial: int) -> dict[str, Any] | None:
     if not plan:
         return None
     for task in plan.get("tasks", []):
-        if str(task.get("tag") or "").strip() == str(tag).strip() and int(task.get("serial") or 0) == int(serial):
+        if _same_tag(task.get("tag") or "", tag) and int(task.get("serial") or 0) == int(serial):
             return dict(task)
     return None
 
@@ -327,7 +339,16 @@ def derive_tags_and_skip_channels(plan: dict[str, Any], tag_info_getter) -> tupl
     skip: list[int] = []
     for tag in tags:
         info = tag_info_getter(tag) or {}
+        if not info:
+            for raw_tag in plan.get("groups", {}).keys():
+                if _same_tag(raw_tag, tag):
+                    info = tag_info_getter(raw_tag) or {}
+                    if info:
+                        break
         all_serials = {int(item) for item in info.get("all_serials", [])}
-        wanted = {int(item) for item in plan.get("groups", {}).get(tag, [])}
+        wanted: set[int] = set()
+        for raw_tag, serials in (plan.get("groups", {}) or {}).items():
+            if _same_tag(raw_tag, tag):
+                wanted.update(int(item) for item in serials)
         skip.extend(sorted(all_serials - wanted))
     return tags, skip

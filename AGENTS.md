@@ -155,3 +155,4 @@ If multiple people maintain this repo:
 - explain workflow changes
 - keep docs in sync with behavior
 - keep public config sanitized
+- unless the user explicitly says not to, sync each stable local version to GitHub after the fixes are finished
