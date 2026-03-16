@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import customtkinter as ctk
 from PIL import Image, ImageGrab
@@ -99,7 +99,6 @@ LANGUAGE_VALUES = ["zh-TW", "zh-CN", "en-US", "ja-JP", "ko-KR"]
 AUTO_IMAGE_VALUES = ["0", "1"]
 METADATA_MODE_LABELS = {
     "提示词那套": "prompt_api",
-    "原先那套": "daily_content",
 }
 METADATA_MODE_VALUES = list(METADATA_MODE_LABELS.keys())
 SCHEDULE_TIMEZONE_VALUES = ["Asia/Taipei (+08:00)"]
@@ -200,9 +199,12 @@ class DashboardApp(ctk.CTk):
         self.minsize(1320, 840)
 
         self.log_queue: queue.Queue[str] = queue.Queue()
+        self.ui_action_queue: queue.Queue[Callable[[], None]] = queue.Queue()
         self.worker_thread: threading.Thread | None = None
         self.worker_process: subprocess.Popen[str] | None = None
         self.upload_monitor_thread: threading.Thread | None = None
+        self.worker_processes: list[subprocess.Popen[str]] = []
+        self.upload_monitor_threads: list[threading.Thread] = []
         self._audience_data_url: str = ""
         self._state = self._load_state()
         self.window_tasks: list[WindowTask] = []
@@ -573,9 +575,11 @@ class DashboardApp(ctk.CTk):
             row=1, column=5, sticky="ew", padx=(0, 16), pady=(0, 10)
         )
         ctk.CTkLabel(group_frame, text="文案来源").grid(row=2, column=0, sticky="w", padx=(16, 8), pady=(0, 10))
-        ctk.CTkOptionMenu(group_frame, variable=self.metadata_mode_var, values=METADATA_MODE_VALUES).grid(
-            row=2, column=1, sticky="ew", padx=(0, 12), pady=(0, 10)
-        )
+        ctk.CTkLabel(
+            group_frame,
+            text="提示词那套（唯一文案来源）",
+            text_color="#d7e3f4",
+        ).grid(row=2, column=1, sticky="w", padx=(0, 12), pady=(0, 10))
         ctk.CTkSwitch(group_frame, text="生成标题/简介/标签", variable=self.generate_text_var).grid(
             row=2, column=2, sticky="w", padx=(0, 12), pady=(0, 10)
         )
@@ -1145,7 +1149,7 @@ class DashboardApp(ctk.CTk):
             "generate_text": bool(self.generate_text_var.get()),
             "generate_thumbnails": bool(self.generate_thumbnails_var.get()),
             "sync_daily_content": bool(self.sync_daily_content_var.get()),
-            "metadata_mode": METADATA_MODE_LABELS.get(self.metadata_mode_var.get(), "prompt_api"),
+            "metadata_mode": "prompt_api",
             "current_group": self.current_group_var.get(),
             "source_dir_override": self.source_dir_override_var.get(),
             "add_ypp": self.add_ypp_var.get(),
@@ -1187,10 +1191,19 @@ class DashboardApp(ctk.CTk):
             self.log_box.insert("end", message + "\n")
             self.log_box.see("end")
             self._update_run_status_from_log(message)
+        while True:
+            try:
+                action = self.ui_action_queue.get_nowait()
+            except queue.Empty:
+                break
+            action()
         self.after(150, self._drain_log_queue)
 
     def _log(self, message: str) -> None:
         self.log_queue.put(message)
+
+    def _post_ui_action(self, action: Callable[[], None]) -> None:
+        self.ui_action_queue.put(action)
 
     def _clear_logs(self) -> None:
         self.log_box.delete("1.0", "end")
@@ -1335,7 +1348,12 @@ class DashboardApp(ctk.CTk):
             f"预计剩余: {self.run_eta_var.get()}",
             f"最近日志: {self.run_last_log_var.get()}",
         ]
-        if (self.worker_thread and self.worker_thread.is_alive()) or self.worker_process is not None:
+        if (
+            (self.worker_thread and self.worker_thread.is_alive())
+            or self.worker_process is not None
+            or bool(self.worker_processes)
+            or any(thread.is_alive() for thread in self.upload_monitor_threads)
+        ):
             parts.append("说明: 你可以继续切换其他页面查看或改配置；新的开始任务会等当前流程结束")
         return "\n".join(parts)
 
@@ -1623,9 +1641,6 @@ class DashboardApp(ctk.CTk):
         }
 
     def _persist_prompt_form_for_active_tasks(self) -> None:
-        if METADATA_MODE_LABELS.get(self.metadata_mode_var.get(), "prompt_api") != "prompt_api":
-            return
-
         task_tags = sorted({task.tag.strip() for task in self.window_tasks if task.tag.strip()})
         if not task_tags:
             return
@@ -1890,7 +1905,7 @@ class DashboardApp(ctk.CTk):
             schedule_start=self._compose_default_schedule(),
             schedule_interval_minutes=int(self.schedule_interval_var.get().strip() or "60"),
             schedule_timezone=self.schedule_timezone_var.get().strip() or SCHEDULE_TIMEZONE_VALUES[0],
-            metadata_mode=METADATA_MODE_LABELS.get(self.metadata_mode_var.get(), "prompt_api"),
+            metadata_mode="prompt_api",
             generate_text=bool(self.generate_text_var.get()),
             generate_thumbnails=bool(self.generate_thumbnails_var.get()),
             sync_daily_content=bool(self.sync_daily_content_var.get()),
@@ -2020,6 +2035,103 @@ class DashboardApp(ctk.CTk):
         plan_path = save_window_plan(plan, run_plan.defaults.date_mmdd)
         tags, skip_channels = derive_tags_and_skip_channels(plan, lambda tag: get_tag_info(tag) or {})
         retain_days = str(self.cleanup_days_var.get().strip() or "5")
+        ordered_targets: list[tuple[str, int]] = []
+        seen_targets: set[tuple[str, int]] = set()
+        for task in run_plan.tasks:
+            clean_tag = str(task.tag or "").strip()
+            key = (clean_tag, int(task.serial))
+            if not clean_tag or key in seen_targets:
+                continue
+            seen_targets.add(key)
+            ordered_targets.append(key)
+
+        if len(ordered_targets) > 1 and detach:
+            processes: list[tuple[str, subprocess.Popen[str]]] = []
+            for tag_name, serial in ordered_targets:
+                per_cmd = [
+                    sys.executable,
+                    "-u",
+                    str(UPLOAD_SCRIPT),
+                    "--tag",
+                    tag_name,
+                    "--date",
+                    run_plan.defaults.date_mmdd,
+                    "--channel",
+                    str(serial),
+                    "--auto-confirm",
+                    "--window-plan-file",
+                    str(plan_path),
+                    "--retain-video-days",
+                    retain_days,
+                ]
+                if self.upload_auto_close_var.get():
+                    per_cmd.append("--auto-close-browser")
+                self._log("[Upload] " + " ".join(per_cmd))
+                proc = subprocess.Popen(
+                    per_cmd,
+                    cwd=str(SCRIPT_DIR),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                processes.append((f"{tag_name}/{serial}", proc))
+
+            self.worker_process = None
+            self.upload_monitor_thread = None
+            self.worker_processes = [proc for _label, proc in processes]
+            self.upload_monitor_threads = []
+            self._log(f"[Upload] Parallel upload started for {len(processes)} windows")
+
+            completion_lock = threading.Lock()
+            state = {"remaining": len(processes), "failures": []}
+
+            def finalize_if_done() -> None:
+                with completion_lock:
+                    if state["remaining"] != 0:
+                        return
+                    failures = list(state["failures"])
+                    self.worker_processes = []
+                    self.upload_monitor_threads = []
+                if failures:
+                    summary = " | ".join(failures[:3])
+                    self._post_ui_action(lambda: self._finish_run_tracking(success=False, summary=summary))
+                    self._post_ui_action(lambda: messagebox.showerror("Upload Failed", summary))
+                else:
+                    self._post_ui_action(lambda: self._finish_run_tracking(success=True, summary="Parallel upload finished"))
+
+            def make_reader(label: str, proc: subprocess.Popen[str]):
+                def reader() -> None:
+                    error_text = ""
+                    try:
+                        assert proc.stdout is not None
+                        for line in proc.stdout:
+                            self._log(f"[Upload {label}] {line.rstrip()}")
+                        return_code = proc.wait()
+                        if return_code != 0:
+                            error_text = f"{label} exit {return_code}"
+                    except Exception as exc:
+                        error_text = f"{label}: {exc}"
+                    finally:
+                        with completion_lock:
+                            state["remaining"] -= 1
+                            try:
+                                self.worker_processes.remove(proc)
+                            except ValueError:
+                                pass
+                            if error_text:
+                                state["failures"].append(error_text)
+                    finalize_if_done()
+
+                return reader
+
+            for label, proc in processes:
+                thread = threading.Thread(target=make_reader(label, proc), daemon=True)
+                self.upload_monitor_threads.append(thread)
+                thread.start()
+            return True
+
         cmd = [
             sys.executable,
             "-u",
@@ -2069,10 +2181,10 @@ class DashboardApp(ctk.CTk):
                     self.upload_monitor_thread = None
 
                 if error_text:
-                    self.after(0, lambda: self._finish_run_tracking(success=False, summary=error_text))
-                    self.after(0, lambda: messagebox.showerror("上传任务失败", error_text))
+                    self._post_ui_action(lambda: self._finish_run_tracking(success=False, summary=error_text))
+                    self._post_ui_action(lambda: messagebox.showerror("上传任务失败", error_text))
                 else:
-                    self.after(0, lambda: self._finish_run_tracking(success=True, summary="上传流程已结束"))
+                    self._post_ui_action(lambda: self._finish_run_tracking(success=True, summary="上传流程已结束"))
 
             self.upload_monitor_thread = threading.Thread(target=reader, daemon=True)
             self.upload_monitor_thread.start()
@@ -2156,6 +2268,8 @@ class DashboardApp(ctk.CTk):
             (self.worker_thread and self.worker_thread.is_alive())
             or (self.upload_monitor_thread and self.upload_monitor_thread.is_alive())
             or self.worker_process is not None
+            or bool(self.worker_processes)
+            or any(thread.is_alive() for thread in self.upload_monitor_threads)
         ):
             messagebox.showinfo("任务进行中", self._current_run_summary())
             return
@@ -2167,12 +2281,12 @@ class DashboardApp(ctk.CTk):
                 deferred_finish = bool(func())
             except Exception as exc:
                 self._log(f"[错误] {exc}")
-                self.after(0, lambda: self._finish_run_tracking(success=False, summary=str(exc)))
-                self.after(0, lambda: messagebox.showerror("任务失败", str(exc)))
+                self._post_ui_action(lambda: self._finish_run_tracking(success=False, summary=str(exc)))
+                self._post_ui_action(lambda: messagebox.showerror("任务失败", str(exc)))
                 return
             if deferred_finish:
                 return
-            self.after(0, lambda: self._finish_run_tracking(success=True, summary="任务已执行完成"))
+            self._post_ui_action(lambda: self._finish_run_tracking(success=True, summary="任务已执行完成"))
 
         self.worker_thread = threading.Thread(target=runner, daemon=True)
         self.worker_thread.start()
@@ -2375,7 +2489,7 @@ class DashboardApp(ctk.CTk):
             schedule_start=self._compose_default_schedule(),
             schedule_interval_minutes=int(self.schedule_interval_var.get().strip() or "60"),
             schedule_timezone=self.schedule_timezone_var.get().strip() or SCHEDULE_TIMEZONE_VALUES[0],
-            metadata_mode=METADATA_MODE_LABELS.get(self.metadata_mode_var.get(), "prompt_api"),
+            metadata_mode="prompt_api",
             generate_text=bool(modules["metadata"] and self.generate_text_var.get()),
             generate_thumbnails=bool(modules["metadata"] and self.generate_thumbnails_var.get()),
             sync_daily_content=bool(modules["metadata"] and self.sync_daily_content_var.get()),

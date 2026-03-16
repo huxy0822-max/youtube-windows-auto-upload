@@ -11,10 +11,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from content_generation import (
-    append_metadata_history,
     call_image_model,
     generate_content_bundle,
-    get_recent_metadata_history,
     save_data_url_image,
 )
 from browser_api import list_browser_envs
@@ -31,6 +29,7 @@ from daily_scheduler import (
 )
 from effects_library import get_effect
 from group_upload_workflow import IMAGE_EXTENSIONS, load_channel_name_map, normalize_mmdd
+from metadata_service import get_used_metadata_scope, record_used_metadata
 from path_helpers import normalize_scheduler_config
 from prompt_studio import (
     default_api_preset,
@@ -1141,7 +1140,7 @@ def refresh_existing_output_metadata(
             thumbnail_prompts: list[str] = []
             bundle = None
 
-            history_scope = get_recent_metadata_history(tag, limit=24)
+            history_scope = get_used_metadata_scope(tag, config=cfg)
             unique_seed = _build_unique_seed(
                 defaults.date_mmdd,
                 tag,
@@ -1225,12 +1224,17 @@ def refresh_existing_output_metadata(
                 )
 
             if defaults.generate_text or defaults.generate_thumbnails:
-                append_metadata_history(
+                record_used_metadata(
                     tag=tag,
                     title=title,
                     description=description,
                     tag_list=tag_list,
                     thumbnail_prompts=thumbnail_prompts,
+                    config=cfg,
+                    serial=task.serial,
+                    date_mmdd=defaults.date_mmdd,
+                    thumbnails=cover_paths,
+                    source="metadata_refresh",
                 )
                 current_titles.append(title)
                 if description:
@@ -1344,7 +1348,7 @@ def execute_metadata_only_workflow(
 
         for task, source_image, source_audio in paired:
             legacy = _load_daily_entry(tag_metadata_dir, defaults.date_mmdd, task.serial)
-            history_scope = get_recent_metadata_history(tag, limit=24)
+            history_scope = get_used_metadata_scope(tag, config=config)
             unique_seed = _build_unique_seed(
                 defaults.date_mmdd,
                 tag,
@@ -1441,12 +1445,17 @@ def execute_metadata_only_workflow(
                 covers=[path.name for path in cover_paths],
                 ab_titles=ab_titles,
             )
-            append_metadata_history(
+            record_used_metadata(
                 tag=tag,
                 title=title,
                 description=description,
                 tag_list=tag_list,
                 thumbnail_prompts=thumbnail_prompts,
+                config=config,
+                serial=task.serial,
+                date_mmdd=defaults.date_mmdd,
+                thumbnails=cover_paths,
+                source="metadata_only",
             )
             current_titles.append(title)
             if description:
@@ -1746,7 +1755,7 @@ def execute_direct_media_workflow(
                 cover_paths = [source_image]
                 cover_source = "source_image"
             thumbnail_prompts: list[str] = []
-            history_scope = get_recent_metadata_history(tag, limit=24)
+            history_scope = get_used_metadata_scope(tag, config=config)
             unique_seed = _build_unique_seed(
                 defaults.date_mmdd,
                 tag,
@@ -1825,12 +1834,17 @@ def execute_direct_media_workflow(
                     ab_titles=ab_titles,
                 )
 
-            append_metadata_history(
+            record_used_metadata(
                 tag=tag,
                 title=title,
                 description=description,
                 tag_list=tag_list,
                 thumbnail_prompts=thumbnail_prompts,
+                config=config,
+                serial=task.serial,
+                date_mmdd=defaults.date_mmdd,
+                thumbnails=cover_paths,
+                source="render",
             )
             current_titles.append(title)
             if description:
@@ -2153,7 +2167,7 @@ def execute_metadata_only_workflow(
 
         for task, source_image, source_audio in paired:
             legacy = _load_daily_entry(state["metadata_dir"], defaults.date_mmdd, task.serial)
-            history_scope = get_recent_metadata_history(tag, limit=24)
+            history_scope = get_used_metadata_scope(tag, config=config)
             unique_seed = _build_unique_seed(
                 defaults.date_mmdd,
                 tag,
@@ -2231,12 +2245,17 @@ def execute_metadata_only_workflow(
                 covers=[path.name for path in cover_paths],
                 ab_titles=ab_titles,
             )
-            append_metadata_history(
+            record_used_metadata(
                 tag=tag,
                 title=title,
                 description=description,
                 tag_list=tag_list,
                 thumbnail_prompts=thumbnail_prompts,
+                config=config,
+                serial=task.serial,
+                date_mmdd=defaults.date_mmdd,
+                thumbnails=cover_paths,
+                source="metadata_only",
             )
             state["titles"].append(title)
             if description:
@@ -2398,7 +2417,7 @@ def execute_direct_media_workflow(
                 cover_paths = [source_image]
                 cover_source = "source_image"
             thumbnail_prompts: list[str] = []
-            history_scope = get_recent_metadata_history(tag, limit=24)
+            history_scope = get_used_metadata_scope(tag, config=config)
             unique_seed = _build_unique_seed(
                 defaults.date_mmdd,
                 tag,
@@ -2488,12 +2507,17 @@ def execute_direct_media_workflow(
                     ab_titles=ab_titles,
                 )
 
-            append_metadata_history(
+            record_used_metadata(
                 tag=tag,
                 title=title,
                 description=description,
                 tag_list=tag_list,
                 thumbnail_prompts=thumbnail_prompts,
+                config=config,
+                serial=task.serial,
+                date_mmdd=defaults.date_mmdd,
+                thumbnails=cover_paths,
+                source="render",
             )
             state["titles"].append(title)
             if description:

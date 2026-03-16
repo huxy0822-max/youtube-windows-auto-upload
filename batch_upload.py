@@ -23,6 +23,7 @@ from typing import Optional, List, Dict, Any
 import platform
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 from browser_api import list_browser_envs, start_browser_debug_port, stop_browser_container
+from metadata_service import archive_uploaded_metadata
 from path_helpers import resolve_config_file
 from upload_window_planner import (
     find_window_task,
@@ -6938,6 +6939,7 @@ async def batch_upload(
             continue
         
         # ========== Manifest 模式: 直接读取冻结数据 ==========
+        thumbnail_prompts = []
         if manifest_data and str(serial) in manifest_data.get("channels", {}):
             ch_manifest = manifest_data["channels"][str(serial)]
             ch_manifest = merge_manifest_with_window_task(
@@ -6949,6 +6951,7 @@ async def batch_upload(
             title = ch_manifest.get("title", "Video Title")
             description = ch_manifest.get("description", "")
             tag_list = [str(item).strip() for item in ch_manifest.get("tag_list", []) if str(item).strip()]
+            thumbnail_prompts = [str(item).strip() for item in ch_manifest.get("thumbnail_prompts", []) if str(item).strip()]
             upload_options = ch_manifest.get("upload_options", {}) if isinstance(ch_manifest.get("upload_options", {}), dict) else {}
             visibility = str(upload_options.get("visibility") or "public").strip().lower()
             scheduled_publish_at = str(upload_options.get("scheduled_publish_at") or "").strip() or None
@@ -7087,6 +7090,23 @@ async def batch_upload(
             # 封面归档已取消 - base image 按日期命名不会重复使用
             
             # === 删除视频文件：上传成功后释放磁盘空间 ===
+            try:
+                archive_uploaded_metadata(
+                    tag=tag,
+                    serial=serial,
+                    date_mmdd=date_key,
+                    title=title,
+                    description=description,
+                    tag_list=tag_list,
+                    thumbnail_prompts=thumbnail_prompts,
+                    thumbnails=thumbnails,
+                    config=config,
+                    move_files=True,
+                    log=lambda message: log(message, "INFO"),
+                )
+            except Exception as e:
+                log(f"Metadata archive failed (non-fatal): {e}", "WARN")
+
             try:
                 if video.exists():
                     if retain_video_days > 0:
