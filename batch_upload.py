@@ -500,6 +500,196 @@ async def ensure_upload_radio_selected(
 
     radio_locator = page.locator(f"tp-yt-paper-radio-button[name='{radio_name}']")
 
+    def _fallback_patterns() -> tuple[list[str], list[str]]:
+        normalized = str(radio_name or "").strip().upper()
+        mapping: dict[str, tuple[list[str], list[str]]] = {
+            "VIDEO_HAS_ALTERED_CONTENT_YES": (
+                [r"altered\s+content", r"synthetic", r"ai\s*content", r"合成内容", r"ai内容", r"ai內容"],
+                [r"(?:^|\b)yes(?:\b|$)", r"是"],
+            ),
+            "VIDEO_HAS_ALTERED_CONTENT_NO": (
+                [r"altered\s+content", r"synthetic", r"ai\s*content", r"合成内容", r"ai内容", r"ai內容"],
+                [r"(?:^|\b)no(?:\b|$)", r"否"],
+            ),
+            "VIDEO_MADE_FOR_KIDS_MFK": (
+                [r"made\s+for\s+kids", r"儿童", r"兒童", r"kid"],
+                [r"(?:^|\b)yes(?:\b|$)", r"是"],
+            ),
+            "VIDEO_MADE_FOR_KIDS_NOT_MFK": (
+                [r"made\s+for\s+kids", r"儿童", r"兒童", r"kid"],
+                [r"(?:^|\b)no(?:\b|$)", r"否"],
+            ),
+            "PUBLIC": (
+                [r"visibility", r"可见度", r"可見度", r"谁可以观看", r"who\s+can\s+watch"],
+                [r"(?:^|\b)public(?:\b|$)", r"(?:^|\b)everyone(?:\b|$)", r"公开", r"公開"],
+            ),
+            "PRIVATE": (
+                [r"visibility", r"可见度", r"可見度", r"谁可以观看", r"who\s+can\s+watch"],
+                [r"(?:^|\b)private(?:\b|$)", r"私密"],
+            ),
+            "UNLISTED": (
+                [r"visibility", r"可见度", r"可見度", r"谁可以观看", r"who\s+can\s+watch"],
+                [r"(?:^|\b)unlisted(?:\b|$)", r"不公开", r"不公開"],
+            ),
+            "SCHEDULE": (
+                [r"visibility", r"可见度", r"可見度", r"谁可以观看", r"who\s+can\s+watch"],
+                [r"(?:^|\b)schedule(?:d)?(?:\b|$)", r"定时", r"定時", r"排程"],
+            ),
+        }
+        return mapping.get(normalized, ([], []))
+
+    async def _dom_locate_and_maybe_click(
+        section_patterns: list[str],
+        option_patterns: list[str],
+        *,
+        do_click: bool,
+    ) -> Dict[str, Any]:
+        if not section_patterns or not option_patterns:
+            return {"found": False, "selected": False, "clicked": False, "label": "", "context": ""}
+        try:
+            return await page.evaluate(
+                """
+                ({ sectionPatterns, optionPatterns, doClick }) => {
+                    const visible = (el) => !!el && (
+                        el.offsetParent !== null ||
+                        el.offsetWidth > 0 ||
+                        el.offsetHeight > 0 ||
+                        el.getClientRects().length > 0
+                    );
+                    const textOf = (el) => ((el && (el.innerText || el.textContent)) || "").trim();
+                    const attrOf = (el) => [
+                        el?.getAttribute?.("aria-label") || "",
+                        el?.getAttribute?.("label") || "",
+                        el?.getAttribute?.("name") || "",
+                        el?.getAttribute?.("title") || "",
+                        el?.id || "",
+                    ].join(" ").trim();
+                    const sectionRe = new RegExp(sectionPatterns.join("|"), "i");
+                    const optionRe = new RegExp(optionPatterns.join("|"), "i");
+                    const roots = [document];
+                    const seenRoots = new Set([document]);
+                    const seenHosts = new Set();
+
+                    const isSelected = (el) => {
+                        if (!el) return false;
+                        if (el instanceof HTMLInputElement && el.type === "radio") {
+                            return !!el.checked;
+                        }
+                        const nodes = [el, el.querySelector?.("[role='radio']"), el.querySelector?.("input[type='radio']")].filter(Boolean);
+                        return nodes.some((node) =>
+                            node.getAttribute?.("aria-checked") === "true" ||
+                            node.hasAttribute?.("checked") ||
+                            node.classList?.contains?.("checked") ||
+                            node.checked === true
+                        );
+                    };
+
+                    const clickEl = (el) => {
+                        if (!(el instanceof HTMLElement)) return false;
+                        try {
+                            el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+                        } catch (_) {}
+                        try { el.click(); } catch (_) {}
+                        for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+                            try {
+                                el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, composed: true }));
+                            } catch (_) {}
+                        }
+                        return true;
+                    };
+
+                    const candidates = [];
+                    while (roots.length) {
+                        const root = roots.shift();
+                        const allNodes = root.querySelectorAll ? root.querySelectorAll("*") : [];
+                        for (const node of allNodes) {
+                            if (node && node.shadowRoot && !seenRoots.has(node.shadowRoot)) {
+                                seenRoots.add(node.shadowRoot);
+                                roots.push(node.shadowRoot);
+                            }
+                        }
+                        const radios = root.querySelectorAll
+                            ? root.querySelectorAll("tp-yt-paper-radio-button, [role='radio'], input[type='radio']")
+                            : [];
+                        for (const raw of radios) {
+                            const host =
+                                raw.closest?.("tp-yt-paper-radio-button") ||
+                                raw.closest?.("[role='radio']") ||
+                                raw;
+                            if (!host || seenHosts.has(host)) continue;
+                            seenHosts.add(host);
+                            if (!visible(host) && !visible(raw)) continue;
+
+                            const labelText = [
+                                textOf(host.querySelector?.("#radioLabel")),
+                                textOf(host.querySelector?.("label")),
+                                textOf(host),
+                                textOf(host.nextElementSibling),
+                                textOf(host.previousElementSibling),
+                                attrOf(host),
+                                attrOf(raw),
+                            ].join(" ").trim();
+
+                            let context = labelText;
+                            let current = host.parentElement;
+                            for (let depth = 0; current && depth < 6; depth += 1, current = current.parentElement) {
+                                context += " " + textOf(current) + " " + attrOf(current);
+                            }
+                            if (!sectionRe.test(context)) continue;
+                            if (!optionRe.test(labelText) && !optionRe.test(context)) continue;
+
+                            const score =
+                                (optionRe.test(labelText) ? 10 : 0) +
+                                (sectionRe.test(labelText) ? 4 : 0) +
+                                (sectionRe.test(context) ? 3 : 0);
+                            candidates.push({ host, raw, labelText, context, score });
+                        }
+                    }
+
+                    if (!candidates.length) {
+                        return { found: false, selected: false, clicked: false, label: "", context: "" };
+                    }
+
+                    candidates.sort((a, b) => b.score - a.score);
+                    const best = candidates[0];
+                    let selected = isSelected(best.host) || isSelected(best.raw);
+                    let clicked = false;
+                    if (!selected && doClick) {
+                        const targets = [
+                            best.host.querySelector?.("[role='radio']"),
+                            best.host.querySelector?.("#radioContainer"),
+                            best.host.querySelector?.("#radioLabel"),
+                            best.host.querySelector?.("label"),
+                            best.host,
+                            best.raw,
+                        ].filter(Boolean);
+                        for (const target of targets) {
+                            if (clickEl(target)) {
+                                clicked = true;
+                                break;
+                            }
+                        }
+                        selected = isSelected(best.host) || isSelected(best.raw);
+                    }
+
+                    return {
+                        found: true,
+                        selected,
+                        clicked,
+                        label: (best.labelText || "").trim(),
+                        context: (best.context || "").trim().slice(0, 240),
+                    };
+                }
+                """,
+                {
+                    "sectionPatterns": section_patterns,
+                    "optionPatterns": option_patterns,
+                    "doClick": do_click,
+                },
+            )
+        except Exception:
+            return {"found": False, "selected": False, "clicked": False, "label": "", "context": ""}
+
     async def _is_selected(single_radio) -> bool:
         try:
             return bool(
@@ -524,6 +714,8 @@ async def ensure_upload_radio_selected(
             )
         except Exception:
             return False
+
+    section_patterns, option_patterns = _fallback_patterns()
 
     for attempt in range(1, max_attempts + 1):
         await clear_blocking_overlays(page, f"radio-{radio_name}-{attempt}")
@@ -558,6 +750,12 @@ async def ensure_upload_radio_selected(
         if selected_before_click:
             if attempt > 1:
                 log(f"{description} 已确认选中 (already_selected)", "OK")
+            return True
+
+        dom_state = await _dom_locate_and_maybe_click(section_patterns, option_patterns, do_click=False)
+        if dom_state.get("selected"):
+            if attempt > 1:
+                log(f"{description} 已确认选中 (dom_probe:{dom_state.get('label', '')})", "OK")
             return True
 
         clicked = False
@@ -600,6 +798,15 @@ async def ensure_upload_radio_selected(
             radio = radio_locator.nth(idx)
             if await _is_selected(radio):
                 log(f"{description} 已确认选中 (playwright_verify)", "OK")
+                return True
+
+        dom_clicked = await _dom_locate_and_maybe_click(section_patterns, option_patterns, do_click=True)
+        if dom_clicked.get("clicked"):
+            log(f"{description} DOM 兜底点击: {dom_clicked.get('label', '')}", "INFO")
+            await asyncio.sleep(0.9)
+            dom_verify = await _dom_locate_and_maybe_click(section_patterns, option_patterns, do_click=False)
+            if dom_verify.get("selected"):
+                log(f"{description} 已确认选中 (dom_verify:{dom_verify.get('label', '')})", "OK")
                 return True
 
         await asyncio.sleep(0.6)
@@ -1302,6 +1509,426 @@ async def set_video_category_music(page, max_attempts: int = 5) -> bool:
         verify = await _read_state()
         log(
             f"Category strict verify#{attempt}: found={verify.get('found')} selected={verify.get('selected')} value={verify.get('value', '')}",
+            "INFO",
+        )
+        if verify.get("selected"):
+            log(f"Category set to Music ({verify.get('value', '')})", "OK")
+            return True
+
+    log("Category still failed to become Music", "WARN")
+    return False
+
+
+async def set_video_category_music(page, max_attempts: int = 6) -> bool:
+    async def _read_state() -> Dict[str, Any]:
+        return await page.evaluate(
+            """
+            () => {
+                const visible = (el) => !!el && (
+                    el.offsetParent !== null ||
+                    el.offsetWidth > 0 ||
+                    el.offsetHeight > 0 ||
+                    el.getClientRects().length > 0
+                );
+                const textOf = (el) => ((el && (el.innerText || el.textContent)) || "").trim();
+                const attrOf = (el) => [
+                    el?.getAttribute?.("aria-label") || "",
+                    el?.getAttribute?.("label") || "",
+                    el?.getAttribute?.("title") || "",
+                    el?.getAttribute?.("name") || "",
+                    el?.id || "",
+                ].join(" ").trim();
+                const categoryRe = /category|分類|分类/i;
+                const excludeRe = /recording\\s*date|錄製日期|录制日期/i;
+                const musicRe = /(^|\\s)music(\\s|$)|音樂|音乐/i;
+                const roots = [document];
+                const seen = new Set([document]);
+                const candidates = [];
+
+                while (roots.length) {
+                    const root = roots.shift();
+                    const allNodes = root.querySelectorAll ? root.querySelectorAll("*") : [];
+                    for (const node of allNodes) {
+                        if (node && node.shadowRoot && !seen.has(node.shadowRoot)) {
+                            seen.add(node.shadowRoot);
+                            roots.push(node.shadowRoot);
+                        }
+                    }
+                    const nodes = Array.from(
+                        root.querySelectorAll
+                            ? root.querySelectorAll(
+                                "ytcp-form-select, tp-yt-paper-dropdown-menu, ytcp-dropdown-trigger, [aria-haspopup='listbox'], [role='combobox']"
+                            )
+                            : []
+                    ).filter(visible);
+                    for (const node of nodes) {
+                        const host =
+                            node.closest?.("ytcp-form-select") ||
+                            node.closest?.("tp-yt-paper-dropdown-menu") ||
+                            node;
+                        if (!host) continue;
+                        const contextParts = [];
+                        let current = host;
+                        for (let depth = 0; current && depth < 5; depth += 1, current = current.parentElement) {
+                            contextParts.push(textOf(current));
+                            contextParts.push(attrOf(current));
+                        }
+                        const context = contextParts.join(" ").trim();
+                        if (!categoryRe.test(context) || excludeRe.test(context)) continue;
+                        const trigger =
+                            host.querySelector?.("ytcp-dropdown-trigger") ||
+                            host.querySelector?.("[aria-haspopup='listbox']") ||
+                            host.querySelector?.("[role='combobox']") ||
+                            host.querySelector?.("#trigger") ||
+                            (node.matches?.("ytcp-dropdown-trigger, [aria-haspopup='listbox'], [role='combobox']") ? node : null) ||
+                            host;
+                        if (!trigger) continue;
+                        const selectedText = [
+                            textOf(host.querySelector?.("#label")),
+                            textOf(host.querySelector?.("yt-formatted-string#label")),
+                            textOf(trigger),
+                            textOf(host),
+                        ].join(" ").trim();
+                        candidates.push({
+                            value: selectedText,
+                            selected: musicRe.test(selectedText.toLowerCase()) || musicRe.test(selectedText),
+                            score:
+                                (categoryRe.test(textOf(host.querySelector?.("label")) || "") ? 8 : 0) +
+                                (categoryRe.test(context) ? 5 : 0) +
+                                (textOf(trigger) ? 1 : 0),
+                        });
+                    }
+                }
+
+                if (!candidates.length) {
+                    return { found: false, selected: false, value: "" };
+                }
+                candidates.sort((a, b) => b.score - a.score);
+                return {
+                    found: true,
+                    selected: !!candidates[0].selected,
+                    value: candidates[0].value || "",
+                };
+            }
+            """
+        )
+
+    async def _open_dropdown() -> bool:
+        return bool(
+            await page.evaluate(
+                """
+                () => {
+                    const visible = (el) => !!el && (
+                        el.offsetParent !== null ||
+                        el.offsetWidth > 0 ||
+                        el.offsetHeight > 0 ||
+                        el.getClientRects().length > 0
+                    );
+                    const textOf = (el) => ((el && (el.innerText || el.textContent)) || "").trim();
+                    const attrOf = (el) => [
+                        el?.getAttribute?.("aria-label") || "",
+                        el?.getAttribute?.("label") || "",
+                        el?.getAttribute?.("title") || "",
+                        el?.getAttribute?.("name") || "",
+                        el?.id || "",
+                    ].join(" ").trim();
+                    const categoryRe = /category|分類|分类/i;
+                    const excludeRe = /recording\\s*date|錄製日期|录制日期/i;
+                    const roots = [document];
+                    const seen = new Set([document]);
+                    const candidates = [];
+                    const clickEl = (el) => {
+                        if (!(el instanceof HTMLElement)) return false;
+                        try { el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" }); } catch (_) {}
+                        try { el.click(); } catch (_) {}
+                        for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+                            try {
+                                el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, composed: true }));
+                            } catch (_) {}
+                        }
+                        return true;
+                    };
+
+                    while (roots.length) {
+                        const root = roots.shift();
+                        const allNodes = root.querySelectorAll ? root.querySelectorAll("*") : [];
+                        for (const node of allNodes) {
+                            if (node && node.shadowRoot && !seen.has(node.shadowRoot)) {
+                                seen.add(node.shadowRoot);
+                                roots.push(node.shadowRoot);
+                            }
+                        }
+                        const nodes = Array.from(
+                            root.querySelectorAll
+                                ? root.querySelectorAll(
+                                    "ytcp-form-select, tp-yt-paper-dropdown-menu, ytcp-dropdown-trigger, [aria-haspopup='listbox'], [role='combobox']"
+                                )
+                                : []
+                        ).filter(visible);
+                        for (const node of nodes) {
+                            const host =
+                                node.closest?.("ytcp-form-select") ||
+                                node.closest?.("tp-yt-paper-dropdown-menu") ||
+                                node;
+                            if (!host) continue;
+                            const contextParts = [];
+                            let current = host;
+                            for (let depth = 0; current && depth < 5; depth += 1, current = current.parentElement) {
+                                contextParts.push(textOf(current));
+                                contextParts.push(attrOf(current));
+                            }
+                            const context = contextParts.join(" ").trim();
+                            if (!categoryRe.test(context) || excludeRe.test(context)) continue;
+                            const trigger =
+                                host.querySelector?.("ytcp-dropdown-trigger") ||
+                                host.querySelector?.("[aria-haspopup='listbox']") ||
+                                host.querySelector?.("[role='combobox']") ||
+                                host.querySelector?.("#trigger") ||
+                                (node.matches?.("ytcp-dropdown-trigger, [aria-haspopup='listbox'], [role='combobox']") ? node : null) ||
+                                host;
+                            if (!trigger || (!visible(trigger) && !visible(host))) continue;
+                            candidates.push({
+                                trigger,
+                                score:
+                                    (categoryRe.test(textOf(host.querySelector?.("label")) || "") ? 8 : 0) +
+                                    (categoryRe.test(context) ? 5 : 0) +
+                                    (textOf(trigger) ? 1 : 0),
+                            });
+                        }
+                    }
+
+                    if (!candidates.length) return false;
+                    candidates.sort((a, b) => b.score - a.score);
+                    for (const candidate of candidates) {
+                        if (clickEl(candidate.trigger)) return true;
+                    }
+                    return false;
+                }
+                """
+            )
+        )
+
+    async def _pick_music_option() -> bool:
+        selectors = [
+            "tp-yt-paper-item:has-text('Music')",
+            "[role='option']:has-text('Music')",
+            "[role='menuitemradio']:has-text('Music')",
+            "ytcp-menu-service-item-renderer:has-text('Music')",
+            "tp-yt-paper-item:has-text('音樂')",
+            "[role='option']:has-text('音樂')",
+            "[role='menuitemradio']:has-text('音樂')",
+            "ytcp-menu-service-item-renderer:has-text('音樂')",
+            "tp-yt-paper-item:has-text('音乐')",
+            "[role='option']:has-text('音乐')",
+            "[role='menuitemradio']:has-text('音乐')",
+            "ytcp-menu-service-item-renderer:has-text('音乐')",
+        ]
+        for selector in selectors:
+            try:
+                locator = page.locator(selector).last
+                if await locator.count() == 0 or not await locator.is_visible():
+                    continue
+                if await human_click(page, locator, f"Category option ({selector})"):
+                    return True
+                await locator.click(force=True, timeout=3000)
+                return True
+            except Exception:
+                continue
+        try:
+            result = await page.evaluate(
+                """
+                () => {
+                    const visible = (el) => !!el && (
+                        el.offsetParent !== null ||
+                        el.offsetWidth > 0 ||
+                        el.offsetHeight > 0 ||
+                        el.getClientRects().length > 0
+                    );
+                    const textOf = (el) => ((el && (el.innerText || el.textContent)) || "").trim();
+                    const musicRe = /(^|\\s)music(\\s|$)|音樂|音乐/i;
+                    const clickEl = (el) => {
+                        if (!(el instanceof HTMLElement)) return false;
+                        try { el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" }); } catch (_) {}
+                        try { el.click(); } catch (_) {}
+                        for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+                            try {
+                                el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, composed: true }));
+                            } catch (_) {}
+                        }
+                        return true;
+                    };
+                    const nodes = Array.from(
+                        document.querySelectorAll(
+                            "tp-yt-paper-item, [role='option'], [role='menuitemradio'], ytcp-menu-service-item-renderer"
+                        )
+                    ).filter(visible);
+                    for (const node of nodes) {
+                        if (!musicRe.test(textOf(node))) continue;
+                        if (clickEl(node)) return true;
+                    }
+                    return false;
+                }
+                """
+            )
+            if result:
+                return True
+        except Exception:
+            pass
+        return False
+
+    for attempt in range(1, max_attempts + 1):
+        await clear_blocking_overlays(page, f"category-final-{attempt}")
+        try:
+            await page.mouse.wheel(0, 700)
+        except Exception:
+            pass
+        state = await _read_state()
+        log(
+            f"Category final check#{attempt}: found={state.get('found')} selected={state.get('selected')} value={state.get('value', '')}",
+            "INFO",
+        )
+        if state.get("selected"):
+            log(f"Category confirmed as Music ({state.get('value', '')})", "OK")
+            return True
+        opened = await _open_dropdown()
+        log(f"Category final open#{attempt}: opened={opened}", "INFO")
+        if not opened:
+            await asyncio.sleep(0.8)
+            continue
+        await asyncio.sleep(1.0)
+        picked = await _pick_music_option()
+        log(f"Category final pick#{attempt}: picked={picked}", "INFO")
+        if not picked:
+            try:
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass
+            await asyncio.sleep(0.8)
+            continue
+        await asyncio.sleep(1.0)
+        verify = await _read_state()
+        log(
+            f"Category final verify#{attempt}: found={verify.get('found')} selected={verify.get('selected')} value={verify.get('value', '')}",
+            "INFO",
+        )
+        if verify.get("selected"):
+            log(f"Category set to Music ({verify.get('value', '')})", "OK")
+            return True
+    log("Category still failed to become Music", "WARN")
+    return False
+
+
+async def set_video_category_music(page, max_attempts: int = 6) -> bool:
+    music_re = re.compile(r"(^|\s)music(\s|$)|音樂|音乐", re.I)
+
+    async def _read_direct_state() -> Dict[str, Any]:
+        texts: list[str] = []
+        found = False
+        for selector in ("#category-container", "ytcp-form-select#category", "#category"):
+            locator = page.locator(selector).first
+            try:
+                if await locator.count() == 0 or not await locator.is_visible():
+                    continue
+                found = True
+                text = (await locator.inner_text()).strip()
+                if text:
+                    texts.append(text)
+            except Exception:
+                continue
+        value = " | ".join(texts).strip()
+        return {"found": found, "selected": bool(music_re.search(value)), "value": value}
+
+    async def _open_direct_dropdown() -> bool:
+        selectors = [
+            "#category [aria-haspopup='listbox']",
+            "#category-container [aria-haspopup='listbox']",
+            "ytcp-form-select#category",
+            "#category",
+            "#category-container",
+        ]
+        for selector in selectors:
+            locator = page.locator(selector).first
+            try:
+                if await locator.count() == 0 or not await locator.is_visible():
+                    continue
+                await locator.scroll_into_view_if_needed()
+                if await human_click(page, locator, f"Category direct ({selector})"):
+                    return True
+                await locator.click(force=True, timeout=3000)
+                return True
+            except Exception:
+                continue
+        return False
+
+    async def _pick_direct_music() -> bool:
+        selectors = [
+            "tp-yt-paper-item:has-text('Music')",
+            "[role='option']:has-text('Music')",
+            "[role='menuitemradio']:has-text('Music')",
+            "ytcp-menu-service-item-renderer:has-text('Music')",
+            "tp-yt-paper-item:has-text('音樂')",
+            "[role='option']:has-text('音樂')",
+            "[role='menuitemradio']:has-text('音樂')",
+            "ytcp-menu-service-item-renderer:has-text('音樂')",
+            "tp-yt-paper-item:has-text('音乐')",
+            "[role='option']:has-text('音乐')",
+            "[role='menuitemradio']:has-text('音乐')",
+            "ytcp-menu-service-item-renderer:has-text('音乐')",
+        ]
+        for selector in selectors:
+            locator = page.locator(selector).last
+            try:
+                if await locator.count() == 0 or not await locator.is_visible():
+                    continue
+                if await human_click(page, locator, f"Category option ({selector})"):
+                    return True
+                await locator.click(force=True, timeout=3000)
+                return True
+            except Exception:
+                continue
+        return False
+
+    for attempt in range(1, max_attempts + 1):
+        await clear_blocking_overlays(page, f"category-direct-{attempt}")
+        try:
+            category_container = page.locator("#category-container").first
+            if await category_container.count() > 0 and await category_container.is_visible():
+                await category_container.scroll_into_view_if_needed()
+            else:
+                await page.mouse.wheel(0, 700)
+        except Exception:
+            pass
+
+        state = await _read_direct_state()
+        log(
+            f"Category direct check#{attempt}: found={state.get('found')} selected={state.get('selected')} value={state.get('value', '')}",
+            "INFO",
+        )
+        if state.get("selected"):
+            log(f"Category confirmed as Music ({state.get('value', '')})", "OK")
+            return True
+
+        opened = await _open_direct_dropdown()
+        log(f"Category direct open#{attempt}: opened={opened}", "INFO")
+        if not opened:
+            await asyncio.sleep(0.8)
+            continue
+
+        await asyncio.sleep(0.8)
+        picked = await _pick_direct_music()
+        log(f"Category direct pick#{attempt}: picked={picked}", "INFO")
+        if not picked:
+            try:
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass
+            await asyncio.sleep(0.8)
+            continue
+
+        await asyncio.sleep(1.0)
+        verify = await _read_direct_state()
+        log(
+            f"Category direct verify#{attempt}: found={verify.get('found')} selected={verify.get('selected')} value={verify.get('value', '')}",
             "INFO",
         )
         if verify.get("selected"):
@@ -6921,6 +7548,152 @@ async def set_video_category_music(page, max_attempts: int = 6) -> bool:
             await asyncio.sleep(0.8)
             continue
         await asyncio.sleep(1.0)
+        picked = await _pick_music_option()
+        log(f"Category final pick#{attempt}: picked={picked}", "INFO")
+        if not picked:
+            try:
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass
+            await asyncio.sleep(0.8)
+            continue
+        await asyncio.sleep(1.0)
+        verify = await _read_state()
+        log(
+            f"Category final verify#{attempt}: found={verify.get('found')} selected={verify.get('selected')} value={verify.get('value', '')}",
+            "INFO",
+        )
+        if verify.get("selected"):
+            log(f"Category set to Music ({verify.get('value', '')})", "OK")
+            return True
+    log("Category still failed to become Music", "WARN")
+    return False
+
+
+async def set_video_category(page, category: str) -> bool:
+    target = str(category or "").strip()
+    if not target:
+        return True
+    if target.lower() == "music":
+        return await set_video_category_music(page)
+    return False
+
+
+async def set_video_category_music(page, max_attempts: int = 6) -> bool:
+    music_markers = ("music", "闊虫▊", "闊充箰")
+
+    async def _read_state() -> Dict[str, Any]:
+        texts: list[str] = []
+        found = False
+        for selector in (
+            "#category-container",
+            "ytcp-form-select#category",
+            "#category",
+        ):
+            locator = page.locator(selector).first
+            try:
+                if await locator.count() == 0:
+                    continue
+                found = True
+                raw = (await locator.inner_text(timeout=2000)).strip()
+                if raw:
+                    texts.append(raw)
+            except Exception:
+                continue
+        combined = " | ".join(texts)
+        lowered = combined.lower()
+        return {
+            "found": found,
+            "selected": any(marker in lowered for marker in music_markers),
+            "value": combined,
+        }
+
+    async def _options_visible() -> bool:
+        for selector in (
+            "tp-yt-paper-item:has-text('Music')",
+            "[role='option']:has-text('Music')",
+            "[role='menuitem']:has-text('Music')",
+            "tp-yt-paper-item:has-text('People & Blogs')",
+            "[role='option']:has-text('People & Blogs')",
+        ):
+            locator = page.locator(selector).first
+            try:
+                if await locator.count() > 0 and await locator.is_visible():
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _open_dropdown() -> bool:
+        for selector in (
+            "ytcp-form-select#category",
+            "#category",
+            "#category-container",
+            "#category-container [aria-haspopup='listbox']",
+            "#category-container [role='button']",
+        ):
+            locator = page.locator(selector).first
+            try:
+                if await locator.count() == 0 or not await locator.is_visible():
+                    continue
+                try:
+                    await locator.scroll_into_view_if_needed(timeout=3000)
+                except Exception:
+                    pass
+                if await human_click(page, locator, f"Category trigger ({selector})"):
+                    await asyncio.sleep(0.8)
+                    if await _options_visible():
+                        return True
+                await locator.click(force=True, timeout=3000)
+                await asyncio.sleep(0.8)
+                if await _options_visible():
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _pick_music_option() -> bool:
+        for selector in (
+            "tp-yt-paper-item:has-text('Music')",
+            "[role='option']:has-text('Music')",
+            "[role='menuitem']:has-text('Music')",
+            "ytcp-menu-service-item-renderer:has-text('Music')",
+            "tp-yt-paper-item:has-text('闊虫▊')",
+            "[role='option']:has-text('闊虫▊')",
+            "tp-yt-paper-item:has-text('闊充箰')",
+            "[role='option']:has-text('闊充箰')",
+        ):
+            locator = page.locator(selector).first
+            try:
+                if await locator.count() == 0 or not await locator.is_visible():
+                    continue
+                if await human_click(page, locator, f"Category option ({selector})"):
+                    return True
+                await locator.click(force=True, timeout=3000)
+                return True
+            except Exception:
+                continue
+        return False
+
+    for attempt in range(1, max_attempts + 1):
+        await clear_blocking_overlays(page, f"category-final-{attempt}")
+        try:
+            await page.mouse.wheel(0, 550)
+        except Exception:
+            pass
+        state = await _read_state()
+        log(
+            f"Category final check#{attempt}: found={state.get('found')} selected={state.get('selected')} value={state.get('value', '')}",
+            "INFO",
+        )
+        if state.get("selected"):
+            log(f"Category confirmed as Music ({state.get('value', '')})", "OK")
+            return True
+        opened = await _open_dropdown()
+        log(f"Category final open#{attempt}: opened={opened}", "INFO")
+        if not opened:
+            await asyncio.sleep(0.8)
+            continue
         picked = await _pick_music_option()
         log(f"Category final pick#{attempt}: picked={picked}", "INFO")
         if not picked:
