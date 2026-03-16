@@ -7725,6 +7725,116 @@ async def set_video_category(page, category: str) -> bool:
     return False
 
 
+def load_channel_mapping_registry() -> Dict[int, Dict[str, Any]]:
+    registry: Dict[int, Dict[str, Any]] = {}
+    if not CHANNEL_MAPPING_PATH.exists():
+        return registry
+    try:
+        with open(CHANNEL_MAPPING_PATH, "r", encoding="utf-8") as f:
+            mapping_data = json.load(f)
+    except Exception as e:
+        log(f"璇诲彇 channel_mapping.json 澶辫触: {e}", "WARN")
+        return registry
+
+    for container_code, info in (mapping_data.get("channels", {}) or {}).items():
+        try:
+            serial = int(info.get("serial_number") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not serial:
+            continue
+        tag_name = str(info.get("tag") or "").strip()
+        registry[serial] = {
+            "serialNumber": serial,
+            "containerCode": str(container_code),
+            "name": str(info.get("channel_name") or ""),
+            "tag": tag_name,
+            "tagName": tag_name,
+            "remark": "",
+        }
+    return registry
+
+
+def extract_window_plan_serials(tag: str) -> List[int]:
+    plan = globals().get("ACTIVE_WINDOW_PLAN")
+    if not isinstance(plan, dict):
+        return []
+    wanted = _normalize_tag_for_match(tag)
+    serials: List[int] = []
+    for task in plan.get("tasks", []) or []:
+        if _normalize_tag_for_match(task.get("tag", "")) != wanted:
+            continue
+        try:
+            serial = int(task.get("serial") or 0)
+        except (TypeError, ValueError):
+            continue
+        if serial:
+            serials.append(serial)
+    return sorted(set(serials))
+
+
+def get_all_containers() -> List[Dict]:
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            containers = list_browser_envs(CONFIG_PATH)
+            normalized: List[Dict[str, Any]] = []
+            for container in containers:
+                item = dict(container)
+                if "tagName" not in item:
+                    item["tagName"] = item.get("tag", "")
+                normalized.append(item)
+            return normalized
+        except Exception as e:
+            last_error = e
+            if attempt < 3:
+                log(f"鑾峰彇鐜鍒楄〃澶辫触锛岀 {attempt} 娆￠噸璇? {e}", "WARN")
+                time.sleep(min(1.5 * attempt, 4.0))
+                continue
+    if last_error is not None:
+        log(f"鑾峰彇鐜鍒楄〃澶辫触: {last_error}", "ERR")
+    return []
+
+
+def resolve_containers_for_tag(tag: str, project_folder: Optional[Path]) -> tuple[List[Dict], str, Dict[int, str]]:
+    serial_to_channel_name = load_channels_registry(project_folder)
+
+    tagged_containers = get_containers_by_tag(tag)
+    if tagged_containers:
+        return tagged_containers, "hubstudio_tag", serial_to_channel_name
+
+    wanted_serials = set(serial_to_channel_name.keys())
+    wanted_serials.update(extract_window_plan_serials(tag))
+
+    if wanted_serials:
+        matched = [
+            c for c in get_all_containers()
+            if int(c.get("serialNumber", 0) or 0) in wanted_serials
+        ]
+        matched = sorted(matched, key=lambda x: int(x.get("serialNumber", 0) or 0))
+        if matched:
+            log(
+                f"鏈壘鍒版爣绛句负 '{tag}' 鐨勫垎缁勭幆澧冿紝鏀圭敤璁″垝/registry 搴忓彿鍥為€€鍖归厤: {sorted(wanted_serials)}",
+                "WARN",
+            )
+            return matched, "serial_fallback", serial_to_channel_name
+
+        mapping_registry = load_channel_mapping_registry()
+        mapped = [
+            mapping_registry[serial]
+            for serial in sorted(wanted_serials)
+            if serial in mapping_registry
+        ]
+        if mapped:
+            log(
+                f"BitBrowser 鍒楄〃鏆傛椂涓嶅彲鐢紝鏀圭敤 channel_mapping 鍥為€€鍖归厤: {sorted(wanted_serials)}",
+                "WARN",
+            )
+            return mapped, "channel_mapping_fallback", serial_to_channel_name
+
+    return [], "missing", serial_to_channel_name
+
+
 def main():
     args = parse_arguments()
     
@@ -7734,6 +7844,7 @@ def main():
     
     config = load_config()
     window_plan = load_window_upload_plan(args.window_plan_file)
+    globals()["ACTIVE_WINDOW_PLAN"] = window_plan
     if args.window_plan_file:
         if window_plan:
             print(f"📋 已加载窗口任务计划: {args.window_plan_file}")
