@@ -1,0 +1,22 @@
+# Tasks: unify-run-plan-workflow
+
+- [ ] 定义 `RunPlan`、`TaskArtifact`、`RunResult` 新数据结构
+- [ ] 新建路径策略层，统一目录优先级解析
+- [ ] 新建窗口解析层，统一分组、窗口计划、channel mapping 的优先级
+- [ ] 把素材分配逻辑从现有 UI/上传逻辑中抽出
+- [ ] 新建 `MetadataService`，只负责文案和缩略图产物
+- [ ] 新建 `RenderService`，只负责视频生成
+- [ ] 新建 `UploadService`，只负责上传
+- [ ] 让上传阶段只消费显式 artifact，不再二次扫描目录
+- [ ] 把 `dashboard_app.py` 改成只生成 `RunRequest` 并调用新服务
+- [ ] 清理 `batch_upload.py` 中重复定义和兼容堆叠逻辑
+- [ ] 清理 `workflow_core.py` 中同时承担多职责的函数
+- [ ] 清理 `utils.py` 中和 `browser_api.py`、`workflow_core.py` 重复的职责
+- [ ] 将“文案 / 剪辑 / 上传”三块改成可独立运行、可组合运行
+- [ ] 为“只上传”场景新增显式 artifact 校验
+- [ ] 为批量场景新增“每任务独立 metadata”一致性校验
+- [ ] 加一轮端到端测试：单任务
+- [ ] 加一轮端到端测试：双任务批量
+- [ ] 加一轮端到端测试：只上传已有视频
+- [ ] 清理旧路径拼接规则和 tag 强绑定逻辑
+- [ ] 更新 README 和实操文档
