@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from copy import deepcopy
 import io
 import json
 import os
@@ -36,6 +37,14 @@ from prompt_studio import (
     save_generation_map,
     sync_manifest_from_generation_map,
 )
+from run_plan_service import (
+    build_module_selection,
+    build_run_plan,
+    execute_run_plan,
+    execute_simulation_plan,
+    preview_run_plan,
+    validate_run_plan,
+)
 from group_upload_workflow import normalize_mmdd
 from upload_window_planner import derive_tags_and_skip_channels
 from utils import get_all_tags, get_tag_info
@@ -43,26 +52,19 @@ from workflow_core import (
     CHANNEL_MAPPING_FILE,
     PROMPT_STUDIO_FILE,
     SCHEDULER_CONFIG_FILE,
-    SimulationOptions,
     WindowTask,
     WorkflowDefaults,
-    build_window_plan,
     create_task,
     describe_group_bindings,
     ensure_prompt_presets,
-    execute_direct_media_workflow,
-    execute_metadata_only_workflow,
     get_group_bindings,
     get_group_catalog,
     get_metadata_root,
     load_prompt_settings,
     load_scheduler_settings,
-    refresh_existing_output_metadata,
     save_scheduler_settings,
     save_window_plan,
     set_group_binding,
-    validate_existing_output_dirs,
-    validate_group_sources,
 )
 
 SCRIPT_DIR = Path(__file__).parent
@@ -2007,15 +2009,15 @@ class DashboardApp(ctk.CTk):
 
     def _run_upload_command(
         self,
-        defaults: WorkflowDefaults,
+        run_plan,
         *,
         detach: bool = False,
         prepared_output_dirs: dict[str, str] | None = None,
     ) -> bool:
-        plan = build_window_plan(self.window_tasks, defaults)
+        plan = deepcopy(run_plan.window_plan)
         if prepared_output_dirs:
             plan["tag_output_dirs"] = dict(prepared_output_dirs)
-        plan_path = save_window_plan(plan, defaults.date_mmdd)
+        plan_path = save_window_plan(plan, run_plan.defaults.date_mmdd)
         tags, skip_channels = derive_tags_and_skip_channels(plan, lambda tag: get_tag_info(tag) or {})
         retain_days = str(self.cleanup_days_var.get().strip() or "5")
         cmd = [
@@ -2025,7 +2027,7 @@ class DashboardApp(ctk.CTk):
             "--tag",
             ",".join(tags),
             "--date",
-            defaults.date_mmdd,
+            run_plan.defaults.date_mmdd,
             "--auto-confirm",
             "--window-plan-file",
             str(plan_path),
@@ -2182,9 +2184,24 @@ class DashboardApp(ctk.CTk):
             "upload": bool(self.run_upload_var.get()),
         }
 
-    def _selected_module_labels(self) -> list[str]:
+    def _current_module_selection(self):
         selected = self._selected_modules()
-        return [label for key, label in MODULE_LABELS.items() if selected.get(key)]
+        return build_module_selection(
+            metadata=selected["metadata"],
+            render=selected["render"],
+            upload=selected["upload"],
+        )
+
+    def _selected_module_labels(self) -> list[str]:
+        return self._current_module_selection().labels()
+
+    def _build_current_run_plan(self):
+        return build_run_plan(
+            tasks=self.window_tasks,
+            defaults=self._collect_defaults(),
+            modules=self._current_module_selection(),
+            config=load_scheduler_settings(),
+        )
 
     def _build_start_tab(self) -> None:
         tab = self.tabview.tab("快捷开始")
@@ -2368,109 +2385,62 @@ class DashboardApp(ctk.CTk):
 
     def _preview_plan(self) -> None:
         self.start_preview.delete("1.0", "end")
-        modules = self._selected_modules()
-        labels = self._selected_module_labels()
-        if not any(modules.values()):
+        module_selection = self._current_module_selection()
+        if not module_selection.any_selected():
             self.start_preview.insert("1.0", "No module selected. Go to Quick Start and check Metadata / Render / Upload.")
             return
         if not self.window_tasks:
             self.start_preview.insert("1.0", "No window tasks yet. Go to Upload tab and add at least one window.")
             return
 
-        defaults = self._collect_defaults()
-        lines = [
-            f"Selected modules: {', '.join(labels)}",
-            f"Date: {defaults.date_mmdd}",
-            f"Window count: {len(self.window_tasks)}",
-            f"Metadata root: {self.metadata_root_var.get().strip()}",
-            f"Music root: {self.music_dir_var.get().strip()}",
-            f"Image root: {self.base_image_dir_var.get().strip()}",
-            f"Video output root: {self.output_root_var.get().strip()}",
-            (
-                "Visual mode: Random"
-                if defaults.randomize_effects
-                else "Visual mode: Manual | "
-                f"style={defaults.visual_settings.get('style', 'bar')} | "
-                f"particle={defaults.visual_settings.get('particle', 'none')} | "
-                f"tint={defaults.visual_settings.get('color_tint', 'none')}"
-            ),
-            "",
-        ]
         try:
-            plan = build_window_plan(self.window_tasks, defaults)
-            lines.extend(plan.get("preview_lines", []))
+            run_plan = self._build_current_run_plan()
         except Exception as exc:
-            lines.append(f"Plan build failed: {exc}")
-            self.start_preview.insert("1.0", "\n".join(lines))
+            self.start_preview.insert("1.0", f"Plan build failed: {exc}")
             return
 
-        config = load_scheduler_settings()
-        if modules["render"] or modules["metadata"]:
-            errors, warnings = validate_group_sources(self.window_tasks, config=config, log=lambda *_args, **_kwargs: None)
-            if warnings:
-                lines.append("")
-                lines.extend(f"Warning: {item}" for item in warnings)
-            if errors:
-                lines.extend(f"Error: {item}" for item in errors)
-        if modules["upload"] and not modules["render"]:
-            errors, warnings, resolved_dirs = validate_existing_output_dirs(
-                self.window_tasks,
-                date_mmdd=defaults.date_mmdd,
-                config=config,
-                log=lambda *_args, **_kwargs: None,
-            )
+        lines = preview_run_plan(run_plan)
+        report = validate_run_plan(run_plan, log=lambda *_args, **_kwargs: None)
+        if report.warnings:
             lines.append("")
-            if resolved_dirs:
-                lines.append("Upload will use these existing video folders:")
-                for tag, folder in resolved_dirs.items():
-                    lines.append(f"  - {tag}: {folder}")
-            if warnings:
-                lines.extend(f"Warning: {item}" for item in warnings)
-            if errors:
-                lines.extend(f"Error: {item}" for item in errors)
+            lines.extend(f"Warning: {item}" for item in report.warnings)
+        if report.resolved_output_dirs:
+            lines.append("")
+            lines.append("Upload will use these existing video folders:")
+            for tag, folder in report.resolved_output_dirs.items():
+                lines.append(f"  - {tag}: {folder}")
+        if report.errors:
+            lines.append("")
+            lines.extend(f"Error: {item}" for item in report.errors)
 
         self.start_preview.insert("1.0", "\n".join(lines))
         self._save_state()
 
     def _validate_paths(self) -> None:
-        modules = self._selected_modules()
-        if not any(modules.values()):
+        module_selection = self._current_module_selection()
+        if not module_selection.any_selected():
             messagebox.showerror("Validate Failed", "Select at least one module first.")
             return
         if not self.window_tasks:
             messagebox.showerror("Validate Failed", "Add at least one window task first.")
             return
 
-        config = load_scheduler_settings()
+        run_plan = self._build_current_run_plan()
+        report = validate_run_plan(run_plan, log=self._log)
         text: list[str] = []
-        errors: list[str] = []
-        if modules["render"] or modules["metadata"]:
-            render_errors, render_warnings = validate_group_sources(self.window_tasks, config=config, log=self._log)
-            text.extend(f"Warning: {item}" for item in render_warnings)
-            text.extend(f"Error: {item}" for item in render_errors)
-            errors.extend(render_errors)
-        if modules["upload"] and not modules["render"]:
-            defaults = self._collect_defaults()
-            upload_errors, upload_warnings, resolved_dirs = validate_existing_output_dirs(
-                self.window_tasks,
-                date_mmdd=defaults.date_mmdd,
-                config=config,
-                log=self._log,
-            )
-            text.extend(f"Ready to upload: {tag} -> {folder}" for tag, folder in resolved_dirs.items())
-            text.extend(f"Warning: {item}" for item in upload_warnings)
-            text.extend(f"Error: {item}" for item in upload_errors)
-            errors.extend(upload_errors)
+        text.extend(f"Ready to upload: {tag} -> {folder}" for tag, folder in report.resolved_output_dirs.items())
+        text.extend(f"Warning: {item}" for item in report.warnings)
+        text.extend(f"Error: {item}" for item in report.errors)
 
-        if errors:
+        if report.errors:
             messagebox.showerror("Validate Failed", "\n".join(text) if text else "Validation failed.")
         else:
             messagebox.showinfo("Validate OK", "\n".join(text) if text else "Validation passed.")
         self._preview_plan()
 
     def _start_simulation(self) -> None:
-        modules = self._selected_modules()
-        if not modules["render"]:
+        module_selection = self._current_module_selection()
+        if not module_selection.render:
             messagebox.showerror("Cannot Simulate", "Simulation requires the Render module.")
             return
         if not self.window_tasks:
@@ -2478,23 +2448,18 @@ class DashboardApp(ctk.CTk):
             return
 
         def job() -> None:
-            defaults = self._collect_defaults()
             self._persist_prompt_form_for_active_tasks()
+            run_plan = self._build_current_run_plan()
             seconds = int(self.simulate_seconds_var.get().strip() or "90")
-            result = execute_direct_media_workflow(
-                tasks=self.window_tasks,
-                defaults=defaults,
-                simulation=SimulationOptions(simulate_seconds=seconds, consume_sources=False, save_manifest=True),
-                log=self._log,
-            )
+            result = execute_simulation_plan(run_plan, simulate_seconds=seconds, log=self._log)
             self._log(f"[Simulate] Finished. Generated {len(result.items)} videos")
             self._log(json.dumps(result.as_dict(), ensure_ascii=False, indent=2))
 
         self._run_background(job, task_name="Simulate Render", total_items=len(self.window_tasks), include_upload=False)
 
     def _start_real_flow(self) -> None:
-        modules = self._selected_modules()
-        if not any(modules.values()):
+        module_selection = self._current_module_selection()
+        if not module_selection.any_selected():
             messagebox.showerror("Cannot Start", "Select at least one module first.")
             return
         if not self.window_tasks:
@@ -2502,74 +2467,16 @@ class DashboardApp(ctk.CTk):
             return
 
         def job() -> bool:
-            defaults = self._collect_defaults()
             self._persist_prompt_form_for_active_tasks()
-            config = load_scheduler_settings()
-            prepared_output_dirs: dict[str, str] | None = None
+            run_plan = self._build_current_run_plan()
+            execution = execute_run_plan(run_plan, log=self._log)
 
-            if modules["render"] or modules["metadata"]:
-                render_errors, render_warnings = validate_group_sources(self.window_tasks, config=config, log=self._log)
-                for warning in render_warnings:
-                    self._log(f"[Validate] {warning}")
-                if render_errors:
-                    raise ValueError("\n".join(render_errors))
-
-            if modules["upload"] and not modules["render"]:
-                upload_errors, upload_warnings, prepared_output_dirs = validate_existing_output_dirs(
-                    tasks=self.window_tasks,
-                    date_mmdd=defaults.date_mmdd,
-                    config=config,
-                    log=self._log,
-                )
-                for warning in upload_warnings:
-                    self._log(f"[Upload] {warning}")
-                if upload_errors:
-                    raise ValueError("\n".join(upload_errors))
-
-            if modules["render"]:
-                self._log("[Start] Render module")
-                render_result = execute_direct_media_workflow(
-                    tasks=self.window_tasks,
-                    defaults=defaults,
-                    simulation=SimulationOptions(simulate_seconds=0, consume_sources=True, save_manifest=True),
-                    log=self._log,
-                )
-                prepared_output_dirs = self._collect_output_dirs_from_result(render_result) or prepared_output_dirs
-                if modules["upload"] and not prepared_output_dirs:
-                    upload_errors, upload_warnings, prepared_output_dirs = validate_existing_output_dirs(
-                        tasks=self.window_tasks,
-                        date_mmdd=defaults.date_mmdd,
-                        config=config,
-                        log=self._log,
-                    )
-                    for warning in upload_warnings:
-                        self._log(f"[Upload] {warning}")
-                    if upload_errors:
-                        raise ValueError("\n".join(upload_errors))
-            elif modules["metadata"]:
-                self._log("[Start] Metadata module")
-                execute_metadata_only_workflow(
-                    tasks=self.window_tasks,
-                    defaults=defaults,
-                    log=self._log,
-                )
-
-            if modules["upload"] and not modules["render"] and modules["metadata"]:
-                self._log("[Upload] Refresh existing manifests using current metadata settings")
-                prepared_output_dirs = refresh_existing_output_metadata(
-                    tasks=self.window_tasks,
-                    defaults=defaults,
-                    prepared_output_dirs=prepared_output_dirs or {},
-                    config=config,
-                    log=self._log,
-                )
-
-            if modules["upload"]:
+            if run_plan.modules.upload:
                 self._log("[Start] Upload module")
                 return self._run_upload_command(
-                    defaults,
+                    run_plan,
                     detach=True,
-                    prepared_output_dirs=prepared_output_dirs,
+                    prepared_output_dirs=execution.prepared_output_dirs,
                 )
 
             return False
@@ -2579,7 +2486,7 @@ class DashboardApp(ctk.CTk):
             job,
             task_name=task_name,
             total_items=len(self.window_tasks),
-            include_upload=bool(modules["upload"]),
+            include_upload=bool(module_selection.upload),
         )
 
     def _load_daily_entry(self) -> None:

@@ -14,6 +14,21 @@ from pathlib import Path
 from typing import Any
 
 
+TAG_NORMALIZATION_MAP = str.maketrans(
+    {
+        "風": "风",
+        "樂": "乐",
+        "臺": "台",
+        "藍": "蓝",
+        "龍": "龙",
+        "館": "馆",
+        "牆": "墙",
+        "試": "试",
+        "薩": "萨",
+    }
+)
+
+
 DEFAULT_TITLE_LIBRARY = """最怕Rapper唱情歌🎧 一聽就放鬆的中文嘻哈歌單｜深夜靜靜聽・讀書用音樂・Chill 氛圍推薦放空一下的最佳選擇
 【中文R&B歌單】寫給過去的自己：謝謝你，當時撐過了那些沒人知道的夜晚｜療癒系中文原創音樂
 【路過人間】2025最好聽華語歌單 | 讀書・工作・放鬆最佳背景音樂 | 民歌風格原創抒情歌
@@ -165,15 +180,50 @@ def save_prompt_studio_config(path: Path, config: dict) -> None:
     path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def normalize_tag_key(value: Any) -> str:
+    text = re.sub(r"\s+", "", str(value or "").strip())
+    return text.translate(TAG_NORMALIZATION_MAP).lower()
+
+
+def _lookup_bound_template(mapping: dict[str, Any], tag: str, available: dict[str, Any]) -> str:
+    direct = mapping.get(tag)
+    if direct in available:
+        return str(direct)
+
+    normalized = normalize_tag_key(tag)
+    if not normalized:
+        return ""
+
+    for raw_tag, template_name in mapping.items():
+        if normalize_tag_key(raw_tag) == normalized and template_name in available:
+            return str(template_name)
+    return ""
+
+
+def _lookup_template_name(available: dict[str, Any], tag: str) -> str:
+    if tag in available:
+        return str(tag)
+
+    normalized = normalize_tag_key(tag)
+    if not normalized:
+        return ""
+
+    for raw_name in available.keys():
+        if normalize_tag_key(raw_name) == normalized:
+            return str(raw_name)
+    return ""
+
+
 def pick_content_template_name(config: dict, tag: str) -> str:
     templates = config.get("contentTemplates", {})
     if not templates:
         return "默认内容模板"
-    bound = config.get("tagBindings", {}).get(tag)
-    if bound in templates:
+    bound = _lookup_bound_template(config.get("tagBindings", {}), tag, templates)
+    if bound:
         return bound
-    if tag in templates:
-        return tag
+    matched_name = _lookup_template_name(templates, tag)
+    if matched_name:
+        return matched_name
     default_name = config.get("defaultContentTemplate")
     if default_name in templates:
         return default_name
@@ -184,11 +234,12 @@ def pick_api_preset_name(config: dict, tag: str) -> str:
     presets = config.get("apiPresets", {})
     if not presets:
         return "默认API模板"
-    bound = config.get("tagApiBindings", {}).get(tag)
-    if bound in presets:
+    bound = _lookup_bound_template(config.get("tagApiBindings", {}), tag, presets)
+    if bound:
         return bound
-    if tag in presets:
-        return tag
+    matched_name = _lookup_template_name(presets, tag)
+    if matched_name:
+        return matched_name
     default_name = config.get("defaultApiPreset")
     if default_name in presets:
         return default_name
