@@ -1,14 +1,42 @@
 # YouTube 自动化控制台
 
-当前仓库只保留这一套主流程：
+这是当前可稳定运行的 Windows 主线仓库。
+
+## 当前稳定线
+
+- 电脑专属分支：`windows-huxy`
+- 稳定标签：`windows-huxy-stable-v1.0`
+- 历史稳定标签：`stable-refactor-v1.0`
+
+## 多电脑多分支规则
+
+这个仓库以后按“每台电脑一条分支”维护。
+
+推荐命名规则：
+
+- `windows-huxy`
+- `mac-huxy`
+- `windows-朋友名`
+- `mac-朋友名`
+
+原则：
+
+- 通用逻辑尽量共用
+- 电脑专属适配放各自分支
+- 每个稳定版本都单独打标签，方便随时回退
+
+## Windows 版当前主流程
+
+当前仓库主要使用这几个文件：
 
 - `dashboard.py`
 - `dashboard_app.py`
 - `workflow_core.py`
+- `run_plan_service.py`
+- `metadata_service.py`
 - `batch_upload.py`
-- `daily_scheduler.py`
-
-旧版 GUI、旧批量入口、重复说明文档和历史归档已经清掉，不再推荐单独记一堆旧脚本名。
+- `browser_api.py`
+- `effects_library.py`
 
 ## 启动
 
@@ -21,125 +49,108 @@ py -3 dashboard.py
 
 - `C:\youtube自动化\启动统一控制台.bat`
 
-## 当前逻辑
+## 当前功能规则
 
-### 1. 快捷开始
+### 1. 三块能力可独立，也可组合
 
-这里只决定今天做什么：
+- 生成标题 / 简介 / 标签 / 缩略图
+- 剪辑生成视频
+- 上传到 YouTube
 
-- `本日只剪辑`
-- `本日只上传`
-- `本日剪辑并上传`
+勾选哪个就运行哪个。
 
-说明：
+### 2. 文案只走提示词那套
 
-- 现在的 `本日只上传` 不会再直接吃旧 `upload_manifest.json`
-- 它会先按上传页当前素材目录准备新视频、新标题、新简介、新标签、新缩略图，再进入上传
+旧的 `daily / generation_map` 不再作为正式文案来源。
 
-### 2. 上传页
+### 3. 批量时每个窗口都必须唯一
 
-这是唯一上传入口。
+唯一范围包括：
 
-你只需要在这里做几件事：
+- 同一批多个窗口之间不能重复
+- 不同批之间也不能重复
+- 已用标题 / 简介 / 标签 / 缩略图会进入已用库，后续不再复用
 
-- 选择 BitBrowser 分组
-- 点窗口按钮，把今天要处理的窗口加入任务区
-- 可选填本次临时素材目录覆盖
-- 选择文案来源：
-  - `提示词那套`
-  - `原先那套`
-- 设置默认规则：
-  - 可见性
-  - 分类
-  - 儿童内容
-  - AI 内容
-  - 定时发布日期 / 时间 / 时区
-  - 上传完成后自动关闭窗口
+### 4. 上传支持并发
 
-任务区里只有 1 个窗口就是单个上传，多个窗口就是批量上传，不再分两个 tab。
+不是传完第一个再传第二个，而是：
 
-### 3. 提示词页
+- 有几个窗口任务
+- 就同时打开几个浏览器窗口
+- 并发上传几个任务
 
-这里只管两类模板：
+### 5. 上传固定规则
 
-- API 模板
-- 内容模板
+- `Altered content = Yes`
+- `Category = Music`
+- 默认不勾选 `Publish to subscriptions feed and notify subscribers`
+- 页面上可切换是否勾选
+- 支持 `Asia/Taipei (+08:00)` 定时发布
 
-支持：
+### 6. 路径优先级
 
-- 多套模板保存
-- 绑定到不同 BitBrowser 分组
-- 文本 API / 图片 API 连通性测试
-- 受众截图自动识别
+始终按这个顺序：
 
-### 4. 当日内容页
+1. 当前任务里手动选的目录
+2. 分组长期绑定目录
+3. 全局默认目录
 
-这里只改某个频道某一天的落地内容：
+目录名不再强绑分组名。
 
-- 标题
-- 简介
-- 封面
-- A/B 标题
-- YPP
+## 多电脑接手方式
 
-可以同步回 `upload_manifest.json`。
+### 你的 Mac 电脑
 
-### 5. 路径配置页
+建议流程：
 
-这里只管：
+```bash
+git clone https://github.com/huxy0822-max/youtube-windows-auto-upload.git
+cd youtube-windows-auto-upload
+git checkout -b mac-huxy origin/windows-huxy
+```
 
-- 音乐目录
-- 底图目录
-- 输出目录
-- FFmpeg
-- 已用素材目录
-- 上传后保留天数
-- 分组 -> 素材目录 的长期绑定
+然后让 Mac 上的 Codex 先读这些文件：
 
-## 渲染与加速
+- `AGENTS.md`
+- `README.md`
+- `docs/项目功能总纲-2026-03-17.md`
 
-当前程序会按机器实际能力自动选择编码器：
+### 朋友的 Windows 电脑
 
-- macOS: `h264_videotoolbox`
-- Windows + NVIDIA 可用: `h264_nvenc`
-- Windows + AMD AMF 可用: `h264_amf`
-- 否则回退 `libx264`
+建议流程：
 
-注意：
+```powershell
+git clone https://github.com/huxy0822-max/youtube-windows-auto-upload.git
+cd youtube-windows-auto-upload
+git checkout -b windows-朋友名 origin/windows-huxy
+```
 
-- 你这台机器实测是 `NVIDIA GeForce RTX 3070`
-- 所以正确的 GPU 路线是 `NVENC`，不是 `AMF`
-- 日志里现在会直接打印当前编码器，避免再靠猜
-- 如果仍然慢，瓶颈通常在特效滤镜链，而不是编码器没启用
+这样朋友可以在自己的电脑分支上改适配，不会影响你的稳定线。
 
-## 当前保留文档
+## 建议直接发给 Codex 的话
 
-- `C:\youtube自动化\docs\项目功能总纲-2026-03-17.md`
-- `C:\youtube自动化\docs\重构阶段1审阅-2026-03-17.md`
-- `C:\youtube自动化\docs\新控制台使用说明.md`
-
-## 主要文件
+### Mac 上发给 Codex
 
 ```text
-C:\youtube自动化
-├── dashboard.py
-├── dashboard_app.py
-├── workflow_core.py
-├── batch_upload.py
-├── browser_api.py
-├── daily_scheduler.py
-├── content_generation.py
-├── prompt_studio.py
-├── upload_window_planner.py
-├── group_upload_workflow.py
-├── path_helpers.py
-├── effects_library.py
-├── utils.py
-├── scheduler_config.json
-├── config\
-│   ├── upload_config.json
-│   ├── channel_mapping.json
-│   └── prompt_studio.json
-└── docs\
-    └── 新控制台使用说明.md
+这是一个 YouTube 自动化项目。先读 AGENTS.md、README.md、docs/项目功能总纲-2026-03-17.md。当前稳定 Windows 线是 windows-huxy，请基于它创建并维护 mac-huxy 分支。目标是在不破坏现有功能逻辑的前提下，把浏览器启动、路径、FFmpeg 编码器、系统命令改成适配我的 Mac。不要动 Windows 专属分支。
 ```
+
+### 朋友 Windows 上发给 Codex
+
+```text
+这是一个 YouTube 自动化项目。先读 AGENTS.md、README.md、docs/项目功能总纲-2026-03-17.md。当前稳定线是 windows-huxy，请基于它创建并维护当前这台电脑专属的 Windows 分支，只处理这台电脑的路径、浏览器、FFmpeg、依赖适配。不要破坏现有上传、文案、剪辑主流程。
+```
+
+## 稳定版回退
+
+回退到这版：
+
+```powershell
+git checkout windows-huxy-stable-v1.0
+```
+
+## 主要文档
+
+- `docs/项目功能总纲-2026-03-17.md`
+- `docs/重构阶段1审阅-2026-03-17.md`
+- `docs/新控制台使用说明.md`
