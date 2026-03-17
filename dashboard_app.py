@@ -30,12 +30,9 @@ from effects_library import (
     list_zoom_modes,
 )
 from prompt_studio import (
-    load_generation_map,
     load_prompt_studio_config,
     pick_api_preset_name,
     pick_content_template_name,
-    save_generation_map,
-    sync_manifest_from_generation_map,
 )
 from run_plan_service import (
     build_module_selection,
@@ -262,7 +259,6 @@ class DashboardApp(ctk.CTk):
         self._load_prompt_for_group()
         self._refresh_task_tree()
         self._refresh_bindings_box()
-        self._refresh_daily_serials()
         self._bind_variable_events()
         self._sync_schedule_mode_state()
         self._refresh_schedule_controls()
@@ -406,13 +402,6 @@ class DashboardApp(ctk.CTk):
         self.desc_len_var = ctk.StringVar(value="300")
         self.tag_range_var = ctk.StringVar(value="10-20")
 
-        self.daily_group_var = ctk.StringVar(value=current_group)
-        self.daily_date_var = ctk.StringVar(value=self.date_var.get())
-        self.daily_serial_var = ctk.StringVar(value="")
-        self.daily_is_ypp_var = ctk.StringVar(value="no")
-        self.daily_title_var = ctk.StringVar(value="")
-        self.daily_covers_var = ctk.StringVar(value="")
-        self.daily_ab_titles_var = ctk.StringVar(value="")
 
         self.run_status_var = ctk.StringVar(value="空闲")
         self.run_phase_var = ctk.StringVar(value="等待任务")
@@ -452,7 +441,7 @@ class DashboardApp(ctk.CTk):
         ).grid(row=0, column=0, sticky="w", padx=20, pady=(18, 4))
         ctk.CTkLabel(
             header,
-            text="上传页只管今天哪些窗口要工作，其他页面分别管提示词、当日内容和路径绑定。",
+            text="???????????????????????????????",
             text_color="#b8c1cc",
             font=ctk.CTkFont(size=14),
         ).grid(row=1, column=0, sticky="w", padx=20, pady=(0, 18))
@@ -937,52 +926,6 @@ class DashboardApp(ctk.CTk):
         self.audience_result_box = ctk.CTkTextbox(audience_frame, height=140)
         self.audience_result_box.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 14))
 
-    def _build_daily_tab(self) -> None:
-        tab = self.tabview.tab("当日内容")
-        tab.grid_columnconfigure(0, weight=1)
-        tab.grid_rowconfigure(3, weight=1)
-        top = ctk.CTkFrame(tab)
-        top.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
-        for column in range(5):
-            top.grid_columnconfigure(column, weight=1)
-        ctk.CTkLabel(top, text="当日内容", font=ctk.CTkFont(size=24, weight="bold")).grid(
-            row=0, column=0, columnspan=5, sticky="w", padx=16, pady=(14, 12)
-        )
-        ctk.CTkLabel(top, text="分组").grid(row=1, column=0, sticky="w", padx=(16, 8), pady=(0, 6))
-        self.daily_group_menu = ctk.CTkOptionMenu(top, variable=self.daily_group_var, values=[""])
-        self.daily_group_menu.grid(row=2, column=0, sticky="ew", padx=(16, 8), pady=(0, 14))
-        ctk.CTkLabel(top, text="日期").grid(row=1, column=1, sticky="w", padx=8, pady=(0, 6))
-        ctk.CTkEntry(top, textvariable=self.daily_date_var).grid(row=2, column=1, sticky="ew", padx=8, pady=(0, 14))
-        ctk.CTkLabel(top, text="窗口").grid(row=1, column=2, sticky="w", padx=8, pady=(0, 6))
-        self.daily_serial_menu = ctk.CTkOptionMenu(top, variable=self.daily_serial_var, values=[""])
-        self.daily_serial_menu.grid(row=2, column=2, sticky="ew", padx=8, pady=(0, 14))
-        ctk.CTkLabel(top, text="YPP").grid(row=1, column=3, sticky="w", padx=8, pady=(0, 6))
-        ctk.CTkOptionMenu(top, variable=self.daily_is_ypp_var, values=YES_NO_VALUES).grid(
-            row=2, column=3, sticky="ew", padx=8, pady=(0, 14)
-        )
-        ctk.CTkButton(top, text="加载当前条目", command=self._load_daily_entry).grid(
-            row=2, column=4, sticky="ew", padx=(8, 16), pady=(0, 14)
-        )
-
-        form = ctk.CTkFrame(tab)
-        form.grid(row=1, column=0, sticky="ew", padx=16, pady=8)
-        form.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(form, text="标题").grid(row=0, column=0, sticky="w", padx=16, pady=(14, 6))
-        ctk.CTkEntry(form, textvariable=self.daily_title_var).grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 12))
-        ctk.CTkLabel(form, text="封面文件名（逗号分隔）").grid(row=2, column=0, sticky="w", padx=16, pady=(0, 6))
-        ctk.CTkEntry(form, textvariable=self.daily_covers_var).grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 12))
-        ctk.CTkLabel(form, text="AB 标题（逗号分隔）").grid(row=4, column=0, sticky="w", padx=16, pady=(0, 6))
-        ctk.CTkEntry(form, textvariable=self.daily_ab_titles_var).grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 12))
-        ctk.CTkLabel(form, text="简介").grid(row=6, column=0, sticky="w", padx=16, pady=(0, 6))
-        self.daily_description_box = ctk.CTkTextbox(form, height=260)
-        self.daily_description_box.grid(row=7, column=0, sticky="ew", padx=16, pady=(0, 14))
-
-        action = ctk.CTkFrame(tab)
-        action.grid(row=2, column=0, sticky="ew", padx=16, pady=8)
-        ctk.CTkButton(action, text="保存到 generation_map", command=self._save_daily_entry).pack(side="left", padx=8, pady=12)
-        ctk.CTkButton(action, text="同步 manifest", command=self._sync_daily_manifest).pack(side="left", padx=8, pady=12)
-        ctk.CTkButton(action, text="打开分组目录", command=self._open_daily_tag_dir).pack(side="left", padx=8, pady=12)
-
     def _build_paths_tab(self) -> None:
         tab = self.tabview.tab("路径配置")
         tab.grid_columnconfigure(0, weight=1)
@@ -1431,7 +1374,6 @@ class DashboardApp(ctk.CTk):
             self.current_group_menu,
             self.binding_group_menu,
             self.prompt_group_menu,
-            self.daily_group_menu,
         ):
             menu.configure(values=groups)
         if self.current_group_var.get() not in groups:
@@ -1440,12 +1382,9 @@ class DashboardApp(ctk.CTk):
             self.binding_group_var.set(self.current_group_var.get())
         if self.prompt_group_var.get() not in groups:
             self.prompt_group_var.set(self.current_group_var.get())
-        if self.daily_group_var.get() not in groups:
-            self.daily_group_var.set(self.current_group_var.get())
         self.binding_folder_var.set(get_group_bindings(self.scheduler_config).get(self.binding_group_var.get(), ""))
         self._refresh_window_buttons()
         self._refresh_bindings_box()
-        self._refresh_daily_serials()
 
     def _refresh_window_buttons(self) -> None:
         for child in self.window_button_frame.winfo_children():
@@ -1508,13 +1447,6 @@ class DashboardApp(ctk.CTk):
             self.api_preset_var.set(api_names[0])
         if self.content_template_var.get() not in content_names:
             self.content_template_var.set(content_names[0])
-
-    def _refresh_daily_serials(self) -> None:
-        group = self.daily_group_var.get()
-        values = [str(item.serial) for item in self.group_catalog.get(group, [])] or [""]
-        self.daily_serial_menu.configure(values=values)
-        if self.daily_serial_var.get() not in values:
-            self.daily_serial_var.set(values[0])
 
     def _pick_source_override(self) -> None:
         selected = filedialog.askdirectory(title="选择新增窗口使用的素材目录")
@@ -2461,65 +2393,6 @@ class DashboardApp(ctk.CTk):
             include_upload=bool(module_selection.upload),
         )
 
-    def _load_daily_entry(self) -> None:
-        tag = self.daily_group_var.get()
-        serial_text = self.daily_serial_var.get().strip()
-        if not tag or not serial_text.isdigit():
-            messagebox.showerror("Load Failed", "Select a group and window first.")
-            return
-        tag_dir = get_metadata_root(load_scheduler_settings()) / tag
-        generation_map = load_generation_map(tag_dir / "generation_map.json")
-        channel = (generation_map.get("channels") or {}).get(serial_text) or {}
-        day_info = (channel.get("days") or {}).get(self.daily_date_var.get().strip()) or {}
-        self.daily_is_ypp_var.set(_yes_no_from_bool(bool(channel.get("is_ypp", False))))
-        self.daily_title_var.set(str(day_info.get("title") or ""))
-        self.daily_covers_var.set(",".join(day_info.get("covers") or []))
-        self.daily_ab_titles_var.set(",".join(day_info.get("ab_titles") or []))
-        self.daily_description_box.delete("1.0", "end")
-        self.daily_description_box.insert("1.0", str(day_info.get("description") or ""))
-
-    def _save_daily_entry(self) -> None:
-        tag = self.daily_group_var.get()
-        serial_text = self.daily_serial_var.get().strip()
-        if not tag or not serial_text.isdigit():
-            messagebox.showerror("Save Failed", "Select a group and window first.")
-            return
-        tag_dir = get_metadata_root(load_scheduler_settings()) / tag
-        tag_dir.mkdir(parents=True, exist_ok=True)
-        path = tag_dir / "generation_map.json"
-        data = load_generation_map(path)
-        channels = data.setdefault("channels", {})
-        channel = channels.setdefault(serial_text, {"is_ypp": _bool_from_yes_no(self.daily_is_ypp_var.get()), "days": {}})
-        channel["is_ypp"] = _bool_from_yes_no(self.daily_is_ypp_var.get())
-        channel.setdefault("days", {})
-        channel["days"][self.daily_date_var.get().strip()] = {
-            "title": self.daily_title_var.get().strip(),
-            "description": self.daily_description_box.get("1.0", "end").strip(),
-            "covers": [item.strip() for item in self.daily_covers_var.get().split(",") if item.strip()],
-            "ab_titles": [item.strip() for item in self.daily_ab_titles_var.get().split(",") if item.strip()],
-            "set": 1,
-        }
-        save_generation_map(path, data)
-        self._log(f"[Daily] Saved {tag}/{serial_text}/{self.daily_date_var.get().strip()}")
-
-    def _sync_daily_manifest(self) -> None:
-        tag = self.daily_group_var.get()
-        tag_dir = get_metadata_root(load_scheduler_settings()) / tag
-        generation_map = load_generation_map(tag_dir / "generation_map.json")
-        manifest_path, count = sync_manifest_from_generation_map(
-            generation_map,
-            tag_dir,
-            Path(self.output_root_var.get()),
-            tag,
-            self.daily_date_var.get().strip(),
-        )
-        self._log(f"[Daily] Synced manifest: {manifest_path} | channels={count}")
-
-    def _open_daily_tag_dir(self) -> None:
-        tag = self.daily_group_var.get()
-        target = get_metadata_root(load_scheduler_settings()) / tag
-        target.mkdir(parents=True, exist_ok=True)
-        os.startfile(target)
 
     def _on_close(self) -> None:
         self._save_state()

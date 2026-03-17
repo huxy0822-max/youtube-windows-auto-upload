@@ -777,14 +777,6 @@ def cleanup_old_uploaded_videos(output_root: Path, retention_days: int, log: Log
         log(f"[清理] 已删除超过 {retention_days} 天的本地成品 {cleaned} 个")
     return cleaned
 
-
-def _load_daily_entry(tag_dir: Path, date_mmdd: str, serial: int) -> dict[str, Any]:
-    generation_map_path = tag_dir / "generation_map.json"
-    generation_map = load_generation_map(generation_map_path)
-    channel = (generation_map.get("channels") or {}).get(str(serial)) or {}
-    return (channel.get("days") or {}).get(date_mmdd) or {}
-
-
 def _save_daily_entry(
     generation_map_path: Path,
     *,
@@ -1191,8 +1183,6 @@ def refresh_existing_output_metadata(
 
             source_image = _resolve_manifest_media_path(output_dir, channel.get("source_image"))
             source_audio = _resolve_manifest_media_path(output_dir, channel.get("source_audio"))
-            legacy = _load_daily_entry(tag_metadata_dir, defaults.date_mmdd, task.serial)
-
             title = task.title.strip() or str(channel.get("title") or video_path.stem).strip() or video_path.stem
             description = task.description.strip() or str(channel.get("description") or "").strip()
             tag_list = [str(item).strip() for item in task.tag_list if str(item).strip()]
@@ -1211,7 +1201,7 @@ def refresh_existing_output_metadata(
                 date_mmdd=defaults.date_mmdd,
                 serial=task.serial,
                 channel=channel,
-                legacy=legacy,
+                legacy={},
             )
             if (
                 not defaults.generate_thumbnails
