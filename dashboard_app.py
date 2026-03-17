@@ -541,68 +541,6 @@ class DashboardApp(ctk.CTk):
         self.add_schedule_enabled_var.trace_add("write", self._on_add_schedule_toggle)
         self.schedule_enabled_var.trace_add("write", self._on_default_schedule_toggle)
 
-    def _build_start_tab(self) -> None:
-        tab = self.tabview.tab("快捷开始")
-        tab.grid_columnconfigure(0, weight=1)
-
-        task_frame = ctk.CTkFrame(tab)
-        task_frame.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
-        task_frame.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(task_frame, text="本次任务", font=ctk.CTkFont(size=24, weight="bold")).grid(
-            row=0, column=0, columnspan=4, sticky="w", padx=16, pady=(14, 12)
-        )
-        self.task_mode_segment = ctk.CTkSegmentedButton(
-            task_frame,
-            values=list(TASK_MODE_VALUES.keys()),
-            command=lambda label: self.task_mode_var.set(TASK_MODE_VALUES[label]),
-        )
-        self.task_mode_segment.grid(row=1, column=0, columnspan=4, sticky="ew", padx=16, pady=(0, 16))
-        self.task_mode_segment.set(TASK_MODE_LABELS.get(self.task_mode_var.get(), "本日只剪辑"))
-        ctk.CTkLabel(task_frame, text="日期").grid(row=2, column=0, sticky="w", padx=(16, 8), pady=(0, 8))
-        ctk.CTkEntry(task_frame, textvariable=self.date_var, width=140).grid(
-            row=2, column=1, sticky="w", padx=(0, 12), pady=(0, 8)
-        )
-        ctk.CTkLabel(task_frame, text="模拟时长(秒)").grid(row=2, column=2, sticky="w", padx=(0, 8), pady=(0, 8))
-        ctk.CTkEntry(task_frame, textvariable=self.simulate_seconds_var, width=120).grid(
-            row=2, column=3, sticky="w", padx=(0, 16), pady=(0, 8)
-        )
-
-        option_frame = ctk.CTkFrame(tab)
-        option_frame.grid(row=1, column=0, sticky="ew", padx=16, pady=8)
-        option_frame.grid_columnconfigure(0, weight=1)
-        option_frame.grid_columnconfigure(1, weight=3)
-        ctk.CTkSwitch(option_frame, text="随机视觉特效", variable=self.randomize_effects_var).grid(
-            row=0, column=0, sticky="w", padx=16, pady=16
-        )
-        ctk.CTkLabel(
-            option_frame,
-            text="标题、简介、标签、缩略图和上传默认规则都在“上传”页设置。",
-            text_color="#b8c1cc",
-        ).grid(row=0, column=1, sticky="w", padx=16, pady=16)
-
-        action_frame = ctk.CTkFrame(tab)
-        action_frame.grid(row=2, column=0, sticky="ew", padx=16, pady=8)
-        for column in range(5):
-            action_frame.grid_columnconfigure(column, weight=1)
-        ctk.CTkButton(action_frame, text="预览计划", command=self._preview_plan).grid(
-            row=0, column=0, sticky="ew", padx=12, pady=12
-        )
-        ctk.CTkButton(action_frame, text="路径检查", command=self._validate_paths).grid(
-            row=0, column=1, sticky="ew", padx=12, pady=12
-        )
-        ctk.CTkButton(action_frame, text="模拟 1-2 分钟", command=self._start_simulation).grid(
-            row=0, column=2, sticky="ew", padx=12, pady=12
-        )
-        ctk.CTkButton(action_frame, text="开始真实流程", command=self._start_real_flow).grid(
-            row=0, column=3, sticky="ew", padx=12, pady=12
-        )
-        ctk.CTkButton(action_frame, text="打开当前输出目录", command=self._open_current_output).grid(
-            row=0, column=4, sticky="ew", padx=12, pady=12
-        )
-
-        self.start_preview = ctk.CTkTextbox(tab, height=420)
-        self.start_preview.grid(row=3, column=0, sticky="nsew", padx=16, pady=(8, 16))
-        tab.grid_rowconfigure(3, weight=1)
 
     def _build_upload_tab(self) -> None:
         base_tab = self.tabview.tab("上传")
@@ -2048,72 +1986,7 @@ class DashboardApp(ctk.CTk):
             randomize_effects=bool(self.randomize_effects_var.get()),
         )
 
-    def _preview_plan(self) -> None:
-        self.start_preview.delete("1.0", "end")
-        if not self.window_tasks:
-            self.start_preview.insert("1.0", "还没有任何窗口任务。先去上传页点窗口。")
-            return
-        defaults = self._collect_defaults()
-        try:
-            plan = build_window_plan(self.window_tasks, defaults)
-        except Exception as exc:
-            self.start_preview.insert("1.0", f"计划生成失败: {exc}")
-            return
-        lines = [
-            f"任务模式: {TASK_MODE_LABELS.get(self.task_mode_var.get(), self.task_mode_var.get())}",
-            f"日期: {defaults.date_mmdd}",
-            f"窗口数: {len(self.window_tasks)}",
-            "",
-            *plan.get("preview_lines", []),
-        ]
-        if self.task_mode_var.get() == "upload_only":
-            errors, warnings, resolved_dirs = validate_existing_output_dirs(
-                self.window_tasks,
-                date_mmdd=defaults.date_mmdd,
-                config=load_scheduler_settings(),
-                log=lambda *_args, **_kwargs: None,
-            )
-            lines.append("")
-            if resolved_dirs:
-                lines.append("现成成品目录:")
-                for tag, folder in resolved_dirs.items():
-                    lines.append(f"  - {tag}: {folder}")
-            if warnings:
-                lines.extend(f"警告: {item}" for item in warnings)
-            if errors:
-                lines.extend(f"错误: {item}" for item in errors)
-        self.start_preview.insert("1.0", "\n".join(lines))
-        self._save_state()
 
-    def _validate_paths(self) -> None:
-        if not self.window_tasks:
-            messagebox.showerror("无法检查", "请先去上传页加入窗口任务")
-            return
-        if self.task_mode_var.get() == "upload_only":
-            errors, warnings, resolved_dirs = validate_existing_output_dirs(
-                self.window_tasks,
-                date_mmdd=normalize_mmdd(self.date_var.get().strip() or _today_mmdd()),
-                config=load_scheduler_settings(),
-                log=self._log,
-            )
-        else:
-            errors, warnings = validate_group_sources(
-                self.window_tasks,
-                config=load_scheduler_settings(),
-                log=self._log,
-            )
-            resolved_dirs = {}
-        text = []
-        if resolved_dirs:
-            text.extend(f"可直接上传: {tag} -> {folder}" for tag, folder in resolved_dirs.items())
-        if warnings:
-            text.extend(f"警告: {item}" for item in warnings)
-        if errors:
-            text.extend(f"错误: {item}" for item in errors)
-            messagebox.showerror("路径检查失败", "\n".join(text))
-        else:
-            messagebox.showinfo("路径检查通过", "\n".join(text) if text else "素材目录检查通过。")
-        self._preview_plan()
 
     def _open_current_output(self) -> None:
         if self.window_tasks:
@@ -2124,25 +1997,6 @@ class DashboardApp(ctk.CTk):
         if target.exists():
             os.startfile(target)
 
-    def _start_simulation(self) -> None:
-        if not self.window_tasks:
-            messagebox.showerror("无法开始", "请先去上传页加入窗口任务")
-            return
-
-        def job() -> None:
-            defaults = self._collect_defaults()
-            self._persist_prompt_form_for_active_tasks()
-            seconds = int(self.simulate_seconds_var.get().strip() or "90")
-            result = execute_direct_media_workflow(
-                tasks=self.window_tasks,
-                defaults=defaults,
-                simulation=SimulationOptions(simulate_seconds=seconds, consume_sources=False, save_manifest=True),
-                log=self._log,
-            )
-            self._log(f"[模拟] 完成，共生成 {len(result.items)} 个视频")
-            self._log(json.dumps(result.as_dict(), ensure_ascii=False, indent=2))
-
-        self._run_background(job, task_name="模拟渲染", total_items=len(self.window_tasks), include_upload=False)
 
     def _collect_output_dirs_from_result(self, result) -> dict[str, str]:
         prepared: dict[str, str] = {}
@@ -2343,68 +2197,6 @@ class DashboardApp(ctk.CTk):
         finally:
             self.worker_process = None
         return False
-
-    def _start_real_flow(self) -> None:
-        if not self.window_tasks:
-            messagebox.showerror("无法开始", "请先去上传页加入窗口任务")
-            return
-
-        def job() -> bool:
-            defaults = self._collect_defaults()
-            self._persist_prompt_form_for_active_tasks()
-            mode = self.task_mode_var.get()
-            if mode == "upload_only":
-                errors, warnings, prepared_output_dirs = validate_existing_output_dirs(
-                    tasks=self.window_tasks,
-                    date_mmdd=defaults.date_mmdd,
-                    config=load_scheduler_settings(),
-                    log=self._log,
-                )
-                for warning in warnings:
-                    self._log(f"[上传] {warning}")
-                if errors:
-                    raise ValueError("\n".join(errors))
-                self._log("[上传] 只上传模式：按当前提示词重写现成成品的标题/简介/标签/缩略图")
-                refresh_existing_output_metadata(
-                    tasks=self.window_tasks,
-                    defaults=defaults,
-                    prepared_output_dirs=prepared_output_dirs,
-                    config=load_scheduler_settings(),
-                    log=self._log,
-                )
-                self._log("[开始] 只上传模式：检测到现成成品，直接上传")
-                return self._run_upload_command(
-                    defaults,
-                    detach=True,
-                    prepared_output_dirs=prepared_output_dirs,
-                )
-            self._log("[开始] 先执行渲染")
-            render_result = execute_direct_media_workflow(
-                tasks=self.window_tasks,
-                defaults=defaults,
-                simulation=SimulationOptions(simulate_seconds=0, consume_sources=True, save_manifest=True),
-                log=self._log,
-            )
-            if mode == "render_and_upload":
-                prepared_output_dirs = self._collect_output_dirs_from_result(render_result)
-                if not prepared_output_dirs:
-                    _errors, _warnings, prepared_output_dirs = validate_existing_output_dirs(
-                        tasks=self.window_tasks,
-                        date_mmdd=defaults.date_mmdd,
-                        config=load_scheduler_settings(),
-                        log=self._log,
-                    )
-                self._log("[开始] 渲染完成，继续上传")
-                return self._run_upload_command(defaults, detach=True, prepared_output_dirs=prepared_output_dirs)
-            return False
-
-        mode_label = TASK_MODE_LABELS.get(self.task_mode_var.get(), self.task_mode_var.get())
-        self._run_background(
-            job,
-            task_name=mode_label,
-            total_items=len(self.window_tasks),
-            include_upload=self.task_mode_var.get() == "render_and_upload",
-        )
 
     def _run_background(self, func, *, task_name: str, total_items: int, include_upload: bool = False) -> None:
         if self._has_active_background_work():
