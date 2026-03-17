@@ -11,6 +11,9 @@
 
 from __future__ import annotations
 
+import os
+import platform
+import subprocess
 from pathlib import Path
 from typing import Iterable
 
@@ -33,6 +36,25 @@ def first_existing(candidates: Iterable[Path]) -> Path | None:
         if candidate.exists():
             return candidate
     return None
+
+
+def open_path_in_file_manager(target: str | Path) -> bool:
+    """跨平台打开文件或目录。"""
+    path = Path(target).expanduser().resolve(strict=False)
+    if not path.exists():
+        return False
+
+    try:
+        system = platform.system()
+        if system == "Darwin":
+            subprocess.run(["open", str(path)], check=False)
+        elif system == "Windows":
+            os.startfile(str(path))
+        else:
+            subprocess.run(["xdg-open", str(path)], check=False)
+        return True
+    except Exception:
+        return False
 
 
 def resolve_config_file(base_dir: str | Path, filename: str) -> Path:

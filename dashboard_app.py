@@ -43,6 +43,7 @@ from run_plan_service import (
     validate_run_plan,
 )
 from group_upload_workflow import normalize_mmdd
+from path_helpers import open_path_in_file_manager
 from upload_window_planner import derive_tags_and_skip_channels
 from utils import get_all_tags, get_tag_info
 from workflow_core import (
@@ -1861,7 +1862,7 @@ class DashboardApp(ctk.CTk):
         else:
             target = Path(self.output_root_var.get())
         if target.exists():
-            os.startfile(target)
+            open_path_in_file_manager(target)
 
 
     def _collect_output_dirs_from_result(self, result) -> dict[str, str]:

@@ -62,7 +62,7 @@ class WorkflowCancelledError(RuntimeError):
     pass
 
 
-@dataclass(slots=True)
+@dataclass
 class ExecutionControl:
     pause_event: threading.Event = field(default_factory=threading.Event)
     cancel_event: threading.Event = field(default_factory=threading.Event)
@@ -145,7 +145,7 @@ def _read_json(path: Path, fallback: Any) -> Any:
         return fallback
 
 
-@dataclass(slots=True)
+@dataclass
 class WindowInfo:
     tag: str
     serial: int
@@ -153,7 +153,7 @@ class WindowInfo:
     is_ypp: bool = False
 
 
-@dataclass(slots=True)
+@dataclass
 class WindowTask:
     tag: str
     serial: int
@@ -206,7 +206,7 @@ class WindowTask:
         return row
 
 
-@dataclass(slots=True)
+@dataclass
 class WorkflowDefaults:
     date_mmdd: str
     visibility: str = "public"
@@ -287,14 +287,14 @@ def _build_render_options_from_defaults(defaults: WorkflowDefaults) -> RenderOpt
     return opts
 
 
-@dataclass(slots=True)
+@dataclass
 class SimulationOptions:
     simulate_seconds: int = 90
     consume_sources: bool = False
     save_manifest: bool = True
 
 
-@dataclass(slots=True)
+@dataclass
 class RenderedItem:
     tag: str
     serial: int
@@ -309,7 +309,7 @@ class RenderedItem:
     effect_desc: str
 
 
-@dataclass(slots=True)
+@dataclass
 class WorkflowResult:
     date_mmdd: str
     plan_path: str

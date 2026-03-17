@@ -11,6 +11,8 @@
 它不是渲染器本体，而是渲染完成后的“素材/频道信息中台”。
 """
 
+from __future__ import annotations
+
 import os
 import json
 import re

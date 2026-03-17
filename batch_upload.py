@@ -8,6 +8,8 @@ YouTube 批量上传脚本
   python3 batch_upload.py --tag 大提琴 --date 1.28 --dry-run  # 只预览不执行
 """
 
+from __future__ import annotations
+
 import asyncio
 import argparse
 import json
@@ -24,7 +26,7 @@ import platform
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 from browser_api import list_browser_envs, start_browser_debug_port, stop_browser_container
 from metadata_service import archive_uploaded_metadata
-from path_helpers import resolve_config_file
+from path_helpers import normalize_path, resolve_config_file
 from upload_window_planner import (
     find_window_task,
     load_window_upload_plan,
@@ -81,11 +83,9 @@ RETRYABLE_NETWORK_ERROR_MARKERS = (
 )
 SUPPORTED_VIDEO_EXTENSIONS = (".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm")
 
-# 详细上传记录目录 (平台自适应)
-if IS_MAC:
-    UPLOAD_RECORDS_DIR = Path("/Users/dazhilv/Downloads/youtube automation/3.实测复盘/04_上传记录")
-else:
-    UPLOAD_RECORDS_DIR = SCRIPT_DIR / "upload_records"
+# 详细上传记录目录 / 上传历史目录 (跨平台统一，支持环境变量覆盖)
+UPLOAD_RECORDS_DIR = normalize_path(os.environ.get("UPLOAD_RECORDS_DIR", "upload_records"), SCRIPT_DIR)
+UPLOAD_HISTORY_PATH = normalize_path(os.environ.get("UPLOAD_HISTORY_PATH", "data/upload_history.json"), SCRIPT_DIR)
 
 # ============ 播放列表名称映射 (方案三: 自动生成) ============
 # 特殊映射: tag → 播放列表名称 (如果不在这里, 自动生成 "超好聽的{tag}音樂")
@@ -7207,12 +7207,6 @@ async def batch_upload(
     
     # === 新增：记录上传日志 ===
     try:
-        history_path = (
-            Path("/Users/dazhilv/Downloads/youtube automation/項目发布/web_manager/data/upload_history.json")
-            if IS_MAC
-            else SCRIPT_DIR / "data" / "upload_history.json"
-        )
-
         new_record = {
             "date": date_key,
             "tag": tag,
@@ -7221,8 +7215,8 @@ async def batch_upload(
             "status": "success"
         }
 
-        if append_upload_history(history_path, new_record):
-            log(f"✅ 上传记录已保存到: {history_path.name}", "OK")
+        if append_upload_history(UPLOAD_HISTORY_PATH, new_record):
+            log(f"✅ 上传记录已保存到: {UPLOAD_HISTORY_PATH.name}", "OK")
 
     except Exception as e:
         log(f"⚠️ 保存日志失败: {e}", "WARN")

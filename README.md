@@ -40,6 +40,8 @@
 
 ## 启动
 
+Windows:
+
 ```powershell
 cd C:\youtube自动化
 py -3 dashboard.py
@@ -48,6 +50,13 @@ py -3 dashboard.py
 或者双击：
 
 - `C:\youtube自动化\启动统一控制台.bat`
+
+macOS:
+
+- 建议直接双击 `启动统一控制台.command`
+- 它会优先选择可用的 Tk Python，并在仓库内自动创建 `.venv/`
+- 首次运行会自动安装 `requirements.txt`
+- 如果提示没有可用 Tk Python，先执行 `brew install python@3.14 python-tk@3.14`
 
 ## 当前功能规则
 

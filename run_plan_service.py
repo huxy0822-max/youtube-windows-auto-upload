@@ -36,7 +36,7 @@ def _noop_log(_message: str) -> None:
     return
 
 
-@dataclass(slots=True)
+@dataclass
 class ModuleSelection:
     metadata: bool = False
     render: bool = False
@@ -56,7 +56,7 @@ class ModuleSelection:
         return [label for key, label in MODULE_LABELS.items() if self.as_dict().get(key)]
 
 
-@dataclass(slots=True)
+@dataclass
 class MediaScope:
     tag: str
     image_dir: str
@@ -65,7 +65,7 @@ class MediaScope:
     source_overrides: list[str] = field(default_factory=list)
 
 
-@dataclass(slots=True)
+@dataclass
 class RunPlan:
     tasks: list[WindowTask]
     defaults: WorkflowDefaults
@@ -79,7 +79,7 @@ class RunPlan:
     media_scopes: list[MediaScope] = field(default_factory=list)
 
 
-@dataclass(slots=True)
+@dataclass
 class ValidationReport:
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -93,7 +93,7 @@ class ValidationReport:
             raise ValueError("\n".join(self.errors))
 
 
-@dataclass(slots=True)
+@dataclass
 class ExecutionResult:
     run_plan: RunPlan
     validation: ValidationReport
