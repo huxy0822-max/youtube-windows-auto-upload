@@ -50,10 +50,12 @@ from upload_window_planner import derive_tags_and_skip_channels
 from utils import get_all_tags, get_tag_info
 from workflow_core import (
     CHANNEL_MAPPING_FILE,
+    ExecutionControl,
     PROMPT_STUDIO_FILE,
     SCHEDULER_CONFIG_FILE,
     WindowTask,
     WorkflowDefaults,
+    WorkflowCancelledError,
     create_task,
     describe_group_bindings,
     ensure_prompt_presets,
@@ -175,6 +177,42 @@ def _format_runtime_duration(seconds: float | int | None) -> str:
     if hours:
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
     return f"{minutes:02d}:{secs:02d}"
+
+
+def _suspend_windows_process(pid: int) -> None:
+    if pid <= 0 or os.name != "nt":
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    PROCESS_SUSPEND_RESUME = 0x0800
+    handle = ctypes.windll.kernel32.OpenProcess(PROCESS_SUSPEND_RESUME, False, pid)
+    if not handle:
+        raise OSError(f"无法打开进程 {pid} 进行暂停")
+    try:
+        status = ctypes.windll.ntdll.NtSuspendProcess(wintypes.HANDLE(handle))
+        if status != 0:
+            raise OSError(f"NtSuspendProcess failed: {status}")
+    finally:
+        ctypes.windll.kernel32.CloseHandle(handle)
+
+
+def _resume_windows_process(pid: int) -> None:
+    if pid <= 0 or os.name != "nt":
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    PROCESS_SUSPEND_RESUME = 0x0800
+    handle = ctypes.windll.kernel32.OpenProcess(PROCESS_SUSPEND_RESUME, False, pid)
+    if not handle:
+        raise OSError(f"无法打开进程 {pid} 进行恢复")
+    try:
+        status = ctypes.windll.ntdll.NtResumeProcess(wintypes.HANDLE(handle))
+        if status != 0:
+            raise OSError(f"NtResumeProcess failed: {status}")
+    finally:
+        ctypes.windll.kernel32.CloseHandle(handle)
 
 
 def _to_data_url(image: Image.Image) -> str:
@@ -384,6 +422,7 @@ class DashboardApp(ctk.CTk):
         self.run_elapsed_var = ctk.StringVar(value="00:00")
         self.run_eta_var = ctk.StringVar(value="--")
         self.run_last_log_var = ctk.StringVar(value="最近日志会显示在这里")
+        self.pause_button_text_var = ctk.StringVar(value="暂停")
 
         self._run_started_at: float | None = None
         self._run_mode_label: str = ""
@@ -396,6 +435,9 @@ class DashboardApp(ctk.CTk):
         self._run_include_upload: bool = False
         self._run_render_done: set[str] = set()
         self._run_upload_done: set[int] = set()
+        self.execution_control: ExecutionControl | None = None
+        self._run_paused: bool = False
+        self._cancel_requested: bool = False
 
     def _build_layout(self) -> None:
         self.grid_columnconfigure(0, weight=1)
@@ -453,6 +495,24 @@ class DashboardApp(ctk.CTk):
         self.run_progress_bar = ctk.CTkProgressBar(status_frame)
         self.run_progress_bar.grid(row=5, column=0, columnspan=4, sticky="ew", padx=14, pady=(6, 12))
         self.run_progress_bar.set(0.0)
+        control_bar = ctk.CTkFrame(status_frame, fg_color="transparent")
+        control_bar.grid(row=6, column=0, columnspan=4, sticky="w", padx=10, pady=(0, 12))
+        self.pause_button = ctk.CTkButton(
+            control_bar,
+            textvariable=self.pause_button_text_var,
+            command=self._toggle_pause_current_task,
+            width=120,
+        )
+        self.pause_button.pack(side="left", padx=4)
+        self.cancel_button = ctk.CTkButton(
+            control_bar,
+            text="取消当前批次",
+            command=self._cancel_current_task,
+            width=140,
+            fg_color="#7a1f1f",
+            hover_color="#932525",
+        )
+        self.cancel_button.pack(side="left", padx=4)
 
         self.tabview = ctk.CTkTabview(self, corner_radius=18)
         self.tabview.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 18))
@@ -1208,6 +1268,67 @@ class DashboardApp(ctk.CTk):
     def _clear_logs(self) -> None:
         self.log_box.delete("1.0", "end")
 
+    def _active_upload_processes(self) -> list[subprocess.Popen[str]]:
+        processes: list[subprocess.Popen[str]] = []
+        if self.worker_process is not None and self.worker_process.poll() is None:
+            processes.append(self.worker_process)
+        for proc in self.worker_processes:
+            if proc.poll() is None:
+                processes.append(proc)
+        return processes
+
+    def _set_run_paused(self, paused: bool) -> None:
+        self._run_paused = bool(paused)
+        self.pause_button_text_var.set("继续" if paused else "暂停")
+        self._apply_run_status()
+
+    def _toggle_pause_current_task(self) -> None:
+        if not self._has_active_background_work():
+            messagebox.showinfo("没有运行中的任务", "当前没有可暂停的任务。")
+            return
+
+        target_state = not self._run_paused
+        try:
+            for proc in self._active_upload_processes():
+                if target_state:
+                    _suspend_windows_process(proc.pid)
+                else:
+                    _resume_windows_process(proc.pid)
+            if self.execution_control:
+                if target_state:
+                    self.execution_control.request_pause()
+                else:
+                    self.execution_control.request_resume()
+            self._set_run_paused(target_state)
+            self._log("[Control] 已暂停当前批次" if target_state else "[Control] 已继续当前批次")
+        except Exception as exc:
+            messagebox.showerror("暂停失败", str(exc))
+
+    def _cancel_current_task(self) -> None:
+        if not self._has_active_background_work():
+            messagebox.showinfo("没有运行中的任务", "当前没有可取消的任务。")
+            return
+        self._cancel_requested = True
+        if self.execution_control:
+            self.execution_control.request_cancel()
+            self.execution_control.request_resume()
+        for proc in self._active_upload_processes():
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        self._set_run_paused(False)
+        self._log("[Control] 已请求取消当前批次")
+
+    def _has_active_background_work(self) -> bool:
+        return bool(
+            (self.worker_thread and self.worker_thread.is_alive())
+            or (self.upload_monitor_thread and self.upload_monitor_thread.is_alive())
+            or self.worker_process is not None
+            or bool(self.worker_processes)
+            or any(thread.is_alive() for thread in self.upload_monitor_threads)
+        )
+
     def _apply_run_status(self) -> None:
         if not self._run_started_at:
             self.run_status_var.set("空闲")
@@ -1219,6 +1340,8 @@ class DashboardApp(ctk.CTk):
             if not self.run_last_log_var.get().strip():
                 self.run_last_log_var.set("最近日志会显示在这里")
             self.run_progress_bar.set(0.0)
+            self._run_paused = False
+            self.pause_button_text_var.set("暂停")
             return
 
         elapsed = time.time() - self._run_started_at
@@ -1230,8 +1353,12 @@ class DashboardApp(ctk.CTk):
             remaining = max(0.0, elapsed * (1.0 - progress) / progress)
             eta = _format_runtime_duration(remaining)
 
-        self.run_status_var.set(f"运行中 | {self._run_mode_label}")
-        self.run_phase_var.set(self._run_phase or "处理中")
+        status_text = "已暂停" if self._run_paused else "运行中"
+        self.run_status_var.set(f"{status_text} | {self._run_mode_label}")
+        phase_text = self._run_phase or "处理中"
+        if self._run_paused and not phase_text.startswith("已暂停"):
+            phase_text = f"已暂停 | {phase_text}"
+        self.run_phase_var.set(phase_text)
         self.run_detail_var.set(self._run_current_item or "等待首条进度")
         self.run_progress_var.set(f"{self._run_completed_steps}/{self._run_total_steps} | {progress * 100:.0f}%")
         self.run_elapsed_var.set(_format_runtime_duration(elapsed))
@@ -1248,19 +1375,23 @@ class DashboardApp(ctk.CTk):
         self._run_current_ratio = 0.0
         self._run_current_item = f"{self._run_total_items} 个窗口待处理"
         self._run_phase = "准备中"
+        self.execution_control = ExecutionControl()
+        self._cancel_requested = False
+        self._run_paused = False
+        self.pause_button_text_var.set("暂停")
         self._run_render_done.clear()
         self._run_upload_done.clear()
         self.run_last_log_var.set("任务已启动，等待第一条日志")
         self._apply_run_status()
 
-    def _finish_run_tracking(self, *, success: bool, summary: str) -> None:
+    def _finish_run_tracking(self, *, success: bool, summary: str, cancelled: bool = False) -> None:
         elapsed = time.time() - self._run_started_at if self._run_started_at else 0.0
-        self.run_status_var.set("已完成" if success else "失败")
+        self.run_status_var.set("已取消" if cancelled else ("已完成" if success else "失败"))
         self.run_phase_var.set("任务结束")
         self.run_detail_var.set(summary)
         self.run_progress_var.set(f"{self._run_completed_steps}/{self._run_total_steps}")
         self.run_elapsed_var.set(_format_runtime_duration(elapsed))
-        self.run_eta_var.set("00:00" if success else "--")
+        self.run_eta_var.set("00:00" if success or cancelled else "--")
         self.run_progress_bar.set(1.0 if success else self.run_progress_bar.get())
         self._run_started_at = None
         self._run_mode_label = ""
@@ -1271,6 +1402,10 @@ class DashboardApp(ctk.CTk):
         self._run_current_item = ""
         self._run_phase = "空闲"
         self._run_include_upload = False
+        self.execution_control = None
+        self._cancel_requested = False
+        self._run_paused = False
+        self.pause_button_text_var.set("暂停")
         self._run_render_done.clear()
         self._run_upload_done.clear()
 
@@ -1299,6 +1434,12 @@ class DashboardApp(ctk.CTk):
 
         if text.startswith("[开始]"):
             self._run_phase = text[4:].strip() or "开始"
+        elif text.startswith("[Control] Paused"):
+            self._run_phase = "已暂停"
+        elif text.startswith("[Control] Resumed"):
+            self._run_phase = "继续执行"
+        elif text.startswith("[Control] 已请求取消") or text.startswith("[取消]"):
+            self._run_phase = "取消中"
         elif text.startswith("[计划]"):
             self._run_phase = "生成计划"
         elif text.startswith("[任务]"):
@@ -1348,12 +1489,7 @@ class DashboardApp(ctk.CTk):
             f"预计剩余: {self.run_eta_var.get()}",
             f"最近日志: {self.run_last_log_var.get()}",
         ]
-        if (
-            (self.worker_thread and self.worker_thread.is_alive())
-            or self.worker_process is not None
-            or bool(self.worker_processes)
-            or any(thread.is_alive() for thread in self.upload_monitor_threads)
-        ):
+        if self._has_active_background_work():
             parts.append("说明: 你可以继续切换其他页面查看或改配置；新的开始任务会等当前流程结束")
         return "\n".join(parts)
 
@@ -2094,6 +2230,9 @@ class DashboardApp(ctk.CTk):
                     failures = list(state["failures"])
                     self.worker_processes = []
                     self.upload_monitor_threads = []
+                if self._cancel_requested:
+                    self._post_ui_action(lambda: self._finish_run_tracking(success=False, summary="当前批次已取消", cancelled=True))
+                    return
                 if failures:
                     summary = " | ".join(failures[:3])
                     self._post_ui_action(lambda: self._finish_run_tracking(success=False, summary=summary))
@@ -2109,10 +2248,11 @@ class DashboardApp(ctk.CTk):
                         for line in proc.stdout:
                             self._log(f"[Upload {label}] {line.rstrip()}")
                         return_code = proc.wait()
-                        if return_code != 0:
+                        if return_code != 0 and not self._cancel_requested:
                             error_text = f"{label} exit {return_code}"
                     except Exception as exc:
-                        error_text = f"{label}: {exc}"
+                        if not self._cancel_requested:
+                            error_text = f"{label}: {exc}"
                     finally:
                         with completion_lock:
                             state["remaining"] -= 1
@@ -2180,6 +2320,9 @@ class DashboardApp(ctk.CTk):
                     self.worker_process = None
                     self.upload_monitor_thread = None
 
+                if self._cancel_requested:
+                    self._post_ui_action(lambda: self._finish_run_tracking(success=False, summary="当前批次已取消", cancelled=True))
+                    return
                 if error_text:
                     self._post_ui_action(lambda: self._finish_run_tracking(success=False, summary=error_text))
                     self._post_ui_action(lambda: messagebox.showerror("上传任务失败", error_text))
@@ -2264,13 +2407,7 @@ class DashboardApp(ctk.CTk):
         )
 
     def _run_background(self, func, *, task_name: str, total_items: int, include_upload: bool = False) -> None:
-        if (
-            (self.worker_thread and self.worker_thread.is_alive())
-            or (self.upload_monitor_thread and self.upload_monitor_thread.is_alive())
-            or self.worker_process is not None
-            or bool(self.worker_processes)
-            or any(thread.is_alive() for thread in self.upload_monitor_threads)
-        ):
+        if self._has_active_background_work():
             messagebox.showinfo("任务进行中", self._current_run_summary())
             return
 
@@ -2279,6 +2416,10 @@ class DashboardApp(ctk.CTk):
         def runner() -> None:
             try:
                 deferred_finish = bool(func())
+            except WorkflowCancelledError as exc:
+                self._log(f"[取消] {exc}")
+                self._post_ui_action(lambda: self._finish_run_tracking(success=False, summary=str(exc), cancelled=True))
+                return
             except Exception as exc:
                 self._log(f"[错误] {exc}")
                 self._post_ui_action(lambda: self._finish_run_tracking(success=False, summary=str(exc)))
@@ -2286,7 +2427,10 @@ class DashboardApp(ctk.CTk):
                 return
             if deferred_finish:
                 return
-            self._post_ui_action(lambda: self._finish_run_tracking(success=True, summary="任务已执行完成"))
+            if self._cancel_requested:
+                self._post_ui_action(lambda: self._finish_run_tracking(success=False, summary="当前批次已取消", cancelled=True))
+            else:
+                self._post_ui_action(lambda: self._finish_run_tracking(success=True, summary="任务已执行完成"))
 
         self.worker_thread = threading.Thread(target=runner, daemon=True)
         self.worker_thread.start()
@@ -2565,7 +2709,12 @@ class DashboardApp(ctk.CTk):
             self._persist_prompt_form_for_active_tasks()
             run_plan = self._build_current_run_plan()
             seconds = int(self.simulate_seconds_var.get().strip() or "90")
-            result = execute_simulation_plan(run_plan, simulate_seconds=seconds, log=self._log)
+            result = execute_simulation_plan(
+                run_plan,
+                simulate_seconds=seconds,
+                control=self.execution_control,
+                log=self._log,
+            )
             self._log(f"[Simulate] Finished. Generated {len(result.items)} videos")
             self._log(json.dumps(result.as_dict(), ensure_ascii=False, indent=2))
 
@@ -2583,7 +2732,7 @@ class DashboardApp(ctk.CTk):
         def job() -> bool:
             self._persist_prompt_form_for_active_tasks()
             run_plan = self._build_current_run_plan()
-            execution = execute_run_plan(run_plan, log=self._log)
+            execution = execute_run_plan(run_plan, control=self.execution_control, log=self._log)
 
             if run_plan.modules.upload:
                 self._log("[Start] Upload module")

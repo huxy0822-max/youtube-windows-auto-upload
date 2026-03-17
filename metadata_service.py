@@ -72,16 +72,31 @@ def load_used_metadata_history(config: dict[str, Any] | None = None) -> dict[str
     return raw
 
 
+def _iter_metadata_rows(data: dict[str, Any], *, tag: str | None = None) -> list[dict[str, Any]]:
+    tags = data.get("tags", {})
+    if not isinstance(tags, dict):
+        return []
+    if tag:
+        rows = tags.get(_metadata_key(tag), [])
+        return [item for item in rows if isinstance(item, dict)] if isinstance(rows, list) else []
+
+    merged: list[dict[str, Any]] = []
+    for rows in tags.values():
+        if not isinstance(rows, list):
+            continue
+        merged.extend(item for item in rows if isinstance(item, dict))
+    return merged
+
+
 def get_used_metadata_scope(
     tag: str,
     *,
     config: dict[str, Any] | None = None,
     limit: int | None = None,
+    global_scope: bool = True,
 ) -> dict[str, list[str]]:
     data = load_used_metadata_history(config)
-    rows = data.get("tags", {}).get(_metadata_key(tag), [])
-    if not isinstance(rows, list):
-        rows = []
+    rows = _iter_metadata_rows(data, tag=None if global_scope else tag)
     if limit and limit > 0:
         rows = rows[-limit:]
     titles = [str(item.get("title") or "").strip() for item in rows if isinstance(item, dict) and str(item.get("title") or "").strip()]
@@ -176,7 +191,8 @@ def record_used_metadata(
         source=source,
     )
     signature = _record_signature(record)
-    if signature and any(_record_signature(item) == signature for item in rows if isinstance(item, dict)):
+    all_rows = _iter_metadata_rows(data)
+    if signature and any(_record_signature(item) == signature for item in all_rows):
         _write_json(get_used_metadata_history_path(config), data)
         return
     rows.append(record)

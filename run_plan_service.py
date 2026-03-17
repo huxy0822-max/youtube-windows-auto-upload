@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from workflow_core import (
+    ExecutionControl,
     SimulationOptions,
     WindowTask,
     WorkflowDefaults,
@@ -241,6 +242,7 @@ def execute_simulation_plan(
     run_plan: RunPlan,
     *,
     simulate_seconds: int,
+    control: ExecutionControl | None = None,
     log: LogFunc = _noop_log,
 ) -> WorkflowResult:
     validation = validate_run_plan(run_plan, log=log)
@@ -255,11 +257,17 @@ def execute_simulation_plan(
             consume_sources=False,
             save_manifest=True,
         ),
+        control=control,
         log=log,
     )
 
 
-def execute_run_plan(run_plan: RunPlan, *, log: LogFunc = _noop_log) -> ExecutionResult:
+def execute_run_plan(
+    run_plan: RunPlan,
+    *,
+    control: ExecutionControl | None = None,
+    log: LogFunc = _noop_log,
+) -> ExecutionResult:
     validation = validate_run_plan(run_plan, log=log)
     for warning in validation.warnings:
         log(f"[Validate] {warning}")
@@ -276,6 +284,7 @@ def execute_run_plan(run_plan: RunPlan, *, log: LogFunc = _noop_log) -> Executio
             tasks=run_plan.tasks,
             defaults=run_plan.defaults,
             simulation=SimulationOptions(simulate_seconds=0, consume_sources=True, save_manifest=True),
+            control=control,
             log=log,
         )
         result.workflow_result = workflow_result
@@ -287,6 +296,7 @@ def execute_run_plan(run_plan: RunPlan, *, log: LogFunc = _noop_log) -> Executio
         result.workflow_result = execute_metadata_only_workflow(
             tasks=run_plan.tasks,
             defaults=run_plan.defaults,
+            control=control,
             log=log,
         )
 
@@ -297,6 +307,7 @@ def execute_run_plan(run_plan: RunPlan, *, log: LogFunc = _noop_log) -> Executio
             defaults=run_plan.defaults,
             prepared_output_dirs=result.prepared_output_dirs,
             config=run_plan.config,
+            control=control,
             log=log,
         )
 

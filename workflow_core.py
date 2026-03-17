@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
@@ -54,6 +56,84 @@ LogFunc = Callable[[str], None]
 
 def _noop_log(_message: str) -> None:
     return
+
+
+class WorkflowCancelledError(RuntimeError):
+    pass
+
+
+@dataclass(slots=True)
+class ExecutionControl:
+    pause_event: threading.Event = field(default_factory=threading.Event)
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+
+    def request_pause(self) -> None:
+        self.pause_event.set()
+
+    def request_resume(self) -> None:
+        self.pause_event.clear()
+
+    def request_cancel(self) -> None:
+        self.cancel_event.set()
+
+    def is_paused(self) -> bool:
+        return self.pause_event.is_set()
+
+    def is_cancelled(self) -> bool:
+        return self.cancel_event.is_set()
+
+    def check_cancelled(self) -> None:
+        if self.cancel_event.is_set():
+            raise WorkflowCancelledError("任务已取消")
+
+    def wait_if_paused(self, *, log: LogFunc = _noop_log, label: str = "") -> None:
+        warned = False
+        while self.pause_event.is_set():
+            self.check_cancelled()
+            if not warned:
+                suffix = f" | {label}" if label else ""
+                log(f"[Control] Paused{suffix}")
+                warned = True
+            time.sleep(0.2)
+        if warned:
+            suffix = f" | {label}" if label else ""
+            log(f"[Control] Resumed{suffix}")
+
+
+def _suspend_process(pid: int) -> None:
+    if pid <= 0 or os.name != "nt":
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    PROCESS_SUSPEND_RESUME = 0x0800
+    handle = ctypes.windll.kernel32.OpenProcess(PROCESS_SUSPEND_RESUME, False, pid)
+    if not handle:
+        raise OSError(f"无法打开进程 {pid} 进行暂停")
+    try:
+        status = ctypes.windll.ntdll.NtSuspendProcess(wintypes.HANDLE(handle))
+        if status != 0:
+            raise OSError(f"NtSuspendProcess failed: {status}")
+    finally:
+        ctypes.windll.kernel32.CloseHandle(handle)
+
+
+def _resume_process(pid: int) -> None:
+    if pid <= 0 or os.name != "nt":
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    PROCESS_SUSPEND_RESUME = 0x0800
+    handle = ctypes.windll.kernel32.OpenProcess(PROCESS_SUSPEND_RESUME, False, pid)
+    if not handle:
+        raise OSError(f"无法打开进程 {pid} 进行恢复")
+    try:
+        status = ctypes.windll.ntdll.NtResumeProcess(wintypes.HANDLE(handle))
+        if status != 0:
+            raise OSError(f"NtResumeProcess failed: {status}")
+    finally:
+        ctypes.windll.kernel32.CloseHandle(handle)
 
 
 def _read_json(path: Path, fallback: Any) -> Any:
@@ -478,11 +558,8 @@ def _candidate_media_dirs(task: WindowTask, config: dict[str, Any], root_key: st
         candidates.append(path)
 
     add(task.source_dir)
-    add(config.get(root_key))
     add(get_group_bindings(config).get(task.tag))
-    root_text = str(config.get(root_key) or "").strip()
-    if root_text:
-        add(Path(root_text) / task.tag)
+    add(config.get(root_key))
     return candidates
 
 
@@ -1072,6 +1149,7 @@ def refresh_existing_output_metadata(
     defaults: WorkflowDefaults,
     prepared_output_dirs: dict[str, str],
     config: dict[str, Any] | None = None,
+    control: ExecutionControl | None = None,
     log: LogFunc = _noop_log,
 ) -> dict[str, str]:
     cfg = config or load_scheduler_settings()
@@ -1082,6 +1160,9 @@ def refresh_existing_output_metadata(
         grouped.setdefault(task.tag, []).append(task)
 
     for tag, tag_tasks in grouped.items():
+        if control:
+            control.check_cancelled()
+            control.wait_if_paused(log=log, label=f"{tag}/metadata_refresh")
         folder_text = str(prepared_output_dirs.get(tag) or "").strip()
         if not folder_text:
             raise ValueError(f"{tag} 没有可用的现成成品目录")
@@ -1100,6 +1181,9 @@ def refresh_existing_output_metadata(
         current_tag_signatures: list[str] = []
 
         for task in tag_tasks:
+            if control:
+                control.check_cancelled()
+                control.wait_if_paused(log=log, label=f"{tag}/{task.serial}")
             channel = channels.get(str(task.serial)) if isinstance(channels.get(str(task.serial)), dict) else {}
             video_path = _find_existing_video(output_dir, defaults.date_mmdd, task.serial, channel)
             if not video_path:
@@ -1151,6 +1235,9 @@ def refresh_existing_output_metadata(
             )
 
             if defaults.metadata_mode == "prompt_api" and (defaults.generate_text or defaults.generate_thumbnails):
+                if control:
+                    control.check_cancelled()
+                    control.wait_if_paused(log=log, label=f"{tag}/{task.serial} 文案生成")
                 generated = _generate_prompt_metadata(
                     tag=tag,
                     task=task,
@@ -1187,6 +1274,9 @@ def refresh_existing_output_metadata(
             if defaults.generate_thumbnails and not task.thumbnails:
                 if not cover_paths and bundle and str(bundle["api_preset"].get("autoImageEnabled") or "0") == "1":
                     for cover_index, prompt in enumerate(thumbnail_prompts[:cover_count], 1):
+                        if control:
+                            control.check_cancelled()
+                            control.wait_if_paused(log=log, label=f"{tag}/{task.serial} 缩略图生成")
                         target = tag_metadata_dir / f"{defaults.date_mmdd}_{task.serial}_cover_{cover_index:02d}.png"
                         try:
                             image_result = call_image_model(bundle["api_preset"], prompt)
@@ -1298,6 +1388,7 @@ def execute_metadata_only_workflow(
     *,
     tasks: list[WindowTask],
     defaults: WorkflowDefaults,
+    control: ExecutionControl | None = None,
     log: LogFunc = _noop_log,
 ) -> WorkflowResult:
     if not tasks:
@@ -1537,6 +1628,7 @@ def _render_with_progress(
     extra_inputs: list[str] | None,
     clip_seconds: int | None,
     log: LogFunc,
+    control: ExecutionControl | None = None,
 ) -> dict[str, Any]:
     from daily_scheduler import FFMPEG_BIN
 
@@ -1610,9 +1702,34 @@ def _render_with_progress(
         errors="replace",
         bufsize=1,
     )
+    suspended = False
 
     try:
         while True:
+            if control:
+                control.check_cancelled()
+                if control.is_paused():
+                    if not suspended:
+                        try:
+                            _suspend_process(process.pid)
+                            suspended = True
+                        except Exception as exc:
+                            log(f"[Control] 暂停渲染失败 {output_path.name}: {exc}")
+                    control.wait_if_paused(log=log, label=output_path.name)
+                    if suspended:
+                        try:
+                            _resume_process(process.pid)
+                            suspended = False
+                        except Exception as exc:
+                            log(f"[Control] 恢复渲染失败 {output_path.name}: {exc}")
+                else:
+                    if suspended:
+                        try:
+                            _resume_process(process.pid)
+                        except Exception as exc:
+                            log(f"[Control] 恢复渲染失败 {output_path.name}: {exc}")
+                        finally:
+                            suspended = False
             line = process.stdout.readline() if process.stdout else ""
             if not line:
                 if process.poll() is not None:
@@ -1650,7 +1767,30 @@ def _render_with_progress(
         mark_complete(output_path, duration=target_duration)
         log(f"[渲染] 完成 {output_path.name} | 耗时 {elapsed:.1f}s")
         return {"success": True, "time": elapsed}
+    except WorkflowCancelledError:
+        try:
+            process.terminate()
+            process.wait(timeout=5)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+        for _ in range(10):
+            try:
+                output_path.unlink(missing_ok=True)
+                break
+            except PermissionError:
+                time.sleep(0.2)
+        Path(str(output_path) + ".done").unlink(missing_ok=True)
+        log(f"[Control] 已取消渲染 {output_path.name}")
+        raise
     finally:
+        if suspended and process.poll() is None:
+            try:
+                _resume_process(process.pid)
+            except Exception:
+                pass
         for temp_path in (tmp_img, tmp_aud):
             if temp_path:
                 try:
@@ -1664,6 +1804,7 @@ def execute_direct_media_workflow(
     tasks: list[WindowTask],
     defaults: WorkflowDefaults,
     simulation: SimulationOptions | None = None,
+    control: ExecutionControl | None = None,
     log: LogFunc = _noop_log,
 ) -> WorkflowResult:
     if not tasks:
@@ -2026,9 +2167,8 @@ def _iter_output_dir_candidates(output_root: Path, date_mmdd: str, tag: str) -> 
         seen.add(key)
         ordered.append(candidate)
 
-    add(output_root / f"{date_mmdd}_{tag}")
-    add(output_root / tag)
     add(output_root)
+    add(output_root / f"{date_mmdd}_{tag}")
     if output_root.exists():
         for folder in sorted(output_root.glob(f"{date_mmdd}_*"), key=lambda item: item.name.lower()):
             if folder.is_dir():
@@ -2104,6 +2244,7 @@ def execute_metadata_only_workflow(
     *,
     tasks: list[WindowTask],
     defaults: WorkflowDefaults,
+    control: ExecutionControl | None = None,
     log: LogFunc = _noop_log,
 ) -> WorkflowResult:
     if not tasks:
@@ -2149,6 +2290,9 @@ def execute_metadata_only_workflow(
 
     for scope in _group_tasks_by_media_scope(tasks, config):
         tag = str(scope["tag"])
+        if control:
+            control.check_cancelled()
+            control.wait_if_paused(log=log, label=f"{tag}/metadata")
         state = state_for(tag)
         image_dir = Path(scope["image_dir"])
         audio_dir = Path(scope["audio_dir"])
@@ -2166,6 +2310,9 @@ def execute_metadata_only_workflow(
             log(f"[警告] {warning}")
 
         for task, source_image, source_audio in paired:
+            if control:
+                control.check_cancelled()
+                control.wait_if_paused(log=log, label=f"{tag}/{task.serial}")
             legacy = _load_daily_entry(state["metadata_dir"], defaults.date_mmdd, task.serial)
             history_scope = get_used_metadata_scope(tag, config=config)
             unique_seed = _build_unique_seed(
@@ -2192,6 +2339,9 @@ def execute_metadata_only_workflow(
             bundle = None
 
             if defaults.metadata_mode == "prompt_api" and (defaults.generate_text or defaults.generate_thumbnails):
+                if control:
+                    control.check_cancelled()
+                    control.wait_if_paused(log=log, label=f"{tag}/{task.serial} 文案生成")
                 generated = _generate_prompt_metadata(
                     tag=tag,
                     task=task,
@@ -2224,6 +2374,9 @@ def execute_metadata_only_workflow(
                 if bundle and str(bundle["api_preset"].get("autoImageEnabled") or "0") == "1":
                     cover_paths = []
                     for cover_index, prompt in enumerate(thumbnail_prompts[:cover_count], 1):
+                        if control:
+                            control.check_cancelled()
+                            control.wait_if_paused(log=log, label=f"{tag}/{task.serial} 缩略图生成")
                         target = state["metadata_dir"] / f"{defaults.date_mmdd}_{task.serial}_cover_{cover_index:02d}.png"
                         try:
                             image_result = call_image_model(bundle["api_preset"], prompt)
@@ -2321,6 +2474,7 @@ def execute_direct_media_workflow(
     tasks: list[WindowTask],
     defaults: WorkflowDefaults,
     simulation: SimulationOptions | None = None,
+    control: ExecutionControl | None = None,
     log: LogFunc = _noop_log,
 ) -> WorkflowResult:
     if not tasks:
@@ -2364,6 +2518,9 @@ def execute_direct_media_workflow(
 
     for scope in _group_tasks_by_media_scope(tasks, config):
         tag = str(scope["tag"])
+        if control:
+            control.check_cancelled()
+            control.wait_if_paused(log=log, label=f"{tag}/render")
         state = state_for(tag)
         image_dir = Path(scope["image_dir"])
         audio_dir = Path(scope["audio_dir"])
@@ -2381,6 +2538,9 @@ def execute_direct_media_workflow(
             log(f"[警告] {warning}")
 
         for task, source_image, source_audio in paired:
+            if control:
+                control.check_cancelled()
+                control.wait_if_paused(log=log, label=f"{tag}/{task.serial}")
             output_video = Path(state["output_dir"]) / f"{defaults.date_mmdd}_{task.serial}.mp4"
             clean_incomplete(output_video)
             output_video.unlink(missing_ok=True)
@@ -2399,6 +2559,7 @@ def execute_direct_media_workflow(
                 filter_complex=filter_complex,
                 extra_inputs=extra_inputs,
                 clip_seconds=simulation.simulate_seconds if simulation else None,
+                control=control,
                 log=log,
             )
 
@@ -2427,6 +2588,9 @@ def execute_direct_media_workflow(
             )
 
             if defaults.metadata_mode == "prompt_api" and (defaults.generate_text or defaults.generate_thumbnails):
+                if control:
+                    control.check_cancelled()
+                    control.wait_if_paused(log=log, label=f"{tag}/{task.serial} 文案生成")
                 generated = _generate_prompt_metadata(
                     tag=tag,
                     task=task,
@@ -2472,6 +2636,9 @@ def execute_direct_media_workflow(
             if defaults.generate_thumbnails:
                 if bundle and str(bundle["api_preset"].get("autoImageEnabled") or "0") == "1" and not cover_paths:
                     for cover_index, prompt in enumerate(thumbnail_prompts[:cover_count], 1):
+                        if control:
+                            control.check_cancelled()
+                            control.wait_if_paused(log=log, label=f"{tag}/{task.serial} 缩略图生成")
                         target = Path(state["metadata_dir"]) / f"{defaults.date_mmdd}_{task.serial}_cover_{cover_index:02d}.png"
                         try:
                             image_result = call_image_model(bundle["api_preset"], prompt)
