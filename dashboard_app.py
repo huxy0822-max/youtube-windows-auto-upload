@@ -331,6 +331,7 @@ class DashboardApp(ctk.CTk):
         self.add_category_var = ctk.StringVar(value=state.get("add_category", "Music"))
         self.add_kids_var = ctk.StringVar(value=state.get("add_kids", "no"))
         self.add_ai_var = ctk.StringVar(value=state.get("add_ai", "yes"))
+        self.add_notify_var = ctk.BooleanVar(value=bool(state.get("add_notify_subscribers", False)))
         self.add_schedule_enabled_var = ctk.BooleanVar(
             value=bool(state.get("add_schedule_enabled", bool(add_schedule_date))),
         )
@@ -351,6 +352,7 @@ class DashboardApp(ctk.CTk):
         self.default_category_var = ctk.StringVar(value=state.get("default_category", "Music"))
         self.default_kids_var = ctk.StringVar(value=state.get("default_kids", "no"))
         self.default_ai_var = ctk.StringVar(value=state.get("default_ai", "yes"))
+        self.default_notify_var = ctk.BooleanVar(value=bool(state.get("default_notify_subscribers", False)))
         self.schedule_enabled_var = ctk.BooleanVar(value=bool(state.get("schedule_enabled", False)))
         self.schedule_date_var = ctk.StringVar(
             value=state.get("schedule_date", default_schedule_date or _default_schedule_date()),
@@ -604,6 +606,11 @@ class DashboardApp(ctk.CTk):
         ctk.CTkOptionMenu(add_frame, variable=self.add_ai_var, values=YES_NO_VALUES).grid(
             row=1, column=5, sticky="ew", padx=(8, 16), pady=(0, 14)
         )
+        ctk.CTkCheckBox(
+            add_frame,
+            text="??????",
+            variable=self.add_notify_var,
+        ).grid(row=2, column=4, sticky="w", padx=8, pady=(0, 6))
         self.add_schedule_checkbox = ctk.CTkCheckBox(
             add_frame,
             text="窗口定时覆盖",
@@ -655,20 +662,27 @@ class DashboardApp(ctk.CTk):
         ctk.CTkOptionMenu(default_frame, variable=self.default_ai_var, values=YES_NO_VALUES).grid(
             row=2, column=3, sticky="ew", padx=8, pady=(0, 12)
         )
+        ctk.CTkCheckBox(
+            default_frame,
+            text="??????",
+            variable=self.default_notify_var,
+        ).grid(
+            row=2, column=4, sticky="w", padx=8, pady=(0, 12)
+        )
         self.schedule_enabled_checkbox = ctk.CTkCheckBox(
             default_frame,
             text="启用定时发布",
             variable=self.schedule_enabled_var,
         )
         self.schedule_enabled_checkbox.grid(
-            row=2, column=4, sticky="w", padx=8, pady=(0, 12)
+            row=2, column=5, sticky="w", padx=8, pady=(0, 12)
         )
         ctk.CTkSwitch(
             default_frame,
             text="上传完成后自动关闭窗口",
             variable=self.upload_auto_close_var,
         ).grid(
-            row=2, column=5, sticky="w", padx=(8, 16), pady=(0, 12)
+            row=2, column=6, sticky="w", padx=(8, 16), pady=(0, 12)
         )
         ctk.CTkLabel(default_frame, text="发布日期").grid(row=3, column=0, sticky="w", padx=(16, 8), pady=(0, 6))
         ctk.CTkLabel(default_frame, text="发布时间").grid(row=3, column=1, sticky="w", padx=8, pady=(0, 6))
@@ -1096,6 +1110,7 @@ class DashboardApp(ctk.CTk):
             "add_category": self.add_category_var.get(),
             "add_kids": self.add_kids_var.get(),
             "add_ai": self.add_ai_var.get(),
+            "add_notify_subscribers": bool(self.add_notify_var.get()),
             "add_schedule_enabled": bool(self.add_schedule_enabled_var.get()),
             "add_schedule_date": self.add_schedule_date_var.get(),
             "add_schedule_time": self.add_schedule_time_var.get(),
@@ -1105,6 +1120,7 @@ class DashboardApp(ctk.CTk):
             "default_category": self.default_category_var.get(),
             "default_kids": self.default_kids_var.get(),
             "default_ai": self.default_ai_var.get(),
+            "default_notify_subscribers": bool(self.default_notify_var.get()),
             "schedule_enabled": bool(self.schedule_enabled_var.get()),
             "schedule_date": self.schedule_date_var.get(),
             "schedule_time": self.schedule_time_var.get(),
@@ -1545,6 +1561,7 @@ class DashboardApp(ctk.CTk):
             category=self.add_category_var.get(),
             made_for_kids=_bool_from_yes_no(self.add_kids_var.get()),
             altered_content=_bool_from_yes_no(self.add_ai_var.get()),
+            notify_subscribers=bool(self.add_notify_var.get()),
             scheduled_publish_at=self._compose_add_schedule(),
             schedule_timezone=self.add_schedule_timezone_var.get() if self.add_schedule_enabled_var.get() else "",
             source_dir=self.source_dir_override_var.get(),
@@ -2270,6 +2287,7 @@ class DashboardApp(ctk.CTk):
             category=self.default_category_var.get(),
             made_for_kids=_bool_from_yes_no(self.default_kids_var.get()),
             altered_content=_bool_from_yes_no(self.default_ai_var.get()),
+            notify_subscribers=bool(self.default_notify_var.get()),
             schedule_enabled=bool(self.schedule_enabled_var.get()),
             schedule_start=self._compose_default_schedule(),
             schedule_interval_minutes=int(self.schedule_interval_var.get().strip() or "60"),

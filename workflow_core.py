@@ -164,6 +164,7 @@ class WindowTask:
     category: str = "Music"
     made_for_kids: bool = False
     altered_content: bool = True
+    notify_subscribers: bool = False
     scheduled_publish_at: str = ""
     schedule_timezone: str = ""
     source_dir: str = ""
@@ -182,6 +183,7 @@ class WindowTask:
             "category": self.category,
             "made_for_kids": bool(self.made_for_kids),
             "altered_content": bool(self.altered_content),
+            "notify_subscribers": bool(self.notify_subscribers),
         }
         if self.title.strip():
             row["title"] = self.title.strip()
@@ -211,6 +213,7 @@ class WorkflowDefaults:
     category: str = "Music"
     made_for_kids: bool = False
     altered_content: bool = True
+    notify_subscribers: bool = False
     schedule_enabled: bool = False
     schedule_start: str = ""
     schedule_interval_minutes: int = 60
@@ -228,6 +231,7 @@ class WorkflowDefaults:
             "category": self.category,
             "made_for_kids": bool(self.made_for_kids),
             "altered_content": bool(self.altered_content),
+            "notify_subscribers": bool(self.notify_subscribers),
         }
         if self.schedule_enabled and self.visibility == "schedule" and self.schedule_start.strip():
             values["scheduled_publish_at"] = self.schedule_start.strip()
@@ -1381,6 +1385,7 @@ def _build_upload_options(task: WindowTask) -> dict[str, Any]:
         "category": task.category.strip() or "Music",
         "made_for_kids": bool(task.made_for_kids),
         "altered_content": bool(task.altered_content),
+        "notify_subscribers": bool(task.notify_subscribers),
     }
     if task.scheduled_publish_at.strip():
         values["scheduled_publish_at"] = task.scheduled_publish_at.strip()
@@ -1593,6 +1598,7 @@ def create_task(
     category: str = "Music",
     made_for_kids: bool = False,
     altered_content: bool = True,
+    notify_subscribers: bool = False,
     scheduled_publish_at: str = "",
     schedule_timezone: str = "",
     source_dir: str = "",
@@ -1608,6 +1614,7 @@ def create_task(
         category=str(category or "Music").strip() or "Music",
         made_for_kids=bool(made_for_kids),
         altered_content=bool(altered_content),
+        notify_subscribers=bool(notify_subscribers),
         scheduled_publish_at=str(scheduled_publish_at or "").strip(),
         schedule_timezone=str(schedule_timezone or "").strip(),
         source_dir=str(source_dir or "").strip(),

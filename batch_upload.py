@@ -3711,6 +3711,7 @@ async def upload_single_with_browser_recovery(
     schedule_timezone: Optional[str] = None,
     made_for_kids: bool = False,
     altered_content: bool = True,
+    notify_subscribers: bool = False,
     category: str = "Music",
 ) -> Dict[str, Any]:
     """浏览器/代理断线时，停浏览器后自动重试一次。"""
@@ -3742,6 +3743,7 @@ async def upload_single_with_browser_recovery(
             schedule_timezone=schedule_timezone,
             made_for_kids=made_for_kids,
             altered_content=altered_content,
+            notify_subscribers=notify_subscribers,
             category=category,
         )
 
@@ -5680,6 +5682,7 @@ async def upload_single(
     schedule_timezone: Optional[str] = None,
     made_for_kids: bool = False,
     altered_content: bool = True,
+    notify_subscribers: bool = False,
     category: str = "Music",
 ) -> Dict[str, Any]:
     """上传单个视频到指定环境"""
@@ -5918,9 +5921,20 @@ async def upload_single(
                         except:
                             pass
                     
-                    # 刷新页面
-                    await page.reload(wait_until="domcontentloaded")
-                    await random_delay(5, 8)
+                    # 优先走更稳的恢复链，避免 reload 在 Studio 卡死
+                    reloaded = False
+                    try:
+                        await page.goto(with_studio_locale("https://studio.youtube.com"), wait_until="domcontentloaded", timeout=45000)
+                        reloaded = True
+                    except Exception as nav_exc:
+                        log(f"返回 Studio 首页失败，改用 reload: {nav_exc}", "WARN")
+                        try:
+                            await page.reload(wait_until="domcontentloaded", timeout=45000)
+                            reloaded = True
+                        except Exception as reload_exc:
+                            log(f"reload 失败，直接改走上传页兜底: {reload_exc}", "WARN")
+                    if reloaded:
+                        await random_delay(5, 8)
                     
                     # 重新打开上传对话框
                     reopened = False
@@ -5932,6 +5946,8 @@ async def upload_single(
                             break
                     if not reopened:
                         reopened = await open_direct_upload_page(page)
+                    if not reopened:
+                        log("恢复 Create/Upload 对话框失败，保留页面供下一轮 file chooser 重试", "WARN")
                     await random_delay(1, 2)
                     
                     # 检查下拉菜单
@@ -6237,6 +6253,11 @@ async def upload_single(
                     f"未能确认 Altered content = {'Yes' if altered_content else 'No'}",
                     "altered_content_selection_failed",
                 )
+
+            log(f"设置订阅通知 = {'On' if notify_subscribers else 'Off'}...")
+            notify_ok = await set_notify_subscribers(page, notify_subscribers)
+            if not notify_ok:
+                log("未能确认订阅通知开关状态，继续后续流程", "WARN")
             
             await random_delay(0.5, 1)
             
@@ -7031,6 +7052,7 @@ async def batch_upload(
                 schedule_timezone=schedule_timezone,
                 made_for_kids=made_for_kids,
                 altered_content=altered_content,
+                notify_subscribers=bool(ch_manifest.get("notify_subscribers", False)),
                 category=category,
             )
         except Exception as e:
@@ -7599,8 +7621,90 @@ async def set_video_category(page, category: str) -> bool:
     return False
 
 
+async def set_notify_subscribers(page, enabled: bool) -> bool:
+    target_text = "Publish to subscriptions feed and notify subscribers"
+    try:
+        result = await page.evaluate(
+            """
+            ([targetText, enabled]) => {
+                const visible = (el) => !!el && (
+                    el.offsetParent !== null ||
+                    el.offsetWidth > 0 ||
+                    el.offsetHeight > 0 ||
+                    el.getClientRects().length > 0
+                );
+                const textOf = (el) => ((el && (el.innerText || el.textContent)) || "").trim();
+                const roots = [document];
+                const seen = new Set([document]);
+
+                const isChecked = (node) => {
+                    const value = (
+                        node?.getAttribute?.("aria-checked") ||
+                        node?.getAttribute?.("checked") ||
+                        node?.querySelector?.("[aria-checked]")?.getAttribute?.("aria-checked") ||
+                        ""
+                    ).toString().toLowerCase();
+                    return value === "true";
+                };
+
+                const clickEl = (el) => {
+                    if (!(el instanceof HTMLElement) || !visible(el)) return false;
+                    try { el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" }); } catch (_) {}
+                    try { el.click(); } catch (_) {}
+                    for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+                        try {
+                            el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, composed: true }));
+                        } catch (_) {}
+                    }
+                    return true;
+                };
+
+                while (roots.length) {
+                    const root = roots.shift();
+                    const allNodes = root.querySelectorAll ? root.querySelectorAll("*") : [];
+                    for (const node of allNodes) {
+                        if (node && node.shadowRoot && !seen.has(node.shadowRoot)) {
+                            seen.add(node.shadowRoot);
+                            roots.push(node.shadowRoot);
+                        }
+                    }
+
+                    const candidates = Array.from(
+                        root.querySelectorAll
+                            ? root.querySelectorAll("ytcp-checkbox-lit, tp-yt-paper-checkbox, [role='checkbox']")
+                            : []
+                    );
+                    for (const candidate of candidates) {
+                        const container = candidate.closest?.("label, ytcp-checkbox-lit, tp-yt-paper-checkbox, div, span") || candidate;
+                        const text = textOf(container);
+                        if (!text.includes(targetText)) continue;
+                        const checked = isChecked(candidate) || isChecked(container);
+                        if (checked === !!enabled) {
+                            return { found: true, changed: false, checked };
+                        }
+                        const target =
+                            candidate.querySelector?.("#checkbox-container") ||
+                            candidate.querySelector?.("[role='checkbox']") ||
+                            candidate;
+                        const clicked = clickEl(target);
+                        return { found: true, changed: clicked, checked: !!enabled };
+                    }
+                }
+                return { found: false, changed: false, checked: false };
+            }
+            """,
+            [target_text, bool(enabled)],
+        )
+        if result.get("found"):
+            log(f"订阅通知已设置为 {'开启' if enabled else '关闭'}", "OK")
+            return True
+    except Exception as exc:
+        log(f"设置订阅通知失败: {exc}", "WARN")
+    return False
+
+
 async def set_video_category_music(page, max_attempts: int = 6) -> bool:
-    music_markers = ("music", "闊虫▊", "闊充箰")
+    music_markers = ("music", "音樂", "音乐")
 
     async def _read_state() -> Dict[str, Any]:
         texts: list[str] = []
@@ -7629,22 +7733,119 @@ async def set_video_category_music(page, max_attempts: int = 6) -> bool:
         }
 
     async def _options_visible() -> bool:
-        for selector in (
-            "tp-yt-paper-item:has-text('Music')",
-            "[role='option']:has-text('Music')",
-            "[role='menuitem']:has-text('Music')",
-            "tp-yt-paper-item:has-text('People & Blogs')",
-            "[role='option']:has-text('People & Blogs')",
-        ):
-            locator = page.locator(selector).first
-            try:
-                if await locator.count() > 0 and await locator.is_visible():
-                    return True
-            except Exception:
-                continue
-        return False
+        try:
+            return bool(
+                await page.evaluate(
+                    """
+                    () => {
+                        const visible = (el) => !!el && (
+                            el.offsetParent !== null ||
+                            el.offsetWidth > 0 ||
+                            el.offsetHeight > 0 ||
+                            el.getClientRects().length > 0
+                        );
+                        const textOf = (el) => ((el && (el.innerText || el.textContent)) || "").trim();
+                        const optionRe = /(^|\\s)music(\\s|$)|音樂|音乐|people\\s*&\\s*blogs|news\\s*&\\s*politics|教育|娛樂|娱乐|新聞|新闻/i;
+                        const roots = [document];
+                        const seen = new Set([document]);
+                        while (roots.length) {
+                            const root = roots.shift();
+                            const allNodes = root.querySelectorAll ? root.querySelectorAll("*") : [];
+                            for (const node of allNodes) {
+                                if (node && node.shadowRoot && !seen.has(node.shadowRoot)) {
+                                    seen.add(node.shadowRoot);
+                                    roots.push(node.shadowRoot);
+                                }
+                            }
+                            const items = Array.from(
+                                root.querySelectorAll
+                                    ? root.querySelectorAll("tp-yt-paper-item, [role='option'], [role='menuitem'], ytcp-menu-service-item-renderer")
+                                    : []
+                            );
+                            for (const item of items) {
+                                if (!visible(item)) continue;
+                                if (optionRe.test(textOf(item))) return true;
+                            }
+                        }
+                        return false;
+                    }
+                    """
+                )
+            )
+        except Exception:
+            return False
 
     async def _open_dropdown() -> bool:
+        try:
+            opened = await page.evaluate(
+                """
+                () => {
+                    const visible = (el) => !!el && (
+                        el.offsetParent !== null ||
+                        el.offsetWidth > 0 ||
+                        el.offsetHeight > 0 ||
+                        el.getClientRects().length > 0
+                    );
+                    const roots = [document];
+                    const seen = new Set([document]);
+                    const clickEl = (el) => {
+                        if (!(el instanceof HTMLElement) || !visible(el)) return false;
+                        try { el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" }); } catch (_) {}
+                        try { el.click(); } catch (_) {}
+                        for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+                            try {
+                                el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, composed: true }));
+                            } catch (_) {}
+                        }
+                        return true;
+                    };
+
+                    while (roots.length) {
+                        const root = roots.shift();
+                        const allNodes = root.querySelectorAll ? root.querySelectorAll("*") : [];
+                        for (const node of allNodes) {
+                            if (node && node.shadowRoot && !seen.has(node.shadowRoot)) {
+                                seen.add(node.shadowRoot);
+                                roots.push(node.shadowRoot);
+                            }
+                        }
+
+                        const field = root.querySelector?.("ytcp-form-select#category");
+                        if (field && visible(field)) {
+                            const triggers = [
+                                field.querySelector?.("[aria-haspopup='listbox']"),
+                                field.querySelector?.("[role='button']"),
+                                field.querySelector?.("#trigger"),
+                                field,
+                            ].filter(Boolean);
+                            for (const trigger of triggers) {
+                                if (clickEl(trigger)) return true;
+                            }
+                        }
+
+                        const containers = Array.from(
+                            root.querySelectorAll ? root.querySelectorAll("#category-container, #category") : []
+                        );
+                        for (const container of containers) {
+                            if (!visible(container)) continue;
+                            const trigger =
+                                container.querySelector?.("[aria-haspopup='listbox']") ||
+                                container.querySelector?.("[role='button']") ||
+                                container;
+                            if (clickEl(trigger)) return true;
+                        }
+                    }
+                    return false;
+                }
+                """
+            )
+            if opened:
+                await asyncio.sleep(0.8)
+                if await _options_visible():
+                    return True
+        except Exception:
+            pass
+
         for selector in (
             "ytcp-form-select#category",
             "#category",
@@ -7673,15 +7874,74 @@ async def set_video_category_music(page, max_attempts: int = 6) -> bool:
         return False
 
     async def _pick_music_option() -> bool:
+        try:
+            picked = await page.evaluate(
+                """
+                () => {
+                    const visible = (el) => !!el && (
+                        el.offsetParent !== null ||
+                        el.offsetWidth > 0 ||
+                        el.offsetHeight > 0 ||
+                        el.getClientRects().length > 0
+                    );
+                    const textOf = (el) => ((el && (el.innerText || el.textContent)) || "").trim();
+                    const musicRe = /(^|\\s)music(\\s|$)|音樂|音乐/i;
+                    const roots = [document];
+                    const seen = new Set([document]);
+                    const clickEl = (el) => {
+                        if (!(el instanceof HTMLElement) || !visible(el)) return false;
+                        try { el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" }); } catch (_) {}
+                        try { el.click(); } catch (_) {}
+                        for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+                            try {
+                                el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, composed: true }));
+                            } catch (_) {}
+                        }
+                        return true;
+                    };
+
+                    while (roots.length) {
+                        const root = roots.shift();
+                        const allNodes = root.querySelectorAll ? root.querySelectorAll("*") : [];
+                        for (const node of allNodes) {
+                            if (node && node.shadowRoot && !seen.has(node.shadowRoot)) {
+                                seen.add(node.shadowRoot);
+                                roots.push(node.shadowRoot);
+                            }
+                        }
+
+                        const items = Array.from(
+                            root.querySelectorAll
+                                ? root.querySelectorAll("tp-yt-paper-item, [role='option'], [role='menuitem'], ytcp-menu-service-item-renderer")
+                                : []
+                        );
+                        for (const item of items) {
+                            if (!musicRe.test(textOf(item))) continue;
+                            const target =
+                                item.querySelector?.("[role='option']") ||
+                                item.querySelector?.("[role='menuitem']") ||
+                                item;
+                            if (clickEl(target)) return true;
+                        }
+                    }
+                    return false;
+                }
+                """
+            )
+            if picked:
+                return True
+        except Exception:
+            pass
+
         for selector in (
             "tp-yt-paper-item:has-text('Music')",
             "[role='option']:has-text('Music')",
             "[role='menuitem']:has-text('Music')",
             "ytcp-menu-service-item-renderer:has-text('Music')",
-            "tp-yt-paper-item:has-text('闊虫▊')",
-            "[role='option']:has-text('闊虫▊')",
-            "tp-yt-paper-item:has-text('闊充箰')",
-            "[role='option']:has-text('闊充箰')",
+            "tp-yt-paper-item:has-text('音樂')",
+            "[role='option']:has-text('音樂')",
+            "tp-yt-paper-item:has-text('音乐')",
+            "[role='option']:has-text('音乐')",
         ):
             locator = page.locator(selector).first
             try:
@@ -7714,6 +7974,7 @@ async def set_video_category_music(page, max_attempts: int = 6) -> bool:
         if not opened:
             await asyncio.sleep(0.8)
             continue
+        await asyncio.sleep(0.8)
         picked = await _pick_music_option()
         log(f"Category final pick#{attempt}: picked={picked}", "INFO")
         if not picked:
