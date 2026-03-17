@@ -321,7 +321,6 @@ class DashboardApp(ctk.CTk):
         self.visual_text_style_var = ctk.StringVar(value=str(state.get("visual_text_style", visual_cfg.get("text_style", "Classic"))))
         self.generate_text_var = ctk.BooleanVar(value=bool(state.get("generate_text", True)))
         self.generate_thumbnails_var = ctk.BooleanVar(value=bool(state.get("generate_thumbnails", True)))
-        self.sync_daily_content_var = ctk.BooleanVar(value=bool(state.get("sync_daily_content", True)))
         metadata_mode = state.get("metadata_mode", "prompt_api")
         metadata_label = next((label for label, value in METADATA_MODE_LABELS.items() if value == metadata_mode), "提示词那套")
         self.metadata_mode_var = ctk.StringVar(value=metadata_label)
@@ -407,10 +406,10 @@ class DashboardApp(ctk.CTk):
         self.desc_len_var = ctk.StringVar(value="300")
         self.tag_range_var = ctk.StringVar(value="10-20")
 
-        self.daily_group_var = ctk.StringVar(value=state.get("daily_group", current_group))
-        self.daily_date_var = ctk.StringVar(value=state.get("daily_date", self.date_var.get()))
-        self.daily_serial_var = ctk.StringVar(value=str(state.get("daily_serial", "")))
-        self.daily_is_ypp_var = ctk.StringVar(value=state.get("daily_is_ypp", "no"))
+        self.daily_group_var = ctk.StringVar(value=current_group)
+        self.daily_date_var = ctk.StringVar(value=self.date_var.get())
+        self.daily_serial_var = ctk.StringVar(value="")
+        self.daily_is_ypp_var = ctk.StringVar(value="no")
         self.daily_title_var = ctk.StringVar(value="")
         self.daily_covers_var = ctk.StringVar(value="")
         self.daily_ab_titles_var = ctk.StringVar(value="")
@@ -516,7 +515,7 @@ class DashboardApp(ctk.CTk):
 
         self.tabview = ctk.CTkTabview(self, corner_radius=18)
         self.tabview.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 18))
-        for name in ("快捷开始", "上传", "提示词", "当日内容", "路径配置", "日志"):
+        for name in ("快捷开始", "上传", "提示词", "路径配置", "日志"):
             self.tabview.add(name)
         self.tabview.add("高级视觉")
 
@@ -524,14 +523,12 @@ class DashboardApp(ctk.CTk):
         self._build_upload_tab()
         self._build_visual_tab()
         self._build_prompt_tab()
-        self._build_daily_tab()
         self._build_paths_tab()
         self._build_log_tab()
 
     def _bind_variable_events(self) -> None:
         self.current_group_var.trace_add("write", lambda *_: self._refresh_window_buttons())
         self.binding_group_var.trace_add("write", lambda *_: self.binding_folder_var.set(get_group_bindings(self.scheduler_config).get(self.binding_group_var.get(), "")))
-        self.daily_group_var.trace_add("write", lambda *_: self._refresh_daily_serials())
         self.prompt_group_var.trace_add("write", lambda *_: self._load_prompt_for_group())
         self.run_metadata_var.trace_add("write", lambda *_: self._preview_plan())
         self.run_render_var.trace_add("write", lambda *_: self._preview_plan())
@@ -584,9 +581,11 @@ class DashboardApp(ctk.CTk):
         ctk.CTkSwitch(group_frame, text="重生成缩略图", variable=self.generate_thumbnails_var).grid(
             row=2, column=3, sticky="w", padx=(0, 12), pady=(0, 10)
         )
-        ctk.CTkSwitch(group_frame, text="同步到当日内容", variable=self.sync_daily_content_var).grid(
-            row=2, column=4, sticky="w", padx=(0, 12), pady=(0, 10)
-        )
+        ctk.CTkLabel(
+            group_frame,
+            text="文案结果会直接写入当前文案输出目录和上传清单",
+            text_color="#9fb2c8",
+        ).grid(row=2, column=4, columnspan=2, sticky="w", padx=(0, 16), pady=(0, 10))
 
         add_frame = ctk.CTkFrame(tab)
         add_frame.grid(row=1, column=0, sticky="ew", padx=16, pady=8)
@@ -1113,7 +1112,6 @@ class DashboardApp(ctk.CTk):
 
     def _save_state(self) -> None:
         state = {
-            "task_mode": self.task_mode_var.get(),
             "run_metadata": bool(self.run_metadata_var.get()),
             "run_render": bool(self.run_render_var.get()),
             "run_upload": bool(self.run_upload_var.get()),
@@ -1146,7 +1144,6 @@ class DashboardApp(ctk.CTk):
             "visual_text_style": self.visual_text_style_var.get(),
             "generate_text": bool(self.generate_text_var.get()),
             "generate_thumbnails": bool(self.generate_thumbnails_var.get()),
-            "sync_daily_content": bool(self.sync_daily_content_var.get()),
             "metadata_mode": "prompt_api",
             "current_group": self.current_group_var.get(),
             "source_dir_override": self.source_dir_override_var.get(),
@@ -1173,10 +1170,6 @@ class DashboardApp(ctk.CTk):
             "schedule_interval": self.schedule_interval_var.get(),
             "upload_auto_close": bool(self.upload_auto_close_var.get()),
             "prompt_group": self.prompt_group_var.get(),
-            "daily_group": self.daily_group_var.get(),
-            "daily_date": self.daily_date_var.get(),
-            "daily_serial": self.daily_serial_var.get(),
-            "daily_is_ypp": self.daily_is_ypp_var.get(),
         }
         STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -1909,82 +1902,6 @@ class DashboardApp(ctk.CTk):
         self._audience_data_url = ""
         self.audience_result_box.delete("1.0", "end")
 
-    def _load_daily_entry(self) -> None:
-        tag = self.daily_group_var.get()
-        serial_text = self.daily_serial_var.get().strip()
-        if not tag or not serial_text.isdigit():
-            messagebox.showerror("加载失败", "请先选择分组和窗口")
-            return
-        tag_dir = Path(self.base_image_dir_var.get()) / tag
-        generation_map = load_generation_map(tag_dir / "generation_map.json")
-        channel = (generation_map.get("channels") or {}).get(serial_text) or {}
-        day_info = (channel.get("days") or {}).get(self.daily_date_var.get().strip()) or {}
-        self.daily_is_ypp_var.set(_yes_no_from_bool(bool(channel.get("is_ypp", False))))
-        self.daily_title_var.set(str(day_info.get("title") or ""))
-        self.daily_covers_var.set(",".join(day_info.get("covers") or []))
-        self.daily_ab_titles_var.set(",".join(day_info.get("ab_titles") or []))
-        self.daily_description_box.delete("1.0", "end")
-        self.daily_description_box.insert("1.0", str(day_info.get("description") or ""))
-
-    def _save_daily_entry(self) -> None:
-        tag = self.daily_group_var.get()
-        serial_text = self.daily_serial_var.get().strip()
-        if not tag or not serial_text.isdigit():
-            messagebox.showerror("保存失败", "请先选择分组和窗口")
-            return
-        tag_dir = Path(self.base_image_dir_var.get()) / tag
-        path = tag_dir / "generation_map.json"
-        data = load_generation_map(path)
-        channels = data.setdefault("channels", {})
-        channel = channels.setdefault(serial_text, {"is_ypp": _bool_from_yes_no(self.daily_is_ypp_var.get()), "days": {}})
-        channel["is_ypp"] = _bool_from_yes_no(self.daily_is_ypp_var.get())
-        channel.setdefault("days", {})
-        channel["days"][self.daily_date_var.get().strip()] = {
-            "title": self.daily_title_var.get().strip(),
-            "description": self.daily_description_box.get("1.0", "end").strip(),
-            "covers": [item.strip() for item in self.daily_covers_var.get().split(",") if item.strip()],
-            "ab_titles": [item.strip() for item in self.daily_ab_titles_var.get().split(",") if item.strip()],
-            "set": 1,
-        }
-        save_generation_map(path, data)
-        self._log(f"[当日内容] 已保存 {tag}/{serial_text}/{self.daily_date_var.get().strip()}")
-
-    def _sync_daily_manifest(self) -> None:
-        tag = self.daily_group_var.get()
-        tag_dir = Path(self.base_image_dir_var.get()) / tag
-        generation_map = load_generation_map(tag_dir / "generation_map.json")
-        manifest_path, count = sync_manifest_from_generation_map(
-            generation_map,
-            tag_dir,
-            Path(self.output_root_var.get()),
-            tag,
-            self.daily_date_var.get().strip(),
-        )
-        self._log(f"[当日内容] 已同步 manifest: {manifest_path} | 频道数 {count}")
-
-    def _open_daily_tag_dir(self) -> None:
-        tag = self.daily_group_var.get()
-        target = Path(self.base_image_dir_var.get()) / tag
-        if target.exists():
-            os.startfile(target)
-
-    def _collect_defaults(self) -> WorkflowDefaults:
-        return WorkflowDefaults(
-            date_mmdd=normalize_mmdd(self.date_var.get().strip() or _today_mmdd()),
-            visibility="schedule" if self.schedule_enabled_var.get() else self.default_visibility_var.get(),
-            category=self.default_category_var.get(),
-            made_for_kids=_bool_from_yes_no(self.default_kids_var.get()),
-            altered_content=_bool_from_yes_no(self.default_ai_var.get()),
-            schedule_enabled=bool(self.schedule_enabled_var.get()),
-            schedule_start=self._compose_default_schedule(),
-            schedule_interval_minutes=int(self.schedule_interval_var.get().strip() or "60"),
-            schedule_timezone=self.schedule_timezone_var.get().strip() or SCHEDULE_TIMEZONE_VALUES[0],
-            metadata_mode="prompt_api",
-            generate_text=bool(self.generate_text_var.get()),
-            generate_thumbnails=bool(self.generate_thumbnails_var.get()),
-            sync_daily_content=bool(self.sync_daily_content_var.get()),
-            randomize_effects=bool(self.randomize_effects_var.get()),
-        )
 
 
 
@@ -2428,7 +2345,7 @@ class DashboardApp(ctk.CTk):
             metadata_mode="prompt_api",
             generate_text=bool(modules["metadata"] and self.generate_text_var.get()),
             generate_thumbnails=bool(modules["metadata"] and self.generate_thumbnails_var.get()),
-            sync_daily_content=bool(modules["metadata"] and self.sync_daily_content_var.get()),
+            sync_daily_content=bool(modules["metadata"]),
             randomize_effects=bool(self.randomize_effects_var.get()),
             visual_settings=self._collect_visual_settings(),
         )

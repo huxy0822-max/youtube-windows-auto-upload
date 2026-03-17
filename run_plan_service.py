@@ -257,6 +257,7 @@ def execute_simulation_plan(
             consume_sources=False,
             save_manifest=True,
         ),
+        config=run_plan.config,
         control=control,
         log=log,
     )
@@ -284,6 +285,7 @@ def execute_run_plan(
             tasks=run_plan.tasks,
             defaults=run_plan.defaults,
             simulation=SimulationOptions(simulate_seconds=0, consume_sources=True, save_manifest=True),
+            config=run_plan.config,
             control=control,
             log=log,
         )
@@ -296,6 +298,7 @@ def execute_run_plan(
         result.workflow_result = execute_metadata_only_workflow(
             tasks=run_plan.tasks,
             defaults=run_plan.defaults,
+            config=run_plan.config,
             control=control,
             log=log,
         )

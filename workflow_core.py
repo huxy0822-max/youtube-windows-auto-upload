@@ -1193,8 +1193,8 @@ def refresh_existing_output_metadata(
             source_audio = _resolve_manifest_media_path(output_dir, channel.get("source_audio"))
             legacy = _load_daily_entry(tag_metadata_dir, defaults.date_mmdd, task.serial)
 
-            title = task.title.strip() or str(channel.get("title") or legacy.get("title") or video_path.stem).strip() or video_path.stem
-            description = task.description.strip() or str(channel.get("description") or legacy.get("description") or "").strip()
+            title = task.title.strip() or str(channel.get("title") or video_path.stem).strip() or video_path.stem
+            description = task.description.strip() or str(channel.get("description") or "").strip()
             tag_list = [str(item).strip() for item in task.tag_list if str(item).strip()]
             if not tag_list:
                 tag_list = [str(item).strip() for item in channel.get("tag_list", []) if str(item).strip()]
@@ -1202,7 +1202,7 @@ def refresh_existing_output_metadata(
             if not ab_titles:
                 ab_titles = [
                     str(item).strip()
-                    for item in (channel.get("ab_titles") or legacy.get("ab_titles") or [])
+                    for item in (channel.get("ab_titles") or [])
                     if str(item).strip()
                 ]
             cover_paths, cover_source = _pick_preferred_cover_paths(
@@ -1265,10 +1265,9 @@ def refresh_existing_output_metadata(
                     if task.is_ypp and not task.ab_titles:
                         ab_titles = list(generated["ab_titles"])
 
-            if defaults.generate_text:
-                if not bundle:
-                    title = str(legacy.get("title") or title or video_path.stem).strip() or video_path.stem
-                    description = str(legacy.get("description") or description or "").strip()
+            if defaults.generate_text and not bundle:
+                title = str(title or video_path.stem).strip() or video_path.stem
+                description = str(description or "").strip()
 
             cover_count = 3 if task.is_ypp else 1
             if defaults.generate_thumbnails and not task.thumbnails:
@@ -1301,7 +1300,7 @@ def refresh_existing_output_metadata(
                 thumb_preview = ", ".join(str(path) for path in cover_paths[:3])
                 log(f"[thumb] {tag}/{task.serial}: source={cover_source or 'existing'} | {thumb_preview}")
 
-            if defaults.sync_daily_content or defaults.generate_text or defaults.generate_thumbnails:
+            if defaults.generate_text or defaults.generate_thumbnails:
                 _save_daily_entry(
                     generation_map_path,
                     date_mmdd=defaults.date_mmdd,
@@ -1781,13 +1780,14 @@ def execute_metadata_only_workflow(
     *,
     tasks: list[WindowTask],
     defaults: WorkflowDefaults,
+    config: dict[str, Any] | None = None,
     control: ExecutionControl | None = None,
     log: LogFunc = _noop_log,
 ) -> WorkflowResult:
     if not tasks:
         raise ValueError("至少需要一个窗口任务")
 
-    config = load_scheduler_settings()
+    config = config or load_scheduler_settings()
     metadata_root = get_metadata_root(config)
     output_root = Path(config["output_root"])
     plan = build_window_plan(tasks, defaults)
@@ -1850,7 +1850,6 @@ def execute_metadata_only_workflow(
             if control:
                 control.check_cancelled()
                 control.wait_if_paused(log=log, label=f"{tag}/{task.serial}")
-            legacy = _load_daily_entry(state["metadata_dir"], defaults.date_mmdd, task.serial)
             history_scope = get_used_metadata_scope(tag, config=config)
             unique_seed = _build_unique_seed(
                 defaults.date_mmdd,
@@ -1861,8 +1860,8 @@ def execute_metadata_only_workflow(
                 "metadata_only",
             )
             channel = state["channels"].get(str(task.serial), {})
-            title = task.title.strip() or str(legacy.get("title") or f"{defaults.date_mmdd}_{task.serial}").strip()
-            description = task.description.strip() or str(legacy.get("description") or "").strip()
+            title = task.title.strip() or f"{defaults.date_mmdd}_{task.serial}"
+            description = task.description.strip()
             tag_list = [item for item in task.tag_list if str(item).strip()]
             ab_titles = [item for item in task.ab_titles if str(item).strip()]
             cover_paths = _load_existing_cover_paths(
@@ -1870,7 +1869,7 @@ def execute_metadata_only_workflow(
                 defaults.date_mmdd,
                 task.serial,
                 channel=channel,
-                legacy=legacy,
+                legacy={},
             )
             thumbnail_prompts: list[str] = []
             bundle = None
@@ -2011,13 +2010,14 @@ def execute_direct_media_workflow(
     tasks: list[WindowTask],
     defaults: WorkflowDefaults,
     simulation: SimulationOptions | None = None,
+    config: dict[str, Any] | None = None,
     control: ExecutionControl | None = None,
     log: LogFunc = _noop_log,
 ) -> WorkflowResult:
     if not tasks:
         raise ValueError("至少需要一个窗口任务")
 
-    config = load_scheduler_settings()
+    config = config or load_scheduler_settings()
     output_root = Path(config["output_root"])
     metadata_root = get_metadata_root(config)
     used_media_root = Path(config.get("used_media_root") or (SCRIPT_DIR / "workspace" / "AutoTask" / "_used_media"))
@@ -2157,15 +2157,10 @@ def execute_direct_media_workflow(
 
             if defaults.generate_text:
                 if not bundle:
-                    legacy = _load_daily_entry(Path(state["metadata_dir"]), defaults.date_mmdd, task.serial)
                     if not title:
-                        title = str(legacy.get("title") or output_video.stem).strip() or output_video.stem
+                        title = output_video.stem
                     if not description:
-                        description = str(legacy.get("description") or "").strip()
-                    if not tag_list:
-                        tag_list = [str(item).strip() for item in legacy.get("tag_list", []) if str(item).strip()]
-                    if not ab_titles and task.is_ypp:
-                        ab_titles = [str(item).strip() for item in legacy.get("ab_titles", []) if str(item).strip()]
+                        description = ""
             elif not title:
                 title = output_video.stem
 
@@ -2199,7 +2194,7 @@ def execute_direct_media_workflow(
             if thumb_preview:
                 log(f"[thumb] {tag}/{task.serial}: source={cover_source or 'existing'} | {thumb_preview}")
 
-            if defaults.sync_daily_content or defaults.generate_text or defaults.generate_thumbnails:
+            if defaults.generate_text or defaults.generate_thumbnails:
                 _save_daily_entry(
                     Path(state["generation_map_path"]),
                     date_mmdd=defaults.date_mmdd,
