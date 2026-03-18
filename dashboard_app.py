@@ -119,10 +119,49 @@ def _yes_no_from_bool(value: bool) -> str:
 
 
 def _with_random(values: list[str]) -> list[str]:
-    result = list(values)
-    if RANDOM_OPTION not in result:
-        result.append(RANDOM_OPTION)
-    return result
+    base = [str(item) for item in values if str(item)]
+    filtered = [item for item in base if item != RANDOM_OPTION]
+    if filtered and filtered[0].lower() == "none":
+        return [filtered[0], RANDOM_OPTION, *filtered[1:]]
+    return [RANDOM_OPTION, *filtered]
+
+
+def _with_random_first(values: list[str]) -> list[str]:
+    base = [str(item) for item in values if str(item)]
+    filtered = [item for item in base if item != RANDOM_OPTION]
+    return [RANDOM_OPTION, *filtered]
+
+
+def _split_range_value(raw: Any, default_min: Any, default_max: Any) -> tuple[str, str]:
+    value = str(raw or "").strip()
+    if not value:
+        return str(default_min), str(default_max)
+    if "-" in value:
+        left, right = value.split("-", 1)
+        left = left.strip()
+        right = right.strip()
+        if not left and not right:
+            return str(default_min), str(default_max)
+        if not left:
+            left = right
+        if not right:
+            right = left
+        return left, right
+    return value, value
+
+
+def _compose_range_value(min_value: str, max_value: str, fallback: Any) -> str:
+    min_text = str(min_value or "").strip()
+    max_text = str(max_value or "").strip()
+    if not min_text and not max_text:
+        return str(fallback)
+    if not min_text:
+        min_text = max_text
+    if not max_text:
+        max_text = min_text
+    if min_text == max_text:
+        return min_text
+    return f"{min_text}-{max_text}"
 
 
 def _today_mmdd() -> str:
@@ -310,20 +349,56 @@ class DashboardApp(ctk.CTk):
         self.visual_color_timeline_var = ctk.StringVar(value=str(state.get("visual_color_timeline", visual_cfg.get("color_timeline", "WhiteGold"))))
         self.visual_spectrum_y_var = ctk.StringVar(value=str(state.get("visual_spectrum_y", visual_cfg.get("spectrum_y", 530))))
         self.visual_spectrum_x_var = ctk.StringVar(value=str(state.get("visual_spectrum_x", visual_cfg.get("spectrum_x", -1))))
-        self.visual_spectrum_w_var = ctk.StringVar(value=str(state.get("visual_spectrum_w", visual_cfg.get("spectrum_w", 1200))))
+        spectrum_w_min, spectrum_w_max = _split_range_value(
+            state.get("visual_spectrum_w", visual_cfg.get("spectrum_w", 1200)),
+            1200,
+            1200,
+        )
+        self.visual_spectrum_w_min_var = ctk.StringVar(value=spectrum_w_min)
+        self.visual_spectrum_w_max_var = ctk.StringVar(value=spectrum_w_max)
         self.visual_film_grain_var = ctk.StringVar(value=str(state.get("visual_film_grain", visual_cfg.get("film_grain", "no"))))
-        self.visual_grain_strength_var = ctk.StringVar(value=str(state.get("visual_grain_strength", visual_cfg.get("grain_strength", 15))))
+        grain_strength_min, grain_strength_max = _split_range_value(
+            state.get("visual_grain_strength", visual_cfg.get("grain_strength", 15)),
+            15,
+            15,
+        )
+        self.visual_grain_strength_min_var = ctk.StringVar(value=grain_strength_min)
+        self.visual_grain_strength_max_var = ctk.StringVar(value=grain_strength_max)
         self.visual_vignette_var = ctk.StringVar(value=str(state.get("visual_vignette", visual_cfg.get("vignette", "no"))))
         self.visual_tint_var = ctk.StringVar(value=str(state.get("visual_tint", visual_cfg.get("color_tint", "none"))))
         self.visual_soft_focus_var = ctk.StringVar(value=str(state.get("visual_soft_focus", visual_cfg.get("soft_focus", "no"))))
-        self.visual_soft_focus_sigma_var = ctk.StringVar(value=str(state.get("visual_soft_focus_sigma", visual_cfg.get("soft_focus_sigma", 1.5))))
+        soft_focus_min, soft_focus_max = _split_range_value(
+            state.get("visual_soft_focus_sigma", visual_cfg.get("soft_focus_sigma", 1.5)),
+            1.5,
+            1.5,
+        )
+        self.visual_soft_focus_sigma_min_var = ctk.StringVar(value=soft_focus_min)
+        self.visual_soft_focus_sigma_max_var = ctk.StringVar(value=soft_focus_max)
         self.visual_particle_var = ctk.StringVar(value=str(state.get("visual_particle", visual_cfg.get("particle", "none"))))
-        self.visual_particle_opacity_var = ctk.StringVar(value=str(state.get("visual_particle_opacity", visual_cfg.get("particle_opacity", 0.6))))
-        self.visual_particle_speed_var = ctk.StringVar(value=str(state.get("visual_particle_speed", visual_cfg.get("particle_speed", 1.0))))
+        particle_opacity_min, particle_opacity_max = _split_range_value(
+            state.get("visual_particle_opacity", visual_cfg.get("particle_opacity", 0.6)),
+            0.6,
+            0.6,
+        )
+        self.visual_particle_opacity_min_var = ctk.StringVar(value=particle_opacity_min)
+        self.visual_particle_opacity_max_var = ctk.StringVar(value=particle_opacity_max)
+        particle_speed_min, particle_speed_max = _split_range_value(
+            state.get("visual_particle_speed", visual_cfg.get("particle_speed", 1.0)),
+            1.0,
+            1.0,
+        )
+        self.visual_particle_speed_min_var = ctk.StringVar(value=particle_speed_min)
+        self.visual_particle_speed_max_var = ctk.StringVar(value=particle_speed_max)
         self.visual_text_var = ctk.StringVar(value=str(state.get("visual_text", visual_cfg.get("text", ""))))
         self.visual_text_font_var = ctk.StringVar(value=str(state.get("visual_text_font", visual_cfg.get("text_font", "default"))))
         self.visual_text_pos_var = ctk.StringVar(value=str(state.get("visual_text_pos", visual_cfg.get("text_pos", "center"))))
-        self.visual_text_size_var = ctk.StringVar(value=str(state.get("visual_text_size", visual_cfg.get("text_size", 60))))
+        text_size_min, text_size_max = _split_range_value(
+            state.get("visual_text_size", visual_cfg.get("text_size", 60)),
+            60,
+            60,
+        )
+        self.visual_text_size_min_var = ctk.StringVar(value=text_size_min)
+        self.visual_text_size_max_var = ctk.StringVar(value=text_size_max)
         self.visual_text_style_var = ctk.StringVar(value=str(state.get("visual_text_style", visual_cfg.get("text_style", "Classic"))))
         self.generate_text_var = ctk.BooleanVar(value=bool(state.get("generate_text", True)))
         self.generate_thumbnails_var = ctk.BooleanVar(value=bool(state.get("generate_thumbnails", True)))
@@ -791,7 +866,7 @@ class DashboardApp(ctk.CTk):
         self._entry_row(basic, 5, "频谱样式", self.visual_style_var, values=_with_random(list_effects()))
         self._entry_row(basic, 6, "频谱 Y", self.visual_spectrum_y_var)
         self._entry_row(basic, 7, "频谱 X (-1=居中)", self.visual_spectrum_x_var)
-        self._entry_row(basic, 8, "频谱宽度", self.visual_spectrum_w_var)
+        self._range_row(basic, 8, "频谱宽度", self.visual_spectrum_w_min_var, self.visual_spectrum_w_max_var)
 
         mood = ctk.CTkFrame(tab)
         mood.grid(row=2, column=0, sticky="ew", padx=8, pady=8)
@@ -803,11 +878,23 @@ class DashboardApp(ctk.CTk):
         self._entry_row(mood, 1, "频谱配色", self.visual_color_spectrum_var, values=_with_random(list_palette_names()))
         self._entry_row(mood, 2, "时间轴配色", self.visual_color_timeline_var, values=_with_random(list_palette_names()))
         self._entry_row(mood, 3, "胶片颗粒", self.visual_film_grain_var, values=VISUAL_TOGGLE_VALUES)
-        self._entry_row(mood, 4, "颗粒强度", self.visual_grain_strength_var)
+        self._range_row(
+            mood,
+            4,
+            "颗粒强度",
+            self.visual_grain_strength_min_var,
+            self.visual_grain_strength_max_var,
+        )
         self._entry_row(mood, 5, "暗角", self.visual_vignette_var, values=VISUAL_TOGGLE_VALUES)
         self._entry_row(mood, 6, "色调", self.visual_tint_var, values=_with_random(list_tint_names()))
         self._entry_row(mood, 7, "柔焦", self.visual_soft_focus_var, values=VISUAL_TOGGLE_VALUES)
-        self._entry_row(mood, 8, "柔焦强度", self.visual_soft_focus_sigma_var)
+        self._range_row(
+            mood,
+            8,
+            "柔焦强度",
+            self.visual_soft_focus_sigma_min_var,
+            self.visual_soft_focus_sigma_max_var,
+        )
 
         overlay = ctk.CTkFrame(tab)
         overlay.grid(row=3, column=0, sticky="ew", padx=8, pady=8)
@@ -816,13 +903,31 @@ class DashboardApp(ctk.CTk):
         ctk.CTkLabel(overlay, text="贴纸 / 粒子 / 叠字", font=ctk.CTkFont(size=22, weight="bold")).grid(
             row=0, column=0, columnspan=4, sticky="w", padx=16, pady=(14, 12)
         )
-        self._entry_row(overlay, 1, "贴纸 / 粒子", self.visual_particle_var, values=_with_random(list_particle_effects()))
-        self._entry_row(overlay, 2, "贴纸透明度", self.visual_particle_opacity_var)
-        self._entry_row(overlay, 3, "贴纸速度", self.visual_particle_speed_var)
+        self._entry_row(
+            overlay,
+            1,
+            "贴纸 / 粒子",
+            self.visual_particle_var,
+            values=_with_random_first(list_particle_effects()),
+        )
+        self._range_row(
+            overlay,
+            2,
+            "贴纸透明度",
+            self.visual_particle_opacity_min_var,
+            self.visual_particle_opacity_max_var,
+        )
+        self._range_row(
+            overlay,
+            3,
+            "贴纸速度",
+            self.visual_particle_speed_min_var,
+            self.visual_particle_speed_max_var,
+        )
         self._entry_row(overlay, 4, "叠字内容", self.visual_text_var)
         self._entry_row(overlay, 5, "字体", self.visual_text_font_var, values=_with_random(list_font_names()))
         self._entry_row(overlay, 6, "文字位置", self.visual_text_pos_var, values=_with_random(list_text_positions()))
-        self._entry_row(overlay, 7, "文字大小", self.visual_text_size_var)
+        self._range_row(overlay, 7, "文字大小", self.visual_text_size_min_var, self.visual_text_size_max_var)
         self._entry_row(overlay, 8, "文字样式", self.visual_text_style_var, values=_with_random(list_text_styles()))
 
         help_frame = ctk.CTkFrame(tab)
@@ -837,7 +942,7 @@ class DashboardApp(ctk.CTk):
                 "1. 把新的 mp4 / mov / webm / mkv 叠层素材直接放进 overlays 文件夹。\n"
                 "2. 重开控制台后，新文件名会自动出现在“贴纸 / 粒子”下拉里。\n"
                 "3. 想按视频随机时，把下拉切成 random；像频谱宽度、颗粒强度、贴纸透明度、贴纸速度、文字大小，"
-                "可以直接输入区间，例如 1080-1600、6-18、0.35-0.75、0.85-1.15、48-72。\n"
+                "现在直接填左边最小值、右边最大值，系统会按每个视频单独随机。\n"
                 "4. 如果要新增真正的新滤镜，再扩 effects_library.py 里的 get_effect。"
             ),
             text_color="#b8c1cc",
@@ -955,66 +1060,6 @@ class DashboardApp(ctk.CTk):
         self.audience_result_box = ctk.CTkTextbox(audience_frame, height=140)
         self.audience_result_box.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 14))
 
-    def _build_paths_tab(self) -> None:
-        base_tab = self.tabview.tab("路径配置")
-        base_tab.grid_columnconfigure(0, weight=1)
-        base_tab.grid_rowconfigure(0, weight=1)
-        tab = ctk.CTkScrollableFrame(base_tab)
-        tab.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
-        tab.grid_columnconfigure(0, weight=1)
-
-        path_frame = ctk.CTkFrame(tab)
-        path_frame.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 8))
-        path_frame.grid_columnconfigure(0, weight=0)
-        path_frame.grid_columnconfigure(1, weight=1)
-        path_frame.grid_columnconfigure(2, weight=1)
-        path_frame.grid_columnconfigure(3, weight=1)
-        ctk.CTkLabel(path_frame, text="全局路径", font=ctk.CTkFont(size=24, weight="bold")).grid(
-            row=0, column=0, sticky="w", padx=16, pady=(14, 12)
-        )
-        for row, (label, var) in enumerate(
-            [
-                ("音乐目录", self.music_dir_var),
-                ("底图目录", self.base_image_dir_var),
-                ("输出目录", self.output_root_var),
-                ("FFmpeg", self.ffmpeg_var),
-                ("已用素材目录", self.used_media_root_var),
-                ("上传后保留天数", self.cleanup_days_var),
-            ],
-            start=1,
-        ):
-            self._entry_row(path_frame, row, label, var)
-        ctk.CTkButton(path_frame, text="保存路径配置", command=self._save_paths).grid(
-            row=7, column=0, columnspan=4, sticky="w", padx=16, pady=(0, 14)
-        )
-
-        binding_frame = ctk.CTkFrame(tab)
-        binding_frame.grid(row=1, column=0, sticky="nsew", padx=16, pady=(8, 16))
-        for column in range(4):
-            binding_frame.grid_columnconfigure(column, weight=1)
-        binding_frame.grid_rowconfigure(5, weight=1)
-        ctk.CTkLabel(binding_frame, text="分组绑定素材文件夹", font=ctk.CTkFont(size=24, weight="bold")).grid(
-            row=0, column=0, columnspan=4, sticky="w", padx=16, pady=(14, 12)
-        )
-        ctk.CTkLabel(binding_frame, text="分组").grid(row=1, column=0, sticky="w", padx=(16, 8), pady=(0, 6))
-        self.binding_group_menu = ctk.CTkOptionMenu(binding_frame, variable=self.binding_group_var, values=[""])
-        self.binding_group_menu.grid(row=2, column=0, sticky="ew", padx=(16, 8), pady=(0, 12))
-        ctk.CTkLabel(binding_frame, text="绑定目录").grid(row=1, column=1, sticky="w", padx=8, pady=(0, 6))
-        ctk.CTkEntry(binding_frame, textvariable=self.binding_folder_var).grid(
-            row=2, column=1, columnspan=2, sticky="ew", padx=8, pady=(0, 12)
-        )
-        ctk.CTkButton(binding_frame, text="选择目录", command=self._pick_binding_folder).grid(
-            row=2, column=3, sticky="ew", padx=(8, 16), pady=(0, 12)
-        )
-        bar = ctk.CTkFrame(binding_frame, fg_color="transparent")
-        bar.grid(row=3, column=0, columnspan=4, sticky="ew", padx=10, pady=(0, 8))
-        ctk.CTkButton(bar, text="保存绑定", command=self._save_binding).pack(side="left", padx=6)
-        ctk.CTkButton(bar, text="移除绑定", command=self._remove_binding).pack(side="left", padx=6)
-        ctk.CTkButton(bar, text="刷新分组列表", command=self._refresh_groups).pack(side="left", padx=6)
-        ctk.CTkLabel(binding_frame, text="当前绑定一览").grid(row=4, column=0, sticky="w", padx=16, pady=(0, 6))
-        self.binding_box = ctk.CTkTextbox(binding_frame, height=220)
-        self.binding_box.grid(row=5, column=0, columnspan=4, sticky="nsew", padx=16, pady=(0, 14))
-
     def _build_log_tab(self) -> None:
         tab = self.tabview.tab("日志")
         tab.grid_columnconfigure(0, weight=1)
@@ -1042,6 +1087,57 @@ class DashboardApp(ctk.CTk):
             widget = ctk.CTkEntry(parent, textvariable=variable, show=show or "")
         widget.grid(row=row, column=1, columnspan=3, sticky="ew", padx=16, pady=(0, 12))
 
+    def _range_row(
+        self,
+        parent: ctk.CTkFrame,
+        row: int,
+        label: str,
+        min_var: ctk.StringVar,
+        max_var: ctk.StringVar,
+    ) -> None:
+        ctk.CTkLabel(parent, text=label).grid(row=row, column=0, sticky="w", padx=16, pady=(0, 6))
+        ctk.CTkEntry(parent, textvariable=min_var, placeholder_text="最小值").grid(
+            row=row, column=1, sticky="ew", padx=(16, 8), pady=(0, 12)
+        )
+        ctk.CTkLabel(parent, text="到").grid(row=row, column=2, sticky="ew", padx=4, pady=(0, 12))
+        ctk.CTkEntry(parent, textvariable=max_var, placeholder_text="最大值").grid(
+            row=row, column=3, sticky="ew", padx=(8, 16), pady=(0, 12)
+        )
+
+    def _bind_scroll_frame_wheel(self, scroll_frame: ctk.CTkScrollableFrame, *widgets: ctk.CTkBaseClass) -> None:
+        canvas = getattr(scroll_frame, "_parent_canvas", None)
+        if canvas is None:
+            return
+
+        try:
+            canvas.configure(yscrollincrement=24)
+        except Exception:
+            pass
+
+        def _on_mousewheel(event: Any) -> str | None:
+            delta = 0
+            if getattr(event, "delta", 0):
+                delta = -int(event.delta / 120) if event.delta else 0
+            elif getattr(event, "num", None) == 4:
+                delta = -1
+            elif getattr(event, "num", None) == 5:
+                delta = 1
+            if delta:
+                canvas.yview_scroll(delta, "units")
+                return "break"
+            return None
+
+        def _bind_tree(widget: Any) -> None:
+            if isinstance(widget, ctk.CTkTextbox):
+                return
+            for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                widget.bind(sequence, _on_mousewheel, add="+")
+            for child in widget.winfo_children():
+                _bind_tree(child)
+
+        for widget in widgets:
+            _bind_tree(widget)
+
     def _collect_visual_settings(self) -> dict[str, Any]:
         return {
             "spectrum": _bool_from_yes_no(self.visual_spectrum_var.get()),
@@ -1053,20 +1149,44 @@ class DashboardApp(ctk.CTk):
             "color_timeline": self.visual_color_timeline_var.get().strip() or "WhiteGold",
             "spectrum_y": self.visual_spectrum_y_var.get().strip() or "530",
             "spectrum_x": self.visual_spectrum_x_var.get().strip() or "-1",
-            "spectrum_w": self.visual_spectrum_w_var.get().strip() or "1200",
+            "spectrum_w": _compose_range_value(
+                self.visual_spectrum_w_min_var.get(),
+                self.visual_spectrum_w_max_var.get(),
+                "1200",
+            ),
             "film_grain": _bool_from_yes_no(self.visual_film_grain_var.get()),
-            "grain_strength": self.visual_grain_strength_var.get().strip() or "15",
+            "grain_strength": _compose_range_value(
+                self.visual_grain_strength_min_var.get(),
+                self.visual_grain_strength_max_var.get(),
+                "15",
+            ),
             "vignette": _bool_from_yes_no(self.visual_vignette_var.get()),
             "color_tint": self.visual_tint_var.get().strip() or "none",
             "soft_focus": _bool_from_yes_no(self.visual_soft_focus_var.get()),
-            "soft_focus_sigma": self.visual_soft_focus_sigma_var.get().strip() or "1.5",
+            "soft_focus_sigma": _compose_range_value(
+                self.visual_soft_focus_sigma_min_var.get(),
+                self.visual_soft_focus_sigma_max_var.get(),
+                "1.5",
+            ),
             "particle": self.visual_particle_var.get().strip() or "none",
-            "particle_opacity": self.visual_particle_opacity_var.get().strip() or "0.6",
-            "particle_speed": self.visual_particle_speed_var.get().strip() or "1.0",
+            "particle_opacity": _compose_range_value(
+                self.visual_particle_opacity_min_var.get(),
+                self.visual_particle_opacity_max_var.get(),
+                "0.6",
+            ),
+            "particle_speed": _compose_range_value(
+                self.visual_particle_speed_min_var.get(),
+                self.visual_particle_speed_max_var.get(),
+                "1.0",
+            ),
             "text": self.visual_text_var.get(),
             "text_font": self.visual_text_font_var.get().strip() or "default",
             "text_pos": self.visual_text_pos_var.get().strip() or "center",
-            "text_size": self.visual_text_size_var.get().strip() or "60",
+            "text_size": _compose_range_value(
+                self.visual_text_size_min_var.get(),
+                self.visual_text_size_max_var.get(),
+                "60",
+            ),
             "text_style": self.visual_text_style_var.get().strip() or "Classic",
         }
 
@@ -1102,20 +1222,56 @@ class DashboardApp(ctk.CTk):
             "visual_color_timeline": self.visual_color_timeline_var.get(),
             "visual_spectrum_y": self.visual_spectrum_y_var.get(),
             "visual_spectrum_x": self.visual_spectrum_x_var.get(),
-            "visual_spectrum_w": self.visual_spectrum_w_var.get(),
+            "visual_spectrum_w": _compose_range_value(
+                self.visual_spectrum_w_min_var.get(),
+                self.visual_spectrum_w_max_var.get(),
+                "1200",
+            ),
+            "visual_spectrum_w_min": self.visual_spectrum_w_min_var.get(),
+            "visual_spectrum_w_max": self.visual_spectrum_w_max_var.get(),
             "visual_film_grain": self.visual_film_grain_var.get(),
-            "visual_grain_strength": self.visual_grain_strength_var.get(),
+            "visual_grain_strength": _compose_range_value(
+                self.visual_grain_strength_min_var.get(),
+                self.visual_grain_strength_max_var.get(),
+                "15",
+            ),
+            "visual_grain_strength_min": self.visual_grain_strength_min_var.get(),
+            "visual_grain_strength_max": self.visual_grain_strength_max_var.get(),
             "visual_vignette": self.visual_vignette_var.get(),
             "visual_tint": self.visual_tint_var.get(),
             "visual_soft_focus": self.visual_soft_focus_var.get(),
-            "visual_soft_focus_sigma": self.visual_soft_focus_sigma_var.get(),
+            "visual_soft_focus_sigma": _compose_range_value(
+                self.visual_soft_focus_sigma_min_var.get(),
+                self.visual_soft_focus_sigma_max_var.get(),
+                "1.5",
+            ),
+            "visual_soft_focus_sigma_min": self.visual_soft_focus_sigma_min_var.get(),
+            "visual_soft_focus_sigma_max": self.visual_soft_focus_sigma_max_var.get(),
             "visual_particle": self.visual_particle_var.get(),
-            "visual_particle_opacity": self.visual_particle_opacity_var.get(),
-            "visual_particle_speed": self.visual_particle_speed_var.get(),
+            "visual_particle_opacity": _compose_range_value(
+                self.visual_particle_opacity_min_var.get(),
+                self.visual_particle_opacity_max_var.get(),
+                "0.6",
+            ),
+            "visual_particle_opacity_min": self.visual_particle_opacity_min_var.get(),
+            "visual_particle_opacity_max": self.visual_particle_opacity_max_var.get(),
+            "visual_particle_speed": _compose_range_value(
+                self.visual_particle_speed_min_var.get(),
+                self.visual_particle_speed_max_var.get(),
+                "1.0",
+            ),
+            "visual_particle_speed_min": self.visual_particle_speed_min_var.get(),
+            "visual_particle_speed_max": self.visual_particle_speed_max_var.get(),
             "visual_text": self.visual_text_var.get(),
             "visual_text_font": self.visual_text_font_var.get(),
             "visual_text_pos": self.visual_text_pos_var.get(),
-            "visual_text_size": self.visual_text_size_var.get(),
+            "visual_text_size": _compose_range_value(
+                self.visual_text_size_min_var.get(),
+                self.visual_text_size_max_var.get(),
+                "60",
+            ),
+            "visual_text_size_min": self.visual_text_size_min_var.get(),
+            "visual_text_size_max": self.visual_text_size_max_var.get(),
             "visual_text_style": self.visual_text_style_var.get(),
             "generate_text": bool(self.generate_text_var.get()),
             "generate_thumbnails": bool(self.generate_thumbnails_var.get()),
@@ -2310,12 +2466,15 @@ class DashboardApp(ctk.CTk):
         tab.grid_rowconfigure(3, weight=1)
 
     def _build_paths_tab(self) -> None:
-        tab = self.tabview.tab("路径配置")
+        base_tab = self.tabview.tab("路径配置")
+        base_tab.grid_columnconfigure(0, weight=1)
+        base_tab.grid_rowconfigure(0, weight=1)
+        tab = ctk.CTkScrollableFrame(base_tab)
+        tab.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
         tab.grid_columnconfigure(0, weight=1)
-        tab.grid_rowconfigure(1, weight=1)
 
         path_frame = ctk.CTkFrame(tab)
-        path_frame.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
+        path_frame.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 8))
         path_frame.grid_columnconfigure(0, weight=0)
         path_frame.grid_columnconfigure(1, weight=1)
         path_frame.grid_columnconfigure(2, weight=1)
@@ -2369,8 +2528,9 @@ class DashboardApp(ctk.CTk):
         ctk.CTkButton(bar, text="删除绑定", command=self._remove_binding).pack(side="left", padx=6)
         ctk.CTkButton(bar, text="刷新分组", command=self._refresh_groups).pack(side="left", padx=6)
         ctk.CTkLabel(binding_frame, text="当前绑定").grid(row=5, column=0, sticky="w", padx=16, pady=(0, 6))
-        self.binding_box = ctk.CTkTextbox(binding_frame, height=220)
+        self.binding_box = ctk.CTkTextbox(binding_frame, height=180)
         self.binding_box.grid(row=6, column=0, columnspan=4, sticky="nsew", padx=16, pady=(0, 14))
+        self._bind_scroll_frame_wheel(tab, path_frame, binding_frame)
 
     def _save_paths(self) -> None:
         config = load_scheduler_settings(SCHEDULER_CONFIG_FILE)
