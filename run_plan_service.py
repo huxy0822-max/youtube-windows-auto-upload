@@ -15,6 +15,7 @@ from workflow_core import (
     build_window_plan,
     execute_direct_media_workflow,
     execute_metadata_only_workflow,
+    _output_dir_matches_tasks,
     get_metadata_root,
     load_scheduler_settings,
     refresh_existing_output_metadata,
@@ -106,6 +107,51 @@ def build_module_selection(*, metadata: bool, render: bool, upload: bool) -> Mod
     return ModuleSelection(metadata=bool(metadata), render=bool(render), upload=bool(upload))
 
 
+def reconcile_run_plan_directories(run_plan: RunPlan) -> RunPlan:
+    cfg = deepcopy(run_plan.config or {})
+    output_root_text = str(cfg.get("output_root") or run_plan.output_root or "").strip()
+    metadata_root_text = str(cfg.get("metadata_root") or run_plan.metadata_root or "").strip()
+    music_root_text = str(cfg.get("music_dir") or run_plan.music_root or "").strip()
+    image_root_text = str(cfg.get("base_image_dir") or run_plan.image_root or "").strip()
+    if not output_root_text:
+        raise ValueError("RunPlan is missing output_root.")
+    if not metadata_root_text:
+        raise ValueError("RunPlan is missing metadata_root.")
+
+    output_root = Path(output_root_text)
+    metadata_root = Path(metadata_root_text)
+    unique_tags = [str(task.tag or "").strip() for task in run_plan.tasks if str(task.tag or "").strip()]
+    unique_tags = list(dict.fromkeys(unique_tags))
+    single_tag_mode = len(unique_tags) == 1
+    tag_output_dirs: dict[str, str] = {}
+    tag_metadata_dirs: dict[str, str] = {}
+    for task in run_plan.tasks:
+        clean_tag = str(task.tag or "").strip()
+        if not clean_tag:
+            continue
+        if single_tag_mode:
+            tag_output_dirs[clean_tag] = str(output_root)
+            tag_metadata_dirs[clean_tag] = str(metadata_root)
+        else:
+            tag_output_dirs.setdefault(clean_tag, str(output_root / f"{run_plan.defaults.date_mmdd}_{clean_tag}"))
+            tag_metadata_dirs.setdefault(clean_tag, str(metadata_root / clean_tag))
+
+    plan = deepcopy(run_plan.window_plan)
+    plan["tag_output_dirs"] = tag_output_dirs
+    plan["tag_metadata_dirs"] = tag_metadata_dirs
+    cfg["output_root"] = str(output_root)
+    cfg["metadata_root"] = str(metadata_root)
+    cfg["music_dir"] = music_root_text
+    cfg["base_image_dir"] = image_root_text
+    run_plan.config = cfg
+    run_plan.window_plan = plan
+    run_plan.output_root = str(output_root)
+    run_plan.metadata_root = str(metadata_root)
+    run_plan.music_root = music_root_text
+    run_plan.image_root = image_root_text
+    return run_plan
+
+
 def _resolve_media_scopes(tasks: list[WindowTask], config: dict[str, Any]) -> list[MediaScope]:
     grouped: dict[tuple[str, str, str], MediaScope] = {}
     for task in tasks:
@@ -139,8 +185,28 @@ def build_run_plan(
 ) -> RunPlan:
     cfg = deepcopy(config or load_scheduler_settings())
     plan = build_window_plan(tasks, defaults)
+    output_root = Path(str(cfg.get("output_root") or "").strip())
     metadata_root = get_metadata_root(cfg)
-    return RunPlan(
+    unique_tags = [str(task.tag or "").strip() for task in tasks if str(task.tag or "").strip()]
+    unique_tags = list(dict.fromkeys(unique_tags))
+    single_tag_mode = len(unique_tags) == 1
+    tag_output_dirs: dict[str, str] = {}
+    tag_metadata_dirs: dict[str, str] = {}
+    for task in tasks:
+        clean_tag = str(task.tag or "").strip()
+        if not clean_tag:
+            continue
+        if single_tag_mode:
+            tag_output_dirs.setdefault(clean_tag, str(output_root))
+            tag_metadata_dirs.setdefault(clean_tag, str(metadata_root))
+        else:
+            tag_output_dirs.setdefault(clean_tag, str(output_root / f"{defaults.date_mmdd}_{clean_tag}"))
+            tag_metadata_dirs.setdefault(clean_tag, str(metadata_root / clean_tag))
+    if tag_output_dirs:
+        plan["tag_output_dirs"] = tag_output_dirs
+    if tag_metadata_dirs:
+        plan["tag_metadata_dirs"] = tag_metadata_dirs
+    run_plan = RunPlan(
         tasks=list(tasks),
         defaults=defaults,
         modules=modules,
@@ -152,6 +218,7 @@ def build_run_plan(
         output_root=str(cfg.get("output_root") or "").strip(),
         media_scopes=_resolve_media_scopes(tasks, cfg),
     )
+    return reconcile_run_plan_directories(run_plan)
 
 
 def _visual_mode_line(defaults: WorkflowDefaults) -> str:
@@ -167,6 +234,7 @@ def _visual_mode_line(defaults: WorkflowDefaults) -> str:
 
 
 def preview_run_plan(run_plan: RunPlan) -> list[str]:
+    run_plan = reconcile_run_plan_directories(run_plan)
     lines = [
         f"Selected modules: {', '.join(run_plan.modules.labels())}",
         f"Date: {run_plan.defaults.date_mmdd}",
@@ -179,6 +247,14 @@ def preview_run_plan(run_plan: RunPlan) -> list[str]:
         "",
     ]
     lines.extend(run_plan.window_plan.get("preview_lines", []))
+    output_dirs = dict(run_plan.window_plan.get("tag_output_dirs") or {})
+    metadata_dirs = dict(run_plan.window_plan.get("tag_metadata_dirs") or {})
+    if output_dirs:
+        lines.append("")
+        lines.append("Resolved output folders:")
+        for tag, folder in output_dirs.items():
+            metadata_folder = metadata_dirs.get(tag, run_plan.metadata_root)
+            lines.append(f"  - {tag}: video={folder} | metadata={metadata_folder}")
     if run_plan.media_scopes:
         lines.append("")
         lines.append("Resolved media scopes:")
@@ -196,6 +272,7 @@ def preview_run_plan(run_plan: RunPlan) -> list[str]:
 
 
 def validate_run_plan(run_plan: RunPlan, *, log: LogFunc = _noop_log) -> ValidationReport:
+    run_plan = reconcile_run_plan_directories(run_plan)
     report = ValidationReport()
     modules = run_plan.modules
     if not modules.any_selected():
@@ -205,23 +282,70 @@ def validate_run_plan(run_plan: RunPlan, *, log: LogFunc = _noop_log) -> Validat
         report.errors.append("至少需要一个窗口任务。")
         return report
 
+    if modules.metadata and run_plan.defaults.metadata_mode != "prompt_api":
+        report.errors.append("Metadata generation requires prompt_api mode.")
+        return report
+
     if modules.render or modules.metadata:
         errors, warnings = validate_group_sources(run_plan.tasks, config=run_plan.config, log=log)
         report.errors.extend(errors)
         report.warnings.extend(warnings)
 
     if modules.upload and not modules.render:
-        errors, warnings, resolved_dirs = validate_existing_output_dirs(
-            run_plan.tasks,
-            date_mmdd=run_plan.defaults.date_mmdd,
-            config=run_plan.config,
-            log=log,
-        )
+        errors, warnings, resolved_dirs = _validate_explicit_output_dirs(run_plan, log=log)
         report.errors.extend(errors)
         report.warnings.extend(warnings)
         report.resolved_output_dirs.update(resolved_dirs)
 
     return report
+
+
+def _validate_explicit_output_dirs(
+    run_plan: RunPlan,
+    *,
+    log: LogFunc = _noop_log,
+) -> tuple[list[str], list[str], dict[str, str]]:
+    errors: list[str] = []
+    warnings: list[str] = []
+    resolved_dirs: dict[str, str] = {}
+    explicit_dirs = {
+        str(tag or "").strip(): str(path or "").strip()
+        for tag, path in dict(run_plan.window_plan.get("tag_output_dirs") or {}).items()
+        if str(tag or "").strip() and str(path or "").strip()
+    }
+    if not explicit_dirs:
+        return ["RunPlan is missing explicit output folders for upload-only mode."], warnings, resolved_dirs
+
+    grouped: dict[str, list[WindowTask]] = {}
+    for task in run_plan.tasks:
+        clean_tag = str(task.tag or "").strip()
+        if clean_tag:
+            grouped.setdefault(clean_tag, []).append(task)
+
+    for tag, tag_tasks in grouped.items():
+        folder_text = explicit_dirs.get(tag, "").strip()
+        if not folder_text:
+            errors.append(f"{tag} 缺少当前任务的明确输出目录。")
+            continue
+
+        folder = Path(folder_text)
+        if not folder.exists():
+            errors.append(f"{tag} 当前任务指定的输出目录不存在: {folder}")
+            continue
+
+        ok, details = _output_dir_matches_tasks(folder, tag_tasks)
+        if not ok:
+            detail_text = " | ".join(details[:3]) if details else ""
+            errors.append(
+                f"{tag} 当前任务指定的输出目录不可上传: {folder}"
+                + (f" | {detail_text}" if detail_text else "")
+            )
+            continue
+
+        resolved_dirs[tag] = str(folder)
+        log(f"[检查] {tag}: 只按本次任务指定目录上传 | {folder}")
+
+    return errors, warnings, resolved_dirs
 
 
 def collect_output_dirs(workflow_result: WorkflowResult | None) -> dict[str, str]:
@@ -246,6 +370,7 @@ def execute_simulation_plan(
     control: ExecutionControl | None = None,
     log: LogFunc = _noop_log,
 ) -> WorkflowResult:
+    run_plan = reconcile_run_plan_directories(run_plan)
     validation = validate_run_plan(run_plan, log=log)
     for warning in validation.warnings:
         log(f"[Validate] {warning}")
@@ -259,6 +384,8 @@ def execute_simulation_plan(
             save_manifest=True,
         ),
         config=run_plan.config,
+        output_dir_overrides=dict(run_plan.window_plan.get("tag_output_dirs") or {}),
+        metadata_dir_overrides=dict(run_plan.window_plan.get("tag_metadata_dirs") or {}),
         control=control,
         log=log,
     )
@@ -271,6 +398,7 @@ def execute_run_plan(
     on_item_ready: ArtifactReadyCallback | None = None,
     log: LogFunc = _noop_log,
 ) -> ExecutionResult:
+    run_plan = reconcile_run_plan_directories(run_plan)
     validation = validate_run_plan(run_plan, log=log)
     for warning in validation.warnings:
         log(f"[Validate] {warning}")
@@ -288,6 +416,8 @@ def execute_run_plan(
             defaults=run_plan.defaults,
             simulation=SimulationOptions(simulate_seconds=0, consume_sources=True, save_manifest=True),
             config=run_plan.config,
+            output_dir_overrides=dict(run_plan.window_plan.get("tag_output_dirs") or {}),
+            metadata_dir_overrides=dict(run_plan.window_plan.get("tag_metadata_dirs") or {}),
             control=control,
             on_item_ready=on_item_ready if run_plan.modules.upload else None,
             log=log,
@@ -302,6 +432,8 @@ def execute_run_plan(
             tasks=run_plan.tasks,
             defaults=run_plan.defaults,
             config=run_plan.config,
+            output_dir_overrides=dict(run_plan.window_plan.get("tag_output_dirs") or {}),
+            metadata_dir_overrides=dict(run_plan.window_plan.get("tag_metadata_dirs") or {}),
             control=control,
             on_item_ready=on_item_ready if run_plan.modules.upload else None,
             log=log,
@@ -314,6 +446,7 @@ def execute_run_plan(
             defaults=run_plan.defaults,
             prepared_output_dirs=result.prepared_output_dirs,
             config=run_plan.config,
+            metadata_dir_overrides=dict(run_plan.window_plan.get("tag_metadata_dirs") or {}),
             control=control,
             log=log,
         )

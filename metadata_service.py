@@ -10,6 +10,9 @@ from typing import Any, Callable
 from prompt_studio import normalize_tag_key
 
 SCRIPT_DIR = Path(__file__).parent
+UPLOAD_RECORDS_ROOT = SCRIPT_DIR / "upload_records"
+LEGACY_METADATA_HISTORY_PATH = SCRIPT_DIR / "data" / "metadata_history.json"
+_UPLOAD_HISTORY_SYNC_CACHE: dict[str, float] = {}
 
 LogFunc = Callable[[str], None]
 
@@ -88,6 +91,47 @@ def _iter_metadata_rows(data: dict[str, Any], *, tag: str | None = None) -> list
     return merged
 
 
+def _iter_legacy_metadata_rows(tag: str | None = None) -> list[dict[str, Any]]:
+    raw = _read_json(LEGACY_METADATA_HISTORY_PATH, {"tags": {}})
+    if not isinstance(raw, dict):
+        return []
+    tags = raw.get("tags", {})
+    if not isinstance(tags, dict):
+        return []
+
+    wanted_tag = _metadata_key(tag) if tag else ""
+    rows: list[dict[str, Any]] = []
+    for raw_tag, items in tags.items():
+        if wanted_tag and _metadata_key(raw_tag) != wanted_tag:
+            continue
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title") or "").strip()
+            description = str(item.get("description") or "").strip()
+            tag_signature = str(item.get("tag_signature") or "").strip()
+            thumbnail_prompts = _thumbnail_prompt_values(item.get("thumbnail_prompts"))
+            if not any([title, description, tag_signature, thumbnail_prompts]):
+                continue
+            rows.append(
+                {
+                    "tag": str(raw_tag or "").strip(),
+                    "serial": None,
+                    "date_mmdd": "",
+                    "title": title,
+                    "description": description,
+                    "tag_signature": tag_signature,
+                    "thumbnail_prompts": thumbnail_prompts,
+                    "thumbnails": [],
+                    "source": "legacy_history",
+                    "saved_at": str(item.get("saved_at") or "").strip(),
+                }
+            )
+    return rows
+
+
 def get_used_metadata_scope(
     tag: str,
     *,
@@ -95,8 +139,16 @@ def get_used_metadata_scope(
     limit: int | None = None,
     global_scope: bool = True,
 ) -> dict[str, list[str]]:
+    sync_uploaded_history_into_used_metadata(
+        config=config,
+        tag=None if global_scope else tag,
+        min_interval_seconds=0.0,
+    )
     data = load_used_metadata_history(config)
-    rows = _iter_metadata_rows(data, tag=None if global_scope else tag)
+    rows = _merge_metadata_rows_with_upload_records(
+        _iter_metadata_rows(data, tag=None if global_scope else tag),
+        tag=None if global_scope else tag,
+    )
     if limit and limit > 0:
         rows = rows[-limit:]
     titles = [str(item.get("title") or "").strip() for item in rows if isinstance(item, dict) and str(item.get("title") or "").strip()]
@@ -119,6 +171,177 @@ def get_used_metadata_scope(
         "thumbnail_prompts": thumbnail_prompts,
         "tag_signatures": tag_signatures,
     }
+
+
+def _cache_key_for_history_sync(config: dict[str, Any] | None, tag: str | None) -> str:
+    root = str(get_used_metadata_root(config))
+    return f"{root.lower()}::{_metadata_key(tag or '*')}"
+
+
+def _iter_upload_record_paths() -> list[Path]:
+    if not UPLOAD_RECORDS_ROOT.exists():
+        return []
+    return sorted(UPLOAD_RECORDS_ROOT.rglob("channel_*.json"))
+
+
+def _extract_manifest_metadata(upload_record: dict[str, Any]) -> tuple[list[str], list[str], list[str]]:
+    tag_list: list[str] = []
+    thumbnail_prompts: list[str] = []
+    thumbnails: list[str] = []
+    video_info = upload_record.get("video") if isinstance(upload_record.get("video"), dict) else {}
+    video_path_text = str(video_info.get("path") or "").strip()
+    serial = upload_record.get("serial")
+    if not video_path_text or serial in (None, ""):
+        return tag_list, thumbnail_prompts, thumbnails
+    manifest_path = Path(video_path_text).parent / "upload_manifest.json"
+    manifest = _read_json(manifest_path, {})
+    channels = manifest.get("channels") if isinstance(manifest, dict) else {}
+    channel = channels.get(str(serial)) if isinstance(channels, dict) else {}
+    if not isinstance(channel, dict):
+        return tag_list, thumbnail_prompts, thumbnails
+    tag_list = [str(item).strip() for item in channel.get("tag_list", []) if str(item).strip()]
+    thumbnail_prompts = [
+        str(item).strip()
+        for item in channel.get("thumbnail_prompts", [])
+        if str(item).strip()
+    ]
+    thumbnails = [str(item).strip() for item in channel.get("thumbnails", []) if str(item).strip()]
+    return tag_list, thumbnail_prompts, thumbnails
+
+
+def sync_uploaded_history_into_used_metadata(
+    *,
+    config: dict[str, Any] | None = None,
+    tag: str | None = None,
+    min_interval_seconds: float = 15.0,
+) -> bool:
+    cache_key = _cache_key_for_history_sync(config, tag)
+    now = time.time()
+    last_sync = _UPLOAD_HISTORY_SYNC_CACHE.get(cache_key, 0.0)
+    if min_interval_seconds > 0 and now - last_sync < min_interval_seconds:
+        return False
+
+    data = load_used_metadata_history(config)
+    tags = data.setdefault("tags", {})
+    existing_signatures = {
+        _record_signature(item)
+        for item in _iter_metadata_rows(data)
+        if isinstance(item, dict)
+    }
+    wanted_tag = _metadata_key(tag) if tag else ""
+    changed = False
+
+    for path in _iter_upload_record_paths():
+        record = _read_json(path, {})
+        if not isinstance(record, dict) or not bool(record.get("success")):
+            continue
+        record_tag = str(record.get("tag") or "").strip()
+        if not record_tag:
+            continue
+        if wanted_tag and _metadata_key(record_tag) != wanted_tag:
+            continue
+
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        title = str(metadata.get("title") or "").strip()
+        description = str(metadata.get("description") or "").strip()
+        if not title:
+            continue
+
+        tag_list, thumbnail_prompts, thumbnails = _extract_manifest_metadata(record)
+        if not thumbnails:
+            thumbnails = [
+                str((item or {}).get("path") or "").strip()
+                for item in (record.get("thumbnails") or [])
+                if str((item or {}).get("path") or "").strip()
+            ]
+
+        built = _build_metadata_record(
+            tag=record_tag,
+            serial=int(record["serial"]) if record.get("serial") is not None else None,
+            date_mmdd=str(record.get("date") or "").strip(),
+            title=title,
+            description=description,
+            tag_list=tag_list,
+            thumbnail_prompts=thumbnail_prompts,
+            thumbnails=thumbnails,
+            source="uploaded_history",
+        )
+        signature = _record_signature(built)
+        if signature and signature in existing_signatures:
+            continue
+
+        tag_key = _metadata_key(record_tag)
+        rows = tags.setdefault(tag_key, [])
+        if not isinstance(rows, list):
+            rows = []
+            tags[tag_key] = rows
+        rows.append(built)
+        existing_signatures.add(signature)
+        changed = True
+
+    if changed:
+        for tag_key, rows in list(tags.items()):
+            if isinstance(rows, list):
+                tags[tag_key] = rows[-20000:]
+        _write_json(get_used_metadata_history_path(config), data)
+
+    _UPLOAD_HISTORY_SYNC_CACHE[cache_key] = now
+    return changed
+
+
+def _collect_uploaded_history_rows(tag: str | None = None) -> list[dict[str, Any]]:
+    wanted_tag = _metadata_key(tag) if tag else ""
+    rows: list[dict[str, Any]] = []
+    for path in _iter_upload_record_paths():
+        record = _read_json(path, {})
+        if not isinstance(record, dict) or not bool(record.get("success")):
+            continue
+        record_tag = str(record.get("tag") or "").strip()
+        if not record_tag:
+            continue
+        if wanted_tag and _metadata_key(record_tag) != wanted_tag:
+            continue
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        title = str(metadata.get("title") or "").strip()
+        description = str(metadata.get("description") or "").strip()
+        if not title:
+            continue
+        tag_list, thumbnail_prompts, thumbnails = _extract_manifest_metadata(record)
+        if not thumbnails:
+            thumbnails = [
+                str((item or {}).get("path") or "").strip()
+                for item in (record.get("thumbnails") or [])
+                if str((item or {}).get("path") or "").strip()
+            ]
+        rows.append(
+            _build_metadata_record(
+                tag=record_tag,
+                serial=int(record["serial"]) if record.get("serial") is not None else None,
+                date_mmdd=str(record.get("date") or "").strip(),
+                title=title,
+                description=description,
+                tag_list=tag_list,
+                thumbnail_prompts=thumbnail_prompts,
+                thumbnails=thumbnails,
+                source="uploaded_history",
+            )
+        )
+    return rows
+
+
+def _merge_metadata_rows_with_upload_records(existing_rows: list[dict[str, Any]], *, tag: str | None = None) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in [*existing_rows, *_iter_legacy_metadata_rows(tag), *_collect_uploaded_history_rows(tag)]:
+        if not isinstance(item, dict):
+            continue
+        signature = _record_signature(item)
+        if signature and signature in seen:
+            continue
+        if signature:
+            seen.add(signature)
+        merged.append(item)
+    return merged
 
 
 def _build_metadata_record(

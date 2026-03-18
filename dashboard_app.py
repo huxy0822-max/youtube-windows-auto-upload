@@ -30,10 +30,13 @@ from effects_library import (
     list_zoom_modes,
 )
 from prompt_studio import (
+    find_explicit_api_preset_name,
+    find_explicit_content_template_name,
     load_prompt_studio_config,
     pick_api_preset_name,
     pick_content_template_name,
 )
+from path_helpers import normalize_scheduler_config
 from run_plan_service import (
     build_module_selection,
     build_run_plan,
@@ -69,6 +72,7 @@ from workflow_core import (
 SCRIPT_DIR = Path(__file__).parent
 STATE_FILE = SCRIPT_DIR / "dashboard_state.json"
 UPLOAD_SCRIPT = SCRIPT_DIR / "batch_upload.py"
+RUN_SNAPSHOT_FILE = SCRIPT_DIR / "data" / "last_run_snapshot.json"
 
 TASK_MODE_VALUES = {
     "本日只上传": "upload_only",
@@ -458,6 +462,7 @@ class DashboardApp(ctk.CTk):
         self.ffmpeg_var = ctk.StringVar(value=str(self.scheduler_config.get("ffmpeg_bin", "ffmpeg")))
         self.used_media_root_var = ctk.StringVar(value=str(self.scheduler_config.get("used_media_root", "")))
         self.cleanup_days_var = ctk.StringVar(value=str(self.scheduler_config.get("render_cleanup_days", 5)))
+        self._runtime_path_widgets: dict[str, Any] = {}
         self.binding_group_var = ctk.StringVar(value=current_group)
         self.binding_folder_var = ctk.StringVar(value=get_group_bindings(self.scheduler_config).get(current_group, ""))
 
@@ -466,6 +471,8 @@ class DashboardApp(ctk.CTk):
         self.content_template_var = ctk.StringVar(value="")
         self.api_save_name_var = ctk.StringVar(value="")
         self.content_save_name_var = ctk.StringVar(value="")
+        self._loading_prompt_form = False
+        self.prompt_form_dirty = False
         self.provider_var = ctk.StringVar(value="openai_compatible")
         self.base_url_var = ctk.StringVar(value="")
         self.model_var = ctk.StringVar(value="")
@@ -613,6 +620,57 @@ class DashboardApp(ctk.CTk):
         self.default_visibility_var.trace_add("write", self._on_default_visibility_change)
         self.add_schedule_enabled_var.trace_add("write", self._on_add_schedule_toggle)
         self.schedule_enabled_var.trace_add("write", self._on_default_schedule_toggle)
+        for runtime_var in (
+            self.metadata_root_var,
+            self.music_dir_var,
+            self.base_image_dir_var,
+            self.output_root_var,
+            self.ffmpeg_var,
+            self.used_media_root_var,
+            self.cleanup_days_var,
+        ):
+            runtime_var.trace_add("write", lambda *_: self._refresh_runtime_config_cache())
+
+        for prompt_var in (
+            self.api_preset_var,
+            self.content_template_var,
+            self.api_save_name_var,
+            self.content_save_name_var,
+            self.provider_var,
+            self.base_url_var,
+            self.model_var,
+            self.api_key_var,
+            self.temperature_var,
+            self.max_tokens_var,
+            self.auto_image_var,
+            self.image_base_url_var,
+            self.image_api_key_var,
+            self.image_model_var,
+            self.image_concurrency_var,
+            self.music_genre_var,
+            self.angle_var,
+            self.audience_var,
+            self.content_language_var,
+            self.title_count_var,
+            self.desc_count_var,
+            self.thumb_count_var,
+            self.title_min_var,
+            self.title_max_var,
+            self.desc_len_var,
+            self.tag_range_var,
+        ):
+            prompt_var.trace_add("write", lambda *_: self._mark_prompt_form_dirty())
+
+    def _refresh_runtime_config_cache(self) -> None:
+        try:
+            self.scheduler_config = self._current_runtime_config()
+        except Exception:
+            pass
+
+    def _mark_prompt_form_dirty(self) -> None:
+        if self._loading_prompt_form:
+            return
+        self.prompt_form_dirty = True
 
 
     def _build_upload_tab(self) -> None:
@@ -1044,6 +1102,8 @@ class DashboardApp(ctk.CTk):
         ctk.CTkLabel(content_frame, text="标题库").grid(row=14, column=0, sticky="w", padx=16, pady=(0, 6))
         self.title_library_box = ctk.CTkTextbox(content_frame, height=160)
         self.title_library_box.grid(row=15, column=0, columnspan=4, sticky="ew", padx=16, pady=(0, 14))
+        self.master_prompt_box.bind("<KeyRelease>", lambda *_: self._mark_prompt_form_dirty(), add="+")
+        self.title_library_box.bind("<KeyRelease>", lambda *_: self._mark_prompt_form_dirty(), add="+")
 
         audience_frame = ctk.CTkFrame(tab)
         audience_frame.grid(row=3, column=0, sticky="ew", padx=8, pady=(8, 16))
@@ -1079,6 +1139,7 @@ class DashboardApp(ctk.CTk):
         *,
         values: list[str] | None = None,
         show: str | None = None,
+        entry_key: str | None = None,
     ) -> None:
         ctk.CTkLabel(parent, text=label).grid(row=row, column=0, sticky="w", padx=16, pady=(0, 6))
         if values:
@@ -1086,6 +1147,8 @@ class DashboardApp(ctk.CTk):
         else:
             widget = ctk.CTkEntry(parent, textvariable=variable, show=show or "")
         widget.grid(row=row, column=1, columnspan=3, sticky="ew", padx=16, pady=(0, 12))
+        if entry_key:
+            self._runtime_path_widgets[entry_key] = widget
 
     def _range_row(
         self,
@@ -1132,11 +1195,31 @@ class DashboardApp(ctk.CTk):
                 return
             for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
                 widget.bind(sequence, _on_mousewheel, add="+")
+            for attr_name in ("_entry", "_text_label", "_canvas", "_dropdown_menu", "_scrollbar"):
+                inner = getattr(widget, attr_name, None)
+                if inner is None:
+                    continue
+                for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                    try:
+                        inner.bind(sequence, _on_mousewheel, add="+")
+                    except Exception:
+                        pass
             for child in widget.winfo_children():
                 _bind_tree(child)
 
         for widget in widgets:
             _bind_tree(widget)
+
+    def _runtime_field_text(self, key: str, variable: ctk.StringVar) -> str:
+        widget = self._runtime_path_widgets.get(key)
+        if widget is not None:
+            try:
+                value = str(widget.get()).strip()
+                if value:
+                    return value
+            except Exception:
+                pass
+        return str(variable.get()).strip()
 
     def _collect_visual_settings(self) -> dict[str, Any]:
         return {
@@ -1770,7 +1853,7 @@ class DashboardApp(ctk.CTk):
         if selected:
             self.binding_folder_var.set(selected)
 
-    def _save_paths(self) -> None:
+    def _legacy__save_paths_shadow(self) -> None:
         config = load_scheduler_settings(SCHEDULER_CONFIG_FILE)
         config.update(
             {
@@ -1832,7 +1915,7 @@ class DashboardApp(ctk.CTk):
             "titleLibrary": self.title_library_box.get("1.0", "end").strip(),
         }
 
-    def _persist_prompt_form_for_active_tasks(self) -> None:
+    def _legacy__persist_prompt_form_for_active_tasks_shadow(self) -> None:
         task_tags = sorted({task.tag.strip() for task in self.window_tasks if task.tag.strip()})
         if not task_tags:
             return
@@ -1845,10 +1928,25 @@ class DashboardApp(ctk.CTk):
                 self._log("[提示词] 本次包含多个分组，当前表单不会自动覆盖全部分组；将使用各分组已保存绑定")
                 return
 
-        api_name = self.api_save_name_var.get().strip() or self.api_preset_var.get().strip() or "默认API模板"
+        self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
+        explicit_save = bool(self.api_save_name_var.get().strip() or self.content_save_name_var.get().strip())
+        prompt_group = self.prompt_group_var.get().strip()
+        if not explicit_save and (not self.prompt_form_dirty or prompt_group != target_tag):
+            self._log(f"[提示词] 运行前直接使用已保存绑定 -> {target_tag}")
+            return
+
+        existing_api_name = pick_api_preset_name(self.prompt_config, target_tag)
+        existing_content_name = pick_content_template_name(self.prompt_config, target_tag)
+        api_name = (
+            self.api_save_name_var.get().strip()
+            or self.api_preset_var.get().strip()
+            or existing_api_name
+            or "默认API模板"
+        )
         content_name = (
             self.content_save_name_var.get().strip()
             or self.content_template_var.get().strip()
+            or existing_content_name
             or "默认内容模板"
         )
         ensure_prompt_presets(
@@ -1864,13 +1962,81 @@ class DashboardApp(ctk.CTk):
         self.prompt_group_var.set(target_tag)
         self.api_preset_var.set(api_name)
         self.content_template_var.set(content_name)
+        self.prompt_form_dirty = False
         self._log(f"[提示词] 运行前已同步当前表单 -> {target_tag} | API={api_name} | 内容模板={content_name}")
+
+    def _persist_prompt_form_for_active_tasks(self) -> None:
+        task_tags = sorted({task.tag.strip() for task in self.window_tasks if task.tag.strip()})
+        if not task_tags:
+            return
+
+        if len(task_tags) == 1:
+            target_tag = task_tags[0]
+        else:
+            target_tag = self.prompt_group_var.get().strip()
+            if not target_tag or target_tag not in task_tags:
+                self._log("[提示词] 本次包含多个分组，当前表单不会自动覆盖全部分组；将继续使用各分组已保存绑定。")
+                return
+
+        self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
+        explicit_save = bool(self.api_save_name_var.get().strip() or self.content_save_name_var.get().strip())
+        prompt_group = self.prompt_group_var.get().strip()
+        explicit_api_name = find_explicit_api_preset_name(self.prompt_config, target_tag)
+        explicit_content_name = find_explicit_content_template_name(self.prompt_config, target_tag)
+        existing_api_name = explicit_api_name or pick_api_preset_name(self.prompt_config, target_tag)
+        existing_content_name = explicit_content_name or pick_content_template_name(self.prompt_config, target_tag)
+        should_force_bind_current_form = (
+            len(task_tags) == 1
+            and (
+                prompt_group == target_tag
+                or not explicit_api_name
+                or not explicit_content_name
+            )
+        )
+        if not should_force_bind_current_form and not explicit_save and (not self.prompt_form_dirty or prompt_group != target_tag):
+            self._log(
+                f"[提示词] 运行前直接使用已保存绑定 -> {target_tag} | "
+                f"API={existing_api_name} | 内容模板={existing_content_name}"
+            )
+            return
+
+        api_name = (
+            self.api_save_name_var.get().strip()
+            or self.api_preset_var.get().strip()
+            or existing_api_name
+            or "默认API模板"
+        )
+        content_name = (
+            self.content_save_name_var.get().strip()
+            or self.content_template_var.get().strip()
+            or existing_content_name
+            or "默认内容模板"
+        )
+        ensure_prompt_presets(
+            api_name=api_name,
+            api_payload=self._current_api_form(),
+            content_name=content_name,
+            content_payload=self._current_content_form(),
+            tag=target_tag,
+            path=PROMPT_STUDIO_FILE,
+        )
+        self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
+        self._refresh_prompt_dropdowns()
+        self.prompt_group_var.set(target_tag)
+        self.api_preset_var.set(api_name)
+        self.content_template_var.set(content_name)
+        self.prompt_form_dirty = False
+        self._log(
+            f"[提示词] 运行前已同步当前表单 -> {target_tag} | "
+            f"API={api_name} | 内容模板={content_name}"
+        )
 
     def _load_prompt_for_group(self) -> None:
         self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
         tag = self.prompt_group_var.get()
         api_name = pick_api_preset_name(self.prompt_config, tag)
         content_name = pick_content_template_name(self.prompt_config, tag)
+        self._loading_prompt_form = True
         self.api_preset_var.set(api_name)
         self.content_template_var.set(content_name)
 
@@ -1904,6 +2070,8 @@ class DashboardApp(ctk.CTk):
         self.master_prompt_box.insert("1.0", str(content_data.get("masterPrompt") or ""))
         self.title_library_box.delete("1.0", "end")
         self.title_library_box.insert("1.0", str(content_data.get("titleLibrary") or ""))
+        self._loading_prompt_form = False
+        self.prompt_form_dirty = False
 
     def _save_api_preset(self) -> None:
         tag = self.prompt_group_var.get()
@@ -2030,6 +2198,22 @@ class DashboardApp(ctk.CTk):
 
 
 
+    def _test_text_api(self) -> None:
+        try:
+            raw = call_text_model(
+                self._current_api_form(),
+                '只返回严格 JSON，不要 markdown。{"titles":["1个繁体中文标题，长度20到40字"]}',
+            )
+            parsed = json.loads(str(raw or "").strip())
+            titles = parsed.get("titles") if isinstance(parsed, dict) else None
+            if not isinstance(titles, list) or not any(str(item).strip() for item in titles):
+                raise ValueError(f"文本接口返回了内容，但不是可用的大模型 JSON 结果: {str(raw)[:200]}")
+            messagebox.showinfo("测试成功", f"文本 API 可生成标题:\n{str(titles[0])[:120]}")
+            self._log("[提示词] 文本 API 测试成功")
+        except Exception as exc:
+            messagebox.showerror("测试失败", str(exc))
+            self._log(f"[提示词] 文本 API 测试失败: {exc}")
+
     def _open_current_output(self) -> None:
         if self.window_tasks:
             tag = self.window_tasks[0].tag
@@ -2054,13 +2238,25 @@ class DashboardApp(ctk.CTk):
                 prepared.setdefault(tag, str(folder))
         return prepared
 
-    def _launch_stream_upload_for_task(self, run_plan, task: WindowTask, output_dir: Path) -> None:
-        plan = deepcopy(run_plan.window_plan)
-        plan["tasks"] = [
-            item
-            for item in list(plan.get("tasks") or [])
-            if str(item.get("tag") or "").strip() == task.tag and int(item.get("serial") or 0) == int(task.serial)
-        ]
+    def _launch_stream_upload_for_task(
+        self,
+        run_plan,
+        task: WindowTask,
+        output_dir: Path,
+        *,
+        retain_days: str,
+        auto_close: bool,
+    ) -> None:
+        current_config = dict(run_plan.config or {})
+        single_modules = build_module_selection(metadata=False, render=False, upload=True)
+        single_run_plan = build_run_plan(
+            tasks=[task],
+            defaults=run_plan.defaults,
+            modules=single_modules,
+            config=current_config,
+        )
+        plan = deepcopy(single_run_plan.window_plan)
+        plan["tasks"] = [task.to_plan_dict(1)]
         plan["groups"] = {task.tag: [int(task.serial)]}
         plan["tags"] = [task.tag]
         plan["default_tag"] = task.tag
@@ -2070,7 +2266,10 @@ class DashboardApp(ctk.CTk):
             run_plan.defaults.date_mmdd,
             path=SCRIPT_DIR / "data" / f"window_upload_plan_{run_plan.defaults.date_mmdd}_{task.serial}.json",
         )
-        retain_days = str(self.cleanup_days_var.get().strip() or "5")
+        self._log(
+            f"[Upload] {task.tag}/{task.serial} 使用单任务上传计划: "
+            f"output={output_dir} | metadata={single_run_plan.metadata_root}"
+        )
         cmd = [
             sys.executable,
             "-u",
@@ -2087,7 +2286,7 @@ class DashboardApp(ctk.CTk):
             "--retain-video-days",
             retain_days,
         ]
-        if self.upload_auto_close_var.get():
+        if auto_close:
             cmd.append("--auto-close-browser")
 
         label = f"{task.tag}/{task.serial}"
@@ -2153,13 +2352,16 @@ class DashboardApp(ctk.CTk):
         *,
         detach: bool = False,
         prepared_output_dirs: dict[str, str] | None = None,
+        retain_days: str | None = None,
+        auto_close: bool | None = None,
     ) -> bool:
         plan = deepcopy(run_plan.window_plan)
         if prepared_output_dirs:
             plan["tag_output_dirs"] = dict(prepared_output_dirs)
         plan_path = save_window_plan(plan, run_plan.defaults.date_mmdd)
         tags, skip_channels = derive_tags_and_skip_channels(plan, lambda tag: get_tag_info(tag) or {})
-        retain_days = str(self.cleanup_days_var.get().strip() or "5")
+        retain_days = str(retain_days or "5")
+        auto_close = bool(auto_close)
         ordered_targets: list[tuple[str, int]] = []
         seen_targets: set[tuple[str, int]] = set()
         for task in run_plan.tasks:
@@ -2189,7 +2391,7 @@ class DashboardApp(ctk.CTk):
                     "--retain-video-days",
                     retain_days,
                 ]
-                if self.upload_auto_close_var.get():
+                if auto_close:
                     per_cmd.append("--auto-close-browser")
                 self._log("[Upload] " + " ".join(per_cmd))
                 proc = subprocess.Popen(
@@ -2275,7 +2477,7 @@ class DashboardApp(ctk.CTk):
             "--retain-video-days",
             retain_days,
         ]
-        if self.upload_auto_close_var.get():
+        if auto_close:
             cmd.append("--auto-close-browser")
         if skip_channels:
             cmd.append("--skip-channels=" + ",".join(str(item) for item in skip_channels))
@@ -2381,27 +2583,177 @@ class DashboardApp(ctk.CTk):
         return self._current_module_selection().labels()
 
     def _current_runtime_config(self) -> dict[str, Any]:
+        try:
+            self.update_idletasks()
+        except Exception:
+            pass
         config = load_scheduler_settings(SCHEDULER_CONFIG_FILE)
+        if self.scheduler_config:
+            config.update(dict(self.scheduler_config))
         config.update(
             {
-                "metadata_root": self.metadata_root_var.get().strip(),
-                "music_dir": self.music_dir_var.get().strip(),
-                "base_image_dir": self.base_image_dir_var.get().strip(),
-                "output_root": self.output_root_var.get().strip(),
-                "ffmpeg_bin": self.ffmpeg_var.get().strip() or "ffmpeg",
-                "ffmpeg_path": self.ffmpeg_var.get().strip() or "ffmpeg",
-                "used_media_root": self.used_media_root_var.get().strip(),
-                "render_cleanup_days": int(self.cleanup_days_var.get().strip() or "5"),
+                "metadata_root": self._runtime_field_text("metadata_root", self.metadata_root_var),
+                "music_dir": self._runtime_field_text("music_dir", self.music_dir_var),
+                "base_image_dir": self._runtime_field_text("base_image_dir", self.base_image_dir_var),
+                "output_root": self._runtime_field_text("output_root", self.output_root_var),
+                "ffmpeg_bin": self._runtime_field_text("ffmpeg_bin", self.ffmpeg_var) or "ffmpeg",
+                "ffmpeg_path": self._runtime_field_text("ffmpeg_bin", self.ffmpeg_var) or "ffmpeg",
+                "used_media_root": self._runtime_field_text("used_media_root", self.used_media_root_var),
+                "render_cleanup_days": int(self._runtime_field_text("render_cleanup_days", self.cleanup_days_var) or "5"),
             }
         )
         return config
 
-    def _build_current_run_plan(self):
+    def _sync_runtime_paths(self, *, persist: bool = False) -> dict[str, Any]:
+        config = self._current_runtime_config()
+        normalized = (
+            save_scheduler_settings(config, SCHEDULER_CONFIG_FILE)
+            if persist
+            else normalize_scheduler_config(config, SCRIPT_DIR)
+        )
+        self.scheduler_config = normalized
+        return normalized
+
+    def _write_run_snapshot(self, *, config: dict[str, Any], run_plan) -> None:
+        payload = {
+            "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "config": {
+                "metadata_root": str(config.get("metadata_root") or ""),
+                "music_dir": str(config.get("music_dir") or ""),
+                "base_image_dir": str(config.get("base_image_dir") or ""),
+                "output_root": str(config.get("output_root") or ""),
+                "used_media_root": str(config.get("used_media_root") or ""),
+                "ffmpeg_bin": str(config.get("ffmpeg_bin") or ""),
+                "render_cleanup_days": int(config.get("render_cleanup_days") or 0),
+            },
+            "modules": self._current_module_selection().labels(),
+            "tasks": [task.to_plan_dict(index + 1) for index, task in enumerate(run_plan.tasks)],
+            "tag_output_dirs": dict(run_plan.window_plan.get("tag_output_dirs") or {}),
+            "output_root": str(run_plan.output_root or ""),
+            "metadata_root": str(run_plan.metadata_root or ""),
+        }
+        RUN_SNAPSHOT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        RUN_SNAPSHOT_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _runtime_window_tasks(self) -> list[WindowTask]:
+        selected_tag = str(self.current_group_var.get() or "").strip()
+        live_source_dir = str(self.source_dir_override_var.get() or "").strip()
+        tags = [str(task.tag or "").strip() for task in self.window_tasks if str(task.tag or "").strip()]
+        unique_tags = list(dict.fromkeys(tags))
+        single_tag_mode = len(unique_tags) == 1
+
+        runtime_tasks: list[WindowTask] = []
+        for task in self.window_tasks:
+            should_override_source = False
+            if single_tag_mode:
+                should_override_source = True
+            elif selected_tag and str(task.tag or "").strip() == selected_tag:
+                should_override_source = True
+
+            cloned = create_task(
+                tag=task.tag,
+                serial=task.serial,
+                is_ypp=task.is_ypp,
+                title=task.title,
+                description=task.description,
+                visibility=task.visibility,
+                category=task.category,
+                made_for_kids=task.made_for_kids,
+                altered_content=task.altered_content,
+                notify_subscribers=task.notify_subscribers,
+                scheduled_publish_at=task.scheduled_publish_at,
+                schedule_timezone=task.schedule_timezone,
+                source_dir=live_source_dir if should_override_source else task.source_dir,
+                channel_name=task.channel_name,
+            )
+            cloned.tag_list = [str(item).strip() for item in task.tag_list if str(item).strip()]
+            cloned.thumbnails = [str(item).strip() for item in task.thumbnails if str(item).strip()]
+            cloned.ab_titles = [str(item).strip() for item in task.ab_titles if str(item).strip()]
+            runtime_tasks.append(cloned)
+        return runtime_tasks
+
+    def _build_current_run_plan(self, *, config: dict[str, Any] | None = None):
         return build_run_plan(
-            tasks=self.window_tasks,
+            tasks=self._runtime_window_tasks(),
             defaults=self._collect_defaults(),
             modules=self._current_module_selection(),
-            config=self._current_runtime_config(),
+            config=config or self._sync_runtime_paths(persist=False),
+        )
+
+    def _assert_manifest_ready_for_upload(self, *, manifest_path: Path, task: WindowTask, output_dir: Path) -> None:
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"{task.tag}/{task.serial} upload manifest 读取失败: {exc}") from exc
+
+        channels = payload.get("channels") if isinstance(payload, dict) else {}
+        channel = channels.get(str(task.serial)) if isinstance(channels, dict) else {}
+        if not isinstance(channel, dict):
+            raise RuntimeError(f"{task.tag}/{task.serial} upload manifest 缺少当前窗口记录。")
+
+        generation_source = str(channel.get("generation_source") or "").strip().lower()
+        api_preset_name = str(channel.get("api_preset_name") or "").strip()
+        content_template_name = str(channel.get("content_template_name") or "").strip()
+        video_name = str(channel.get("video") or "").strip()
+        thumbnails = [str(item).strip() for item in (channel.get("thumbnails") or []) if str(item).strip()]
+
+        if generation_source != "api":
+            raise RuntimeError(f"{task.tag}/{task.serial} manifest 不是 API 文案结果，已拒绝上传。")
+        if not api_preset_name or not content_template_name:
+            raise RuntimeError(f"{task.tag}/{task.serial} manifest 缺少 API 模板/内容模板标记，已拒绝上传。")
+
+        if not video_name:
+            raise RuntimeError(f"{task.tag}/{task.serial} manifest 未写入视频文件名。")
+        video_path = output_dir / Path(video_name).name
+        if not video_path.exists():
+            raise RuntimeError(f"{task.tag}/{task.serial} manifest 指向的视频不存在: {video_path}")
+        if self.generate_thumbnails_var.get() and not thumbnails:
+            raise RuntimeError(f"{task.tag}/{task.serial} manifest 未写入缩略图路径，已拒绝上传。")
+
+        self._log(
+            f"[Upload] manifest ready -> {task.tag}/{task.serial} | source={generation_source or 'n/a'} | "
+            f"preset={api_preset_name or '-'} | template={content_template_name or '-'} | video={video_path.name}"
+        )
+
+    def _assert_manifest_ready_for_upload(self, *, manifest_path: Path, task: WindowTask, output_dir: Path) -> None:
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"{task.tag}/{task.serial} upload manifest 读取失败: {exc}") from exc
+
+        channels = payload.get("channels") if isinstance(payload, dict) else {}
+        channel = channels.get(str(task.serial)) if isinstance(channels, dict) else {}
+        if not isinstance(channel, dict):
+            raise RuntimeError(f"{task.tag}/{task.serial} upload manifest 缺少当前窗口记录。")
+
+        generation_source = str(channel.get("generation_source") or "").strip().lower()
+        api_preset_name = str(channel.get("api_preset_name") or "").strip()
+        api_base_url = str(channel.get("api_base_url") or "").strip()
+        api_model = str(channel.get("api_model") or "").strip()
+        content_template_name = str(channel.get("content_template_name") or "").strip()
+        thumbnail_prompt_source = str(channel.get("thumbnail_prompt_source") or "").strip().lower()
+        video_name = str(channel.get("video") or "").strip()
+        thumbnails = [str(item).strip() for item in (channel.get("thumbnails") or []) if str(item).strip()]
+
+        if generation_source != "api":
+            raise RuntimeError(f"{task.tag}/{task.serial} manifest 不是 API 文案结果，已拒绝上传。")
+        if not api_preset_name or not api_base_url or not api_model or not content_template_name:
+            raise RuntimeError(f"{task.tag}/{task.serial} manifest 缺少 API/模板指纹，已拒绝上传。")
+        if not video_name:
+            raise RuntimeError(f"{task.tag}/{task.serial} manifest 未写入视频文件名。")
+
+        video_path = output_dir / Path(video_name).name
+        if not video_path.exists():
+            raise RuntimeError(f"{task.tag}/{task.serial} manifest 指向的视频不存在: {video_path}")
+        if self.generate_thumbnails_var.get() and not thumbnails:
+            raise RuntimeError(f"{task.tag}/{task.serial} manifest 未写入缩略图路径，已拒绝上传。")
+        if self.generate_thumbnails_var.get() and thumbnails and thumbnail_prompt_source != "api_text":
+            raise RuntimeError(f"{task.tag}/{task.serial} manifest 未标记 API 缩略图提示词来源，已拒绝上传。")
+
+        self._log(
+            f"[Upload] manifest ready -> {task.tag}/{task.serial} | source={generation_source or 'n/a'} | "
+            f"preset={api_preset_name or '-'} | model={api_model or '-'} | "
+            f"template={content_template_name or '-'} | video={video_path.name}"
         )
 
     def _build_start_tab(self) -> None:
@@ -2510,7 +2862,16 @@ class DashboardApp(ctk.CTk):
             ],
             start=1,
         ):
-            self._entry_row(path_frame, row, label, var)
+            entry_key = {
+                1: "metadata_root",
+                2: "music_dir",
+                3: "base_image_dir",
+                4: "output_root",
+                5: "ffmpeg_bin",
+                6: "used_media_root",
+                7: "render_cleanup_days",
+            }.get(row)
+            self._entry_row(path_frame, row, label, var, entry_key=entry_key)
         ctk.CTkButton(path_frame, text="保存路径配置", command=self._save_paths).grid(
             row=8, column=0, columnspan=4, sticky="w", padx=16, pady=(0, 14)
         )
@@ -2519,6 +2880,7 @@ class DashboardApp(ctk.CTk):
         binding_frame.grid(row=1, column=0, sticky="nsew", padx=8, pady=(8, 16))
         for column in range(4):
             binding_frame.grid_columnconfigure(column, weight=1)
+        binding_frame.grid_rowconfigure(6, weight=0)
         ctk.CTkLabel(binding_frame, text="分组素材目录绑定", font=ctk.CTkFont(size=24, weight="bold")).grid(
             row=0, column=0, columnspan=4, sticky="w", padx=16, pady=(14, 12)
         )
@@ -2543,29 +2905,62 @@ class DashboardApp(ctk.CTk):
         ctk.CTkButton(bar, text="保存绑定", command=self._save_binding).pack(side="left", padx=6)
         ctk.CTkButton(bar, text="删除绑定", command=self._remove_binding).pack(side="left", padx=6)
         ctk.CTkButton(bar, text="刷新分组", command=self._refresh_groups).pack(side="left", padx=6)
-        ctk.CTkLabel(binding_frame, text="当前绑定").grid(row=5, column=0, sticky="w", padx=16, pady=(0, 6))
-        self.binding_box = ctk.CTkTextbox(binding_frame, height=180)
+        ctk.CTkLabel(binding_frame, text="当前绑定（框内可滚动）").grid(row=5, column=0, sticky="w", padx=16, pady=(0, 6))
+        self.binding_box = ctk.CTkTextbox(binding_frame, height=200)
         self.binding_box.grid(row=6, column=0, columnspan=4, sticky="nsew", padx=16, pady=(0, 14))
-        self._bind_scroll_frame_wheel(tab, path_frame, binding_frame)
+        self._bind_scroll_frame_wheel(tab, base_tab, tab, path_frame, binding_frame)
+        canvas = getattr(tab, "_parent_canvas", None)
+        if canvas is not None:
+            def _scroll_binding_box(event: Any) -> str | None:
+                delta = 0
+                if getattr(event, "delta", 0):
+                    delta = -int(event.delta / 120) if event.delta else 0
+                elif getattr(event, "num", None) == 4:
+                    delta = -1
+                elif getattr(event, "num", None) == 5:
+                    delta = 1
+                if delta:
+                    canvas.yview_scroll(delta, "units")
+                    return "break"
+                return None
 
-    def _save_paths(self) -> None:
+            for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                try:
+                    self.binding_box.bind(sequence, _scroll_binding_box, add="+")
+                except Exception:
+                    pass
+                try:
+                    inner_binding_box = getattr(self.binding_box, "_textbox", None)
+                    if inner_binding_box is not None:
+                        inner_binding_box.bind(sequence, _scroll_binding_box, add="+")
+                except Exception:
+                    pass
+
+    def _save_paths(self) -> dict[str, Any]:
         config = load_scheduler_settings(SCHEDULER_CONFIG_FILE)
         config.update(
             {
-                "metadata_root": self.metadata_root_var.get().strip(),
-                "music_dir": self.music_dir_var.get().strip(),
-                "base_image_dir": self.base_image_dir_var.get().strip(),
-                "output_root": self.output_root_var.get().strip(),
-                "ffmpeg_bin": self.ffmpeg_var.get().strip() or "ffmpeg",
-                "ffmpeg_path": self.ffmpeg_var.get().strip() or "ffmpeg",
-                "used_media_root": self.used_media_root_var.get().strip(),
-                "render_cleanup_days": int(self.cleanup_days_var.get().strip() or "5"),
+                "metadata_root": self._runtime_field_text("metadata_root", self.metadata_root_var),
+                "music_dir": self._runtime_field_text("music_dir", self.music_dir_var),
+                "base_image_dir": self._runtime_field_text("base_image_dir", self.base_image_dir_var),
+                "output_root": self._runtime_field_text("output_root", self.output_root_var),
+                "ffmpeg_bin": self._runtime_field_text("ffmpeg_bin", self.ffmpeg_var) or "ffmpeg",
+                "ffmpeg_path": self._runtime_field_text("ffmpeg_bin", self.ffmpeg_var) or "ffmpeg",
+                "used_media_root": self._runtime_field_text("used_media_root", self.used_media_root_var),
+                "render_cleanup_days": int(self._runtime_field_text("render_cleanup_days", self.cleanup_days_var) or "5"),
             }
         )
         self.scheduler_config = save_scheduler_settings(config, SCHEDULER_CONFIG_FILE)
         self.metadata_root_var.set(str(get_metadata_root(self.scheduler_config)))
+        self.music_dir_var.set(str(self.scheduler_config.get("music_dir", "")))
+        self.base_image_dir_var.set(str(self.scheduler_config.get("base_image_dir", "")))
+        self.output_root_var.set(str(self.scheduler_config.get("output_root", "")))
+        self.ffmpeg_var.set(str(self.scheduler_config.get("ffmpeg_bin", "ffmpeg")))
+        self.used_media_root_var.set(str(self.scheduler_config.get("used_media_root", "")))
+        self.cleanup_days_var.set(str(self.scheduler_config.get("render_cleanup_days", 5)))
         self._refresh_bindings_box()
         self._log("[Paths] Saved path config")
+        return dict(self.scheduler_config)
 
     def _collect_defaults(self) -> WorkflowDefaults:
         modules = self._selected_modules()
@@ -2581,14 +2976,15 @@ class DashboardApp(ctk.CTk):
             schedule_interval_minutes=int(self.schedule_interval_var.get().strip() or "60"),
             schedule_timezone=self.schedule_timezone_var.get().strip() or SCHEDULE_TIMEZONE_VALUES[0],
             metadata_mode="prompt_api",
-            generate_text=bool(modules["metadata"] and self.generate_text_var.get()),
-            generate_thumbnails=bool(modules["metadata"] and self.generate_thumbnails_var.get()),
+            generate_text=bool(modules["metadata"]),
+            generate_thumbnails=bool(modules["metadata"]),
             sync_daily_content=bool(modules["metadata"]),
             randomize_effects=bool(self.randomize_effects_var.get()),
             visual_settings=self._collect_visual_settings(),
         )
 
     def _preview_plan(self) -> None:
+        self._save_paths()
         self.start_preview.delete("1.0", "end")
         module_selection = self._current_module_selection()
         if not module_selection.any_selected():
@@ -2622,6 +3018,7 @@ class DashboardApp(ctk.CTk):
         self._save_state()
 
     def _validate_paths(self) -> None:
+        saved_config = self._save_paths()
         module_selection = self._current_module_selection()
         if not module_selection.any_selected():
             messagebox.showerror("Validate Failed", "Select at least one module first.")
@@ -2630,7 +3027,7 @@ class DashboardApp(ctk.CTk):
             messagebox.showerror("Validate Failed", "Add at least one window task first.")
             return
 
-        run_plan = self._build_current_run_plan()
+        run_plan = self._build_current_run_plan(config=saved_config)
         report = validate_run_plan(run_plan, log=self._log)
         text: list[str] = []
         text.extend(f"Ready to upload: {tag} -> {folder}" for tag, folder in report.resolved_output_dirs.items())
@@ -2644,6 +3041,7 @@ class DashboardApp(ctk.CTk):
         self._preview_plan()
 
     def _start_simulation(self) -> None:
+        saved_config = self._save_paths()
         module_selection = self._current_module_selection()
         if not module_selection.render:
             messagebox.showerror("Cannot Simulate", "Simulation requires the Render module.")
@@ -2651,11 +3049,10 @@ class DashboardApp(ctk.CTk):
         if not self.window_tasks:
             messagebox.showerror("Cannot Simulate", "Add at least one window task first.")
             return
+        run_plan = self._build_current_run_plan(config=saved_config)
+        seconds = int(self.simulate_seconds_var.get().strip() or "90")
 
         def job() -> None:
-            self._persist_prompt_form_for_active_tasks()
-            run_plan = self._build_current_run_plan()
-            seconds = int(self.simulate_seconds_var.get().strip() or "90")
             result = execute_simulation_plan(
                 run_plan,
                 simulate_seconds=seconds,
@@ -2668,6 +3065,14 @@ class DashboardApp(ctk.CTk):
         self._run_background(job, task_name="Simulate Render", total_items=len(self.window_tasks), include_upload=False)
 
     def _start_real_flow(self) -> None:
+        saved_config = self._save_paths()
+        self._log(
+            "[路径] 本次运行使用: "
+            f"metadata={saved_config.get('metadata_root')} | "
+            f"music={saved_config.get('music_dir')} | "
+            f"image={saved_config.get('base_image_dir')} | "
+            f"output={saved_config.get('output_root')}"
+        )
         module_selection = self._current_module_selection()
         if not module_selection.any_selected():
             messagebox.showerror("Cannot Start", "Select at least one module first.")
@@ -2675,10 +3080,38 @@ class DashboardApp(ctk.CTk):
         if not self.window_tasks:
             messagebox.showerror("Cannot Start", "Add at least one window task first.")
             return
+        if module_selection.metadata:
+            if not bool(self.generate_text_var.get()):
+                self.generate_text_var.set(True)
+            if not bool(self.generate_thumbnails_var.get()):
+                self.generate_thumbnails_var.set(True)
+            self._log("[Metadata] Quick Start 已勾选文案模块，本次强制走 API 生成标题/简介/标签，缩略图优先走图片 API。")
+        self._persist_prompt_form_for_active_tasks()
+        run_plan = self._build_current_run_plan(config=saved_config)
+        self._write_run_snapshot(config=saved_config, run_plan=run_plan)
+        task_runtime_rows = [
+            {
+                "tag": str(task.tag or "").strip(),
+                "serial": int(task.serial),
+                "source_dir": str(task.source_dir or "").strip(),
+                "title": str(task.title or "").strip(),
+                "thumbnails": [str(item).strip() for item in task.thumbnails if str(item).strip()],
+            }
+            for task in run_plan.tasks
+        ]
+        self._log(f"[Paths] Runtime tasks: {json.dumps(task_runtime_rows, ensure_ascii=False)}")
+        self._log(f"[Paths] Resolved tag output dirs: {json.dumps(run_plan.window_plan.get('tag_output_dirs', {}), ensure_ascii=False)}")
+        self._log(f"[Paths] Resolved tag metadata dirs: {json.dumps(run_plan.window_plan.get('tag_metadata_dirs', {}), ensure_ascii=False)}")
+        upload_runtime = {
+            "retain_days": str(self.cleanup_days_var.get().strip() or "5"),
+            "auto_close": bool(self.upload_auto_close_var.get()),
+        }
 
         def job() -> bool:
-            self._persist_prompt_form_for_active_tasks()
-            run_plan = self._build_current_run_plan()
+            self._log(
+                f"[Paths] metadata={run_plan.metadata_root} | music={run_plan.music_root} | "
+                f"image={run_plan.image_root} | output={run_plan.output_root}"
+            )
             stream_upload = bool(run_plan.modules.render and run_plan.modules.upload)
             upload_dispatched = False
 
@@ -2686,9 +3119,20 @@ class DashboardApp(ctk.CTk):
                 nonlocal upload_dispatched
                 if not stream_upload:
                     return
+                self._assert_manifest_ready_for_upload(
+                    manifest_path=_manifest_path,
+                    task=task,
+                    output_dir=output_dir,
+                )
                 upload_dispatched = True
                 self._log(f"[Upload] {task.tag}/{task.serial} 已完成渲染与文案，立即开始上传")
-                self._launch_stream_upload_for_task(run_plan, task, output_dir)
+                self._launch_stream_upload_for_task(
+                    run_plan,
+                    task,
+                    output_dir,
+                    retain_days=upload_runtime["retain_days"],
+                    auto_close=upload_runtime["auto_close"],
+                )
 
             execution = execute_run_plan(
                 run_plan,
@@ -2711,6 +3155,8 @@ class DashboardApp(ctk.CTk):
                     run_plan,
                     detach=True,
                     prepared_output_dirs=execution.prepared_output_dirs,
+                    retain_days=upload_runtime["retain_days"],
+                    auto_close=upload_runtime["auto_close"],
                 )
 
             return False
