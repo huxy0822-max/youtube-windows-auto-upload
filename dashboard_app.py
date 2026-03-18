@@ -103,6 +103,7 @@ METADATA_MODE_VALUES = list(METADATA_MODE_LABELS.keys())
 SCHEDULE_TIMEZONE_VALUES = ["Asia/Taipei (+08:00)"]
 WINDOW_BUTTONS_PER_ROW = 6
 VISUAL_TOGGLE_VALUES = ["yes", "no"]
+RANDOM_OPTION = "random"
 
 
 ctk.set_appearance_mode("dark")
@@ -115,6 +116,13 @@ def _bool_from_yes_no(value: str) -> bool:
 
 def _yes_no_from_bool(value: bool) -> str:
     return "yes" if value else "no"
+
+
+def _with_random(values: list[str]) -> list[str]:
+    result = list(values)
+    if RANDOM_OPTION not in result:
+        result.append(RANDOM_OPTION)
+    return result
 
 
 def _today_mmdd() -> str:
@@ -240,6 +248,8 @@ class DashboardApp(ctk.CTk):
         self.upload_monitor_thread: threading.Thread | None = None
         self.worker_processes: list[subprocess.Popen[str]] = []
         self.upload_monitor_threads: list[threading.Thread] = []
+        self._upload_process_lock = threading.Lock()
+        self._upload_failures: list[str] = []
         self._audience_data_url: str = ""
         self._state = self._load_state()
         self.window_tasks: list[WindowTask] = []
@@ -759,7 +769,10 @@ class DashboardApp(ctk.CTk):
         )
         ctk.CTkLabel(
             intro,
-            text="关闭随机视觉特效后，下面这些手动参数才会生效。这里改的是渲染特效，不影响上传规则。",
+            text=(
+                "这里改的是渲染特效，不影响上传规则。涉及“有没有”的开关仍按你手动勾选执行；"
+                "只有你选成 random 的样式、配色、贴纸、字体和数值区间，才会按每个视频单独随机。"
+            ),
             text_color="#b8c1cc",
             justify="left",
         ).grid(row=1, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 14))
@@ -774,8 +787,8 @@ class DashboardApp(ctk.CTk):
         self._entry_row(basic, 1, "频谱", self.visual_spectrum_var, values=VISUAL_TOGGLE_VALUES)
         self._entry_row(basic, 2, "时间轴", self.visual_timeline_var, values=VISUAL_TOGGLE_VALUES)
         self._entry_row(basic, 3, "黑边", self.visual_letterbox_var, values=VISUAL_TOGGLE_VALUES)
-        self._entry_row(basic, 4, "镜头缩放", self.visual_zoom_var, values=list_zoom_modes())
-        self._entry_row(basic, 5, "频谱样式", self.visual_style_var, values=list_effects())
+        self._entry_row(basic, 4, "镜头缩放", self.visual_zoom_var, values=_with_random(list_zoom_modes()))
+        self._entry_row(basic, 5, "频谱样式", self.visual_style_var, values=_with_random(list_effects()))
         self._entry_row(basic, 6, "频谱 Y", self.visual_spectrum_y_var)
         self._entry_row(basic, 7, "频谱 X (-1=居中)", self.visual_spectrum_x_var)
         self._entry_row(basic, 8, "频谱宽度", self.visual_spectrum_w_var)
@@ -787,12 +800,12 @@ class DashboardApp(ctk.CTk):
         ctk.CTkLabel(mood, text="色彩与氛围", font=ctk.CTkFont(size=22, weight="bold")).grid(
             row=0, column=0, columnspan=4, sticky="w", padx=16, pady=(14, 12)
         )
-        self._entry_row(mood, 1, "频谱配色", self.visual_color_spectrum_var, values=list_palette_names())
-        self._entry_row(mood, 2, "时间轴配色", self.visual_color_timeline_var, values=list_palette_names())
+        self._entry_row(mood, 1, "频谱配色", self.visual_color_spectrum_var, values=_with_random(list_palette_names()))
+        self._entry_row(mood, 2, "时间轴配色", self.visual_color_timeline_var, values=_with_random(list_palette_names()))
         self._entry_row(mood, 3, "胶片颗粒", self.visual_film_grain_var, values=VISUAL_TOGGLE_VALUES)
         self._entry_row(mood, 4, "颗粒强度", self.visual_grain_strength_var)
         self._entry_row(mood, 5, "暗角", self.visual_vignette_var, values=VISUAL_TOGGLE_VALUES)
-        self._entry_row(mood, 6, "色调", self.visual_tint_var, values=list_tint_names())
+        self._entry_row(mood, 6, "色调", self.visual_tint_var, values=_with_random(list_tint_names()))
         self._entry_row(mood, 7, "柔焦", self.visual_soft_focus_var, values=VISUAL_TOGGLE_VALUES)
         self._entry_row(mood, 8, "柔焦强度", self.visual_soft_focus_sigma_var)
 
@@ -803,14 +816,14 @@ class DashboardApp(ctk.CTk):
         ctk.CTkLabel(overlay, text="贴纸 / 粒子 / 叠字", font=ctk.CTkFont(size=22, weight="bold")).grid(
             row=0, column=0, columnspan=4, sticky="w", padx=16, pady=(14, 12)
         )
-        self._entry_row(overlay, 1, "贴纸 / 粒子", self.visual_particle_var, values=list_particle_effects())
+        self._entry_row(overlay, 1, "贴纸 / 粒子", self.visual_particle_var, values=_with_random(list_particle_effects()))
         self._entry_row(overlay, 2, "贴纸透明度", self.visual_particle_opacity_var)
         self._entry_row(overlay, 3, "贴纸速度", self.visual_particle_speed_var)
         self._entry_row(overlay, 4, "叠字内容", self.visual_text_var)
-        self._entry_row(overlay, 5, "字体", self.visual_text_font_var, values=list_font_names())
-        self._entry_row(overlay, 6, "文字位置", self.visual_text_pos_var, values=list_text_positions())
+        self._entry_row(overlay, 5, "字体", self.visual_text_font_var, values=_with_random(list_font_names()))
+        self._entry_row(overlay, 6, "文字位置", self.visual_text_pos_var, values=_with_random(list_text_positions()))
         self._entry_row(overlay, 7, "文字大小", self.visual_text_size_var)
-        self._entry_row(overlay, 8, "文字样式", self.visual_text_style_var, values=list_text_styles())
+        self._entry_row(overlay, 8, "文字样式", self.visual_text_style_var, values=_with_random(list_text_styles()))
 
         help_frame = ctk.CTkFrame(tab)
         help_frame.grid(row=4, column=0, sticky="ew", padx=8, pady=(8, 16))
@@ -823,7 +836,9 @@ class DashboardApp(ctk.CTk):
             text=(
                 "1. 把新的 mp4 / mov / webm / mkv 叠层素材直接放进 overlays 文件夹。\n"
                 "2. 重开控制台后，新文件名会自动出现在“贴纸 / 粒子”下拉里。\n"
-                "3. 如果要新增真正的新滤镜，再扩 effects_library.py 里的 get_effect。"
+                "3. 想按视频随机时，把下拉切成 random；像频谱宽度、颗粒强度、贴纸透明度、贴纸速度、文字大小，"
+                "可以直接输入区间，例如 1080-1600、6-18、0.35-0.75、0.85-1.15、48-72。\n"
+                "4. 如果要新增真正的新滤镜，再扩 effects_library.py 里的 get_effect。"
             ),
             text_color="#b8c1cc",
             justify="left",
@@ -941,12 +956,15 @@ class DashboardApp(ctk.CTk):
         self.audience_result_box.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 14))
 
     def _build_paths_tab(self) -> None:
-        tab = self.tabview.tab("路径配置")
+        base_tab = self.tabview.tab("路径配置")
+        base_tab.grid_columnconfigure(0, weight=1)
+        base_tab.grid_rowconfigure(0, weight=1)
+        tab = ctk.CTkScrollableFrame(base_tab)
+        tab.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
         tab.grid_columnconfigure(0, weight=1)
-        tab.grid_rowconfigure(1, weight=1)
 
         path_frame = ctk.CTkFrame(tab)
-        path_frame.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
+        path_frame.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 8))
         path_frame.grid_columnconfigure(0, weight=0)
         path_frame.grid_columnconfigure(1, weight=1)
         path_frame.grid_columnconfigure(2, weight=1)
@@ -1271,6 +1289,8 @@ class DashboardApp(ctk.CTk):
         self.pause_button_text_var.set("暂停")
         self._run_render_done.clear()
         self._run_upload_done.clear()
+        with self._upload_process_lock:
+            self._upload_failures = []
         self.run_last_log_var.set("任务已启动，等待第一条日志")
         self._apply_run_status()
 
@@ -1878,6 +1898,99 @@ class DashboardApp(ctk.CTk):
                 prepared.setdefault(tag, str(folder))
         return prepared
 
+    def _launch_stream_upload_for_task(self, run_plan, task: WindowTask, output_dir: Path) -> None:
+        plan = deepcopy(run_plan.window_plan)
+        plan["tasks"] = [
+            item
+            for item in list(plan.get("tasks") or [])
+            if str(item.get("tag") or "").strip() == task.tag and int(item.get("serial") or 0) == int(task.serial)
+        ]
+        plan["groups"] = {task.tag: [int(task.serial)]}
+        plan["tags"] = [task.tag]
+        plan["default_tag"] = task.tag
+        plan["tag_output_dirs"] = {task.tag: str(output_dir)}
+        plan_path = save_window_plan(
+            plan,
+            run_plan.defaults.date_mmdd,
+            path=SCRIPT_DIR / "data" / f"window_upload_plan_{run_plan.defaults.date_mmdd}_{task.serial}.json",
+        )
+        retain_days = str(self.cleanup_days_var.get().strip() or "5")
+        cmd = [
+            sys.executable,
+            "-u",
+            str(UPLOAD_SCRIPT),
+            "--tag",
+            task.tag,
+            "--date",
+            run_plan.defaults.date_mmdd,
+            "--channel",
+            str(task.serial),
+            "--auto-confirm",
+            "--window-plan-file",
+            str(plan_path),
+            "--retain-video-days",
+            retain_days,
+        ]
+        if self.upload_auto_close_var.get():
+            cmd.append("--auto-close-browser")
+
+        label = f"{task.tag}/{task.serial}"
+        self._log("[Upload] Stream dispatch -> " + " ".join(cmd))
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(SCRIPT_DIR),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        with self._upload_process_lock:
+            self.worker_processes.append(proc)
+
+        def reader() -> None:
+            error_text = ""
+            completed_ok = False
+            try:
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    self._log(f"[Upload {label}] {line.rstrip()}")
+                return_code = proc.wait()
+                if return_code != 0 and not self._cancel_requested:
+                    error_text = f"{label} exit {return_code}"
+                else:
+                    completed_ok = not self._cancel_requested
+            except Exception as exc:
+                if not self._cancel_requested:
+                    error_text = f"{label}: {exc}"
+            finally:
+                with self._upload_process_lock:
+                    try:
+                        self.worker_processes.remove(proc)
+                    except ValueError:
+                        pass
+                    if error_text:
+                        self._upload_failures.append(error_text)
+                if completed_ok:
+                    self._post_ui_action(lambda serial=task.serial: self._run_progress_step_done(str(serial), "upload"))
+
+        thread = threading.Thread(target=reader, daemon=True)
+        with self._upload_process_lock:
+            self.upload_monitor_threads.append(thread)
+        thread.start()
+
+    def _wait_for_stream_uploads(self) -> list[str]:
+        while True:
+            with self._upload_process_lock:
+                self.upload_monitor_threads = [thread for thread in self.upload_monitor_threads if thread.is_alive()]
+                active = [proc for proc in self.worker_processes if proc.poll() is None]
+                failures = list(self._upload_failures)
+            if not active and not self.upload_monitor_threads:
+                return failures
+            if self._cancel_requested:
+                return failures
+            time.sleep(0.5)
+
     def _run_upload_command(
         self,
         run_plan,
@@ -2228,10 +2341,9 @@ class DashboardApp(ctk.CTk):
         )
 
         binding_frame = ctk.CTkFrame(tab)
-        binding_frame.grid(row=1, column=0, sticky="nsew", padx=16, pady=(8, 16))
+        binding_frame.grid(row=1, column=0, sticky="nsew", padx=8, pady=(8, 16))
         for column in range(4):
             binding_frame.grid_columnconfigure(column, weight=1)
-        binding_frame.grid_rowconfigure(6, weight=1)
         ctk.CTkLabel(binding_frame, text="分组素材目录绑定", font=ctk.CTkFont(size=24, weight="bold")).grid(
             row=0, column=0, columnspan=4, sticky="w", padx=16, pady=(14, 12)
         )
@@ -2391,7 +2503,31 @@ class DashboardApp(ctk.CTk):
         def job() -> bool:
             self._persist_prompt_form_for_active_tasks()
             run_plan = self._build_current_run_plan()
-            execution = execute_run_plan(run_plan, control=self.execution_control, log=self._log)
+            stream_upload = bool(run_plan.modules.render and run_plan.modules.upload)
+            upload_dispatched = False
+
+            def handle_item_ready(task: WindowTask, output_dir: Path, _manifest_path: Path) -> None:
+                nonlocal upload_dispatched
+                if not stream_upload:
+                    return
+                upload_dispatched = True
+                self._log(f"[Upload] {task.tag}/{task.serial} 已完成渲染与文案，立即开始上传")
+                self._launch_stream_upload_for_task(run_plan, task, output_dir)
+
+            execution = execute_run_plan(
+                run_plan,
+                control=self.execution_control,
+                on_item_ready=handle_item_ready if stream_upload else None,
+                log=self._log,
+            )
+
+            if stream_upload and upload_dispatched:
+                failures = self._wait_for_stream_uploads()
+                if self._cancel_requested:
+                    return False
+                if failures:
+                    raise RuntimeError(" | ".join(failures[:3]))
+                return False
 
             if run_plan.modules.upload:
                 self._log("[Start] Upload module")

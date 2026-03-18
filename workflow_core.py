@@ -52,6 +52,7 @@ AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
 PROGRESS_INTERVAL_SECONDS = 3.0
 
 LogFunc = Callable[[str], None]
+ArtifactReadyCallback = Callable[["WindowTask", Path, Path], None]
 
 
 def _noop_log(_message: str) -> None:
@@ -257,8 +258,6 @@ def _build_render_options_from_defaults(defaults: WorkflowDefaults) -> RenderOpt
     settings = defaults.visual_settings or {}
     opts = RenderOptions()
     opts.fx_randomize = bool(defaults.randomize_effects)
-    if opts.fx_randomize:
-        return opts
 
     opts.fx_spectrum = bool(settings.get("spectrum", True))
     opts.fx_timeline = bool(settings.get("timeline", True))
@@ -267,22 +266,22 @@ def _build_render_options_from_defaults(defaults: WorkflowDefaults) -> RenderOpt
     opts.fx_style = str(settings.get("style", "bar") or "bar")
     opts.fx_color_spectrum = str(settings.get("color_spectrum", "WhiteGold") or "WhiteGold")
     opts.fx_color_timeline = str(settings.get("color_timeline", "WhiteGold") or "WhiteGold")
-    opts.fx_spectrum_y = _coerce_int(settings.get("spectrum_y", 530), 530)
-    opts.fx_spectrum_x = _coerce_int(settings.get("spectrum_x", -1), -1)
-    opts.fx_spectrum_w = _coerce_int(settings.get("spectrum_w", 1200), 1200)
+    opts.fx_spectrum_y = settings.get("spectrum_y", 530)
+    opts.fx_spectrum_x = settings.get("spectrum_x", -1)
+    opts.fx_spectrum_w = settings.get("spectrum_w", 1200)
     opts.fx_film_grain = bool(settings.get("film_grain", False))
-    opts.fx_grain_strength = _coerce_int(settings.get("grain_strength", 15), 15)
+    opts.fx_grain_strength = settings.get("grain_strength", 15)
     opts.fx_vignette = bool(settings.get("vignette", False))
     opts.fx_color_tint = str(settings.get("color_tint", "none") or "none")
     opts.fx_soft_focus = bool(settings.get("soft_focus", False))
-    opts.fx_soft_focus_sigma = _coerce_float(settings.get("soft_focus_sigma", 1.5), 1.5)
+    opts.fx_soft_focus_sigma = settings.get("soft_focus_sigma", 1.5)
     opts.fx_particle = str(settings.get("particle", "none") or "none")
-    opts.fx_particle_opacity = _coerce_float(settings.get("particle_opacity", 0.6), 0.6)
-    opts.fx_particle_speed = _coerce_float(settings.get("particle_speed", 1.0), 1.0)
+    opts.fx_particle_opacity = settings.get("particle_opacity", 0.6)
+    opts.fx_particle_speed = settings.get("particle_speed", 1.0)
     opts.fx_text = str(settings.get("text", "") or "")
     opts.fx_text_font = str(settings.get("text_font", "default") or "default")
     opts.fx_text_pos = str(settings.get("text_pos", "center") or "center")
-    opts.fx_text_size = _coerce_int(settings.get("text_size", 60), 60)
+    opts.fx_text_size = settings.get("text_size", 60)
     opts.fx_text_style = str(settings.get("text_style", "Classic") or "Classic")
     return opts
 
@@ -1779,6 +1778,7 @@ def execute_metadata_only_workflow(
     defaults: WorkflowDefaults,
     config: dict[str, Any] | None = None,
     control: ExecutionControl | None = None,
+    on_item_ready: ArtifactReadyCallback | None = None,
     log: LogFunc = _noop_log,
 ) -> WorkflowResult:
     if not tasks:
@@ -1968,6 +1968,19 @@ def execute_metadata_only_workflow(
                     "set": 1,
                     "upload_options": _build_upload_options(task),
                 }
+                manifest_path = _write_manifest(
+                    output_dir=Path(state["output_dir"]),
+                    date_mmdd=defaults.date_mmdd,
+                    tag=str(state["tag"]),
+                    channels=dict(state["channels"]),
+                    source_label="metadata_only",
+                )
+                manifest_path_text = str(manifest_path)
+                if manifest_path_text not in result.manifest_paths:
+                    result.manifest_paths.append(manifest_path_text)
+                log(f"[清单] {state['tag']} metadata manifest 已更新: {manifest_path}")
+                if on_item_ready:
+                    on_item_ready(task, Path(state["output_dir"]), manifest_path)
 
             result.items.append(
                 RenderedItem(
@@ -1996,7 +2009,9 @@ def execute_metadata_only_workflow(
                 channels=channels,
                 source_label="metadata_only",
             )
-            result.manifest_paths.append(str(manifest_path))
+            manifest_path_text = str(manifest_path)
+            if manifest_path_text not in result.manifest_paths:
+                result.manifest_paths.append(manifest_path_text)
             log(f"[清单] {state['tag']} metadata manifest 已更新: {manifest_path}")
 
     return result
@@ -2009,6 +2024,7 @@ def execute_direct_media_workflow(
     simulation: SimulationOptions | None = None,
     config: dict[str, Any] | None = None,
     control: ExecutionControl | None = None,
+    on_item_ready: ArtifactReadyCallback | None = None,
     log: LogFunc = _noop_log,
 ) -> WorkflowResult:
     if not tasks:
@@ -2239,6 +2255,20 @@ def execute_direct_media_workflow(
                 "set": 1,
                 "upload_options": _build_upload_options(task),
             }
+            if simulation is None or simulation.save_manifest:
+                manifest_path = _write_manifest(
+                    output_dir=Path(state["output_dir"]),
+                    date_mmdd=defaults.date_mmdd,
+                    tag=str(state["tag"]),
+                    channels=dict(state["manifest_channels"]),
+                    source_label="group_bound_media",
+                )
+                manifest_path_text = str(manifest_path)
+                if manifest_path_text not in result.manifest_paths:
+                    result.manifest_paths.append(manifest_path_text)
+                log(f"[清单] {state['tag']} manifest 已写入: {manifest_path}")
+                if on_item_ready:
+                    on_item_ready(task, Path(state["output_dir"]), manifest_path)
             result.items.append(
                 RenderedItem(
                     tag=tag,
@@ -2268,7 +2298,9 @@ def execute_direct_media_workflow(
                 channels=dict(state["manifest_channels"]),
                 source_label="group_bound_media",
             )
-            result.manifest_paths.append(str(manifest_path))
+            manifest_path_text = str(manifest_path)
+            if manifest_path_text not in result.manifest_paths:
+                result.manifest_paths.append(manifest_path_text)
             log(f"[清单] {state['tag']} manifest 已写入: {manifest_path}")
 
     return result

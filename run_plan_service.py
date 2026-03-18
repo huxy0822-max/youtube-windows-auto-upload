@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from workflow_core import (
+    ArtifactReadyCallback,
     ExecutionControl,
     SimulationOptions,
     WindowTask,
@@ -267,6 +268,7 @@ def execute_run_plan(
     run_plan: RunPlan,
     *,
     control: ExecutionControl | None = None,
+    on_item_ready: ArtifactReadyCallback | None = None,
     log: LogFunc = _noop_log,
 ) -> ExecutionResult:
     validation = validate_run_plan(run_plan, log=log)
@@ -287,6 +289,7 @@ def execute_run_plan(
             simulation=SimulationOptions(simulate_seconds=0, consume_sources=True, save_manifest=True),
             config=run_plan.config,
             control=control,
+            on_item_ready=on_item_ready if run_plan.modules.upload else None,
             log=log,
         )
         result.workflow_result = workflow_result
@@ -300,10 +303,11 @@ def execute_run_plan(
             defaults=run_plan.defaults,
             config=run_plan.config,
             control=control,
+            on_item_ready=on_item_ready if run_plan.modules.upload else None,
             log=log,
         )
 
-    if run_plan.modules.upload and run_plan.modules.metadata:
+    if run_plan.modules.upload and run_plan.modules.metadata and on_item_ready is None:
         log("[Upload] Refresh existing manifests using current metadata settings")
         result.prepared_output_dirs = refresh_existing_output_metadata(
             tasks=run_plan.tasks,
