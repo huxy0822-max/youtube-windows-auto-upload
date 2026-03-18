@@ -166,6 +166,23 @@ def _iter_window_plan_source_dirs(window_plan: Optional[Dict[str, Any]], tag: st
     return paths
 
 
+def _extract_window_plan_serials_from_plan(window_plan: Optional[Dict[str, Any]], tag: str) -> List[int]:
+    if not isinstance(window_plan, dict):
+        return []
+    wanted = _normalize_tag_for_match(tag)
+    serials: list[int] = []
+    for task in window_plan.get("tasks", []) or []:
+        if _normalize_tag_for_match(task.get("tag") or "") != wanted:
+            continue
+        try:
+            serial = int(task.get("serial") or 0)
+        except (TypeError, ValueError):
+            continue
+        if serial:
+            serials.append(serial)
+    return sorted(set(serials))
+
+
 def _count_matching_output_videos(folder: Path, date_key: str) -> int:
     if not folder.exists() or not folder.is_dir():
         return 0
@@ -648,7 +665,9 @@ def _upload_context_probe_script() -> str:
         };
 
         visit(document);
-        const bodyText = `${document.body?.innerText || ''}\n${combinedText}`.toLowerCase();
+        const bodyNode = document.body || null;
+        const bodyInnerText = bodyNode && bodyNode.innerText ? String(bodyNode.innerText) : '';
+        const bodyText = String(bodyInnerText + '\\n' + combinedText).toLowerCase();
         const titleText = String(document.title || '').trim().toLowerCase();
         const url = String(location.href || '').toLowerCase();
         const hasExpectedName = normalizedExpected
@@ -4755,8 +4774,8 @@ async def select_file_with_cdp(page, file_path: str) -> bool:
             log("CDP 文件设置成功并已确认进入上传上下文", "OK")
             return True
 
-        log("CDP 已设置文件，但页面暂未确认接收，切换 Playwright 回退确认", "WARN")
-        return await select_file_with_playwright(page, file_path)
+        log("CDP 已设置文件，但页面暂未立即确认接收，继续交给后续等待逻辑", "WARN")
+        return True
         
     except Exception as e:
         log(f"CDP 文件选择失败: {e}，切换 Playwright 回退", "WARN")
@@ -7088,7 +7107,11 @@ async def batch_upload(
     
     # ========== 动态从 API 获取环境列表 ==========
     # 获取该标签下的所有环境。若 HubStudio 未同步新赛道标签，则回退到 channels.md。
-    containers, container_source, serial_to_channel_name = resolve_containers_for_tag(tag, project_folder)
+    containers, container_source, serial_to_channel_name = resolve_containers_for_tag(
+        tag,
+        project_folder,
+        window_plan=window_plan,
+    )
     if not containers:
         log(f"未找到标签为 '{tag}' 的环境", "ERR")
         return make_batch_result(0, 0, 1)
@@ -7110,6 +7133,14 @@ async def batch_upload(
         ypp_serials = [s for s in ypp_serials if s not in skip_set]
         non_ypp_serials = [s for s in non_ypp_serials if s not in skip_set]
         log(f"跳过指定序号: {sorted(skip_set)}", "WARN")
+
+    plan_serials = _extract_window_plan_serials_from_plan(window_plan, tag)
+    if plan_serials:
+        allowed_serials = set(plan_serials)
+        containers = [c for c in containers if int(c["serialNumber"]) in allowed_serials]
+        ypp_serials = [s for s in ypp_serials if s in allowed_serials]
+        non_ypp_serials = [s for s in non_ypp_serials if s in allowed_serials]
+        log(f"窗口任务计划限定序号: {plan_serials}", "OK")
 
     all_serials = sorted(ypp_serials + non_ypp_serials)
     if not all_serials:
@@ -8442,20 +8473,7 @@ def load_channel_mapping_registry() -> Dict[int, Dict[str, Any]]:
 
 def extract_window_plan_serials(tag: str) -> List[int]:
     plan = globals().get("ACTIVE_WINDOW_PLAN")
-    if not isinstance(plan, dict):
-        return []
-    wanted = _normalize_tag_for_match(tag)
-    serials: List[int] = []
-    for task in plan.get("tasks", []) or []:
-        if _normalize_tag_for_match(task.get("tag", "")) != wanted:
-            continue
-        try:
-            serial = int(task.get("serial") or 0)
-        except (TypeError, ValueError):
-            continue
-        if serial:
-            serials.append(serial)
-    return sorted(set(serials))
+    return _extract_window_plan_serials_from_plan(plan, tag)
 
 
 def get_all_containers() -> List[Dict]:
@@ -8481,8 +8499,39 @@ def get_all_containers() -> List[Dict]:
     return []
 
 
-def resolve_containers_for_tag(tag: str, project_folder: Optional[Path]) -> tuple[List[Dict], str, Dict[int, str]]:
+def resolve_containers_for_tag(
+    tag: str,
+    project_folder: Optional[Path],
+    window_plan: Optional[Dict[str, Any]] = None,
+) -> tuple[List[Dict], str, Dict[int, str]]:
     serial_to_channel_name = load_channels_registry(project_folder)
+    wanted_serials = set(_extract_window_plan_serials_from_plan(window_plan, tag))
+
+    if wanted_serials:
+        matched = [
+            c for c in get_all_containers()
+            if int(c.get("serialNumber", 0) or 0) in wanted_serials
+        ]
+        matched = sorted(matched, key=lambda x: int(x.get("serialNumber", 0) or 0))
+        if matched:
+            log(
+                f"使用窗口任务计划限定环境: {sorted(wanted_serials)}",
+                "OK",
+            )
+            return matched, "window_plan_serials", serial_to_channel_name
+
+        mapping_registry = load_channel_mapping_registry()
+        mapped = [
+            mapping_registry[serial]
+            for serial in sorted(wanted_serials)
+            if serial in mapping_registry
+        ]
+        if mapped:
+            log(
+                f"BitBrowser 列表暂不可用，按窗口任务计划 / channel_mapping 回退匹配: {sorted(wanted_serials)}",
+                "WARN",
+            )
+            return mapped, "channel_mapping_plan_fallback", serial_to_channel_name
 
     tagged_containers = get_containers_by_tag(tag)
     if tagged_containers:

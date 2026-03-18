@@ -114,6 +114,13 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
 
+def _subprocess_utf8_env() -> dict[str, str]:
+    env = dict(os.environ)
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
+
+
 def _bool_from_yes_no(value: str) -> bool:
     return str(value).strip().lower() == "yes"
 
@@ -535,7 +542,7 @@ class DashboardApp(ctk.CTk):
         ).grid(row=0, column=0, sticky="w", padx=20, pady=(18, 4))
         ctk.CTkLabel(
             header,
-            text="???????????????????????????????",
+            text="上传页负责今天哪些窗口要工作，其他页面分别管理提示词、路径和高级视觉。",
             text_color="#b8c1cc",
             font=ctk.CTkFont(size=14),
         ).grid(row=1, column=0, sticky="w", padx=20, pady=(0, 18))
@@ -751,7 +758,7 @@ class DashboardApp(ctk.CTk):
         )
         ctk.CTkCheckBox(
             add_frame,
-            text="??????",
+            text="通知订阅用户",
             variable=self.add_notify_var,
         ).grid(row=2, column=4, sticky="w", padx=8, pady=(0, 6))
         self.add_schedule_checkbox = ctk.CTkCheckBox(
@@ -807,7 +814,7 @@ class DashboardApp(ctk.CTk):
         )
         ctk.CTkCheckBox(
             default_frame,
-            text="??????",
+            text="通知订阅用户",
             variable=self.default_notify_var,
         ).grid(
             row=2, column=4, sticky="w", padx=8, pady=(0, 12)
@@ -2299,6 +2306,7 @@ class DashboardApp(ctk.CTk):
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=_subprocess_utf8_env(),
         )
         with self._upload_process_lock:
             self.worker_processes.append(proc)
@@ -2402,6 +2410,7 @@ class DashboardApp(ctk.CTk):
                     text=True,
                     encoding="utf-8",
                     errors="replace",
+                    env=_subprocess_utf8_env(),
                 )
                 processes.append((f"{tag_name}/{serial}", proc))
 
@@ -2490,6 +2499,7 @@ class DashboardApp(ctk.CTk):
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=_subprocess_utf8_env(),
         )
         if detach:
             self._log("[上传] 已转入后台监控，可继续切换其他页面查看或修改配置")
@@ -2678,41 +2688,6 @@ class DashboardApp(ctk.CTk):
             defaults=self._collect_defaults(),
             modules=self._current_module_selection(),
             config=config or self._sync_runtime_paths(persist=False),
-        )
-
-    def _assert_manifest_ready_for_upload(self, *, manifest_path: Path, task: WindowTask, output_dir: Path) -> None:
-        try:
-            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            raise RuntimeError(f"{task.tag}/{task.serial} upload manifest 读取失败: {exc}") from exc
-
-        channels = payload.get("channels") if isinstance(payload, dict) else {}
-        channel = channels.get(str(task.serial)) if isinstance(channels, dict) else {}
-        if not isinstance(channel, dict):
-            raise RuntimeError(f"{task.tag}/{task.serial} upload manifest 缺少当前窗口记录。")
-
-        generation_source = str(channel.get("generation_source") or "").strip().lower()
-        api_preset_name = str(channel.get("api_preset_name") or "").strip()
-        content_template_name = str(channel.get("content_template_name") or "").strip()
-        video_name = str(channel.get("video") or "").strip()
-        thumbnails = [str(item).strip() for item in (channel.get("thumbnails") or []) if str(item).strip()]
-
-        if generation_source != "api":
-            raise RuntimeError(f"{task.tag}/{task.serial} manifest 不是 API 文案结果，已拒绝上传。")
-        if not api_preset_name or not content_template_name:
-            raise RuntimeError(f"{task.tag}/{task.serial} manifest 缺少 API 模板/内容模板标记，已拒绝上传。")
-
-        if not video_name:
-            raise RuntimeError(f"{task.tag}/{task.serial} manifest 未写入视频文件名。")
-        video_path = output_dir / Path(video_name).name
-        if not video_path.exists():
-            raise RuntimeError(f"{task.tag}/{task.serial} manifest 指向的视频不存在: {video_path}")
-        if self.generate_thumbnails_var.get() and not thumbnails:
-            raise RuntimeError(f"{task.tag}/{task.serial} manifest 未写入缩略图路径，已拒绝上传。")
-
-        self._log(
-            f"[Upload] manifest ready -> {task.tag}/{task.serial} | source={generation_source or 'n/a'} | "
-            f"preset={api_preset_name or '-'} | template={content_template_name or '-'} | video={video_path.name}"
         )
 
     def _assert_manifest_ready_for_upload(self, *, manifest_path: Path, task: WindowTask, output_dir: Path) -> None:

@@ -15,6 +15,7 @@ from workflow_core import (
     build_window_plan,
     execute_direct_media_workflow,
     execute_metadata_only_workflow,
+    _find_existing_video,
     _output_dir_matches_tasks,
     get_metadata_root,
     load_scheduler_settings,
@@ -107,6 +108,31 @@ def build_module_selection(*, metadata: bool, render: bool, upload: bool) -> Mod
     return ModuleSelection(metadata=bool(metadata), render=bool(render), upload=bool(upload))
 
 
+def _resolve_task_plan_dirs(
+    *,
+    task: WindowTask,
+    defaults: WorkflowDefaults,
+    modules: ModuleSelection,
+    config: dict[str, Any],
+    single_tag_mode: bool,
+) -> tuple[Path, Path]:
+    output_root = Path(str(config.get("output_root") or "").strip())
+    metadata_root = get_metadata_root(config)
+    clean_tag = str(task.tag or "").strip()
+    source_override = str(task.source_dir or "").strip()
+
+    # In metadata/upload flows that operate on existing videos, the user-selected
+    # folder on the upload page must win. We should create/read manifests directly
+    # in that folder instead of silently drifting back to stale global roots.
+    if source_override and not modules.render and (modules.metadata or modules.upload):
+        source_root = Path(source_override)
+        return source_root, source_root
+
+    if single_tag_mode:
+        return output_root, metadata_root
+    return output_root / f"{defaults.date_mmdd}_{clean_tag}", metadata_root / clean_tag
+
+
 def reconcile_run_plan_directories(run_plan: RunPlan) -> RunPlan:
     cfg = deepcopy(run_plan.config or {})
     output_root_text = str(cfg.get("output_root") or run_plan.output_root or "").strip()
@@ -118,8 +144,6 @@ def reconcile_run_plan_directories(run_plan: RunPlan) -> RunPlan:
     if not metadata_root_text:
         raise ValueError("RunPlan is missing metadata_root.")
 
-    output_root = Path(output_root_text)
-    metadata_root = Path(metadata_root_text)
     unique_tags = [str(task.tag or "").strip() for task in run_plan.tasks if str(task.tag or "").strip()]
     unique_tags = list(dict.fromkeys(unique_tags))
     single_tag_mode = len(unique_tags) == 1
@@ -129,24 +153,27 @@ def reconcile_run_plan_directories(run_plan: RunPlan) -> RunPlan:
         clean_tag = str(task.tag or "").strip()
         if not clean_tag:
             continue
-        if single_tag_mode:
-            tag_output_dirs[clean_tag] = str(output_root)
-            tag_metadata_dirs[clean_tag] = str(metadata_root)
-        else:
-            tag_output_dirs.setdefault(clean_tag, str(output_root / f"{run_plan.defaults.date_mmdd}_{clean_tag}"))
-            tag_metadata_dirs.setdefault(clean_tag, str(metadata_root / clean_tag))
+        resolved_output, resolved_metadata = _resolve_task_plan_dirs(
+            task=task,
+            defaults=run_plan.defaults,
+            modules=run_plan.modules,
+            config=cfg,
+            single_tag_mode=single_tag_mode,
+        )
+        tag_output_dirs.setdefault(clean_tag, str(resolved_output))
+        tag_metadata_dirs.setdefault(clean_tag, str(resolved_metadata))
 
     plan = deepcopy(run_plan.window_plan)
     plan["tag_output_dirs"] = tag_output_dirs
     plan["tag_metadata_dirs"] = tag_metadata_dirs
-    cfg["output_root"] = str(output_root)
-    cfg["metadata_root"] = str(metadata_root)
+    cfg["output_root"] = output_root_text
+    cfg["metadata_root"] = metadata_root_text
     cfg["music_dir"] = music_root_text
     cfg["base_image_dir"] = image_root_text
     run_plan.config = cfg
     run_plan.window_plan = plan
-    run_plan.output_root = str(output_root)
-    run_plan.metadata_root = str(metadata_root)
+    run_plan.output_root = output_root_text
+    run_plan.metadata_root = metadata_root_text
     run_plan.music_root = music_root_text
     run_plan.image_root = image_root_text
     return run_plan
@@ -185,8 +212,6 @@ def build_run_plan(
 ) -> RunPlan:
     cfg = deepcopy(config or load_scheduler_settings())
     plan = build_window_plan(tasks, defaults)
-    output_root = Path(str(cfg.get("output_root") or "").strip())
-    metadata_root = get_metadata_root(cfg)
     unique_tags = [str(task.tag or "").strip() for task in tasks if str(task.tag or "").strip()]
     unique_tags = list(dict.fromkeys(unique_tags))
     single_tag_mode = len(unique_tags) == 1
@@ -196,12 +221,15 @@ def build_run_plan(
         clean_tag = str(task.tag or "").strip()
         if not clean_tag:
             continue
-        if single_tag_mode:
-            tag_output_dirs.setdefault(clean_tag, str(output_root))
-            tag_metadata_dirs.setdefault(clean_tag, str(metadata_root))
-        else:
-            tag_output_dirs.setdefault(clean_tag, str(output_root / f"{defaults.date_mmdd}_{clean_tag}"))
-            tag_metadata_dirs.setdefault(clean_tag, str(metadata_root / clean_tag))
+        resolved_output, resolved_metadata = _resolve_task_plan_dirs(
+            task=task,
+            defaults=defaults,
+            modules=modules,
+            config=cfg,
+            single_tag_mode=single_tag_mode,
+        )
+        tag_output_dirs.setdefault(clean_tag, str(resolved_output))
+        tag_metadata_dirs.setdefault(clean_tag, str(resolved_metadata))
     if tag_output_dirs:
         plan["tag_output_dirs"] = tag_output_dirs
     if tag_metadata_dirs:
@@ -212,7 +240,7 @@ def build_run_plan(
         modules=modules,
         config=cfg,
         window_plan=plan,
-        metadata_root=str(metadata_root),
+        metadata_root=str(get_metadata_root(cfg)),
         music_root=str(cfg.get("music_dir") or "").strip(),
         image_root=str(cfg.get("base_image_dir") or "").strip(),
         output_root=str(cfg.get("output_root") or "").strip(),
@@ -286,13 +314,17 @@ def validate_run_plan(run_plan: RunPlan, *, log: LogFunc = _noop_log) -> Validat
         report.errors.append("Metadata generation requires prompt_api mode.")
         return report
 
-    if modules.render or modules.metadata:
+    if modules.render:
         errors, warnings = validate_group_sources(run_plan.tasks, config=run_plan.config, log=log)
         report.errors.extend(errors)
         report.warnings.extend(warnings)
 
     if modules.upload and not modules.render:
-        errors, warnings, resolved_dirs = _validate_explicit_output_dirs(run_plan, log=log)
+        errors, warnings, resolved_dirs = _validate_explicit_output_dirs(
+            run_plan,
+            allow_bootstrap=bool(modules.metadata),
+            log=log,
+        )
         report.errors.extend(errors)
         report.warnings.extend(warnings)
         report.resolved_output_dirs.update(resolved_dirs)
@@ -303,6 +335,7 @@ def validate_run_plan(run_plan: RunPlan, *, log: LogFunc = _noop_log) -> Validat
 def _validate_explicit_output_dirs(
     run_plan: RunPlan,
     *,
+    allow_bootstrap: bool = False,
     log: LogFunc = _noop_log,
 ) -> tuple[list[str], list[str], dict[str, str]]:
     errors: list[str] = []
@@ -334,6 +367,19 @@ def _validate_explicit_output_dirs(
             continue
 
         ok, details = _output_dir_matches_tasks(folder, tag_tasks)
+        if not ok and allow_bootstrap:
+            bootstrap_errors: list[str] = []
+            for task in tag_tasks:
+                video = _find_existing_video(folder, run_plan.defaults.date_mmdd, task.serial, {})
+                if not video:
+                    bootstrap_errors.append(f"窗口 {task.serial} 缺少现成视频文件")
+            if not bootstrap_errors:
+                resolved_dirs[tag] = str(folder)
+                warning = f"{tag} 将从现成视频目录自举 metadata/manifest: {folder}"
+                warnings.append(warning)
+                log(f"[检查] {warning}")
+                continue
+            details = [*details, *bootstrap_errors]
         if not ok:
             detail_text = " | ".join(details[:3]) if details else ""
             errors.append(
@@ -436,18 +482,6 @@ def execute_run_plan(
             metadata_dir_overrides=dict(run_plan.window_plan.get("tag_metadata_dirs") or {}),
             control=control,
             on_item_ready=on_item_ready if run_plan.modules.upload else None,
-            log=log,
-        )
-
-    if run_plan.modules.upload and run_plan.modules.metadata and on_item_ready is None:
-        log("[Upload] Refresh existing manifests using current metadata settings")
-        result.prepared_output_dirs = refresh_existing_output_metadata(
-            tasks=run_plan.tasks,
-            defaults=run_plan.defaults,
-            prepared_output_dirs=result.prepared_output_dirs,
-            config=run_plan.config,
-            metadata_dir_overrides=dict(run_plan.window_plan.get("tag_metadata_dirs") or {}),
-            control=control,
             log=log,
         )
 

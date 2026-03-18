@@ -11,12 +11,15 @@
 from __future__ import annotations
 
 import base64
+import difflib
 import hashlib
 import json
 import re
 import time
+import urllib.parse
+import unicodedata
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import requests
 
@@ -67,6 +70,26 @@ def _read_json(path: Path, fallback: Any) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return fallback
+
+
+def _post_json(
+    url: str,
+    *,
+    headers: dict[str, Any] | None = None,
+    json_payload: dict[str, Any] | None = None,
+    timeout: int | float = DEFAULT_TIMEOUT_SECONDS,
+    params: dict[str, Any] | None = None,
+):
+    with requests.Session() as session:
+        # 某些第三方网关在系统代理环境下会随机断开，这里统一直连。
+        session.trust_env = False
+        return session.post(
+            url,
+            headers=headers,
+            json=json_payload,
+            timeout=timeout,
+            params=params,
+        )
 
 
 def load_metadata_history(path: Path = METADATA_HISTORY_FILE) -> dict[str, Any]:
@@ -149,17 +172,25 @@ def _build_openai_chat_urls(base_url: str) -> list[str]:
         if url and url not in ordered:
             ordered.append(url)
 
+    parsed = urllib.parse.urlparse(clean)
+    path = str(parsed.path or "").strip("/")
+
     if clean.endswith("/v1/chat/completions") or clean.endswith("/chat/completions"):
         add(clean)
     elif clean.endswith("/v1"):
         add(f"{clean}/chat/completions")
+        add(clean)
     elif clean.endswith("/models"):
         root = clean.removesuffix("/models")
         add(f"{root}/v1/chat/completions")
         add(f"{root}/chat/completions")
+        add(clean)
+    elif path:
+        add(f"{clean}/v1/chat/completions")
     else:
         add(f"{clean}/v1/chat/completions")
         add(f"{clean}/chat/completions")
+        add(clean)
     return ordered
 
 
@@ -407,47 +438,244 @@ def _build_compact_generation_prompt(
     tag_range = parse_tag_range(str(content_template.get("tagRange") or "10-20"))
     output_language = str(content_template.get("outputLanguage") or "zh-TW")
     language_ui, language_english = language_meta(output_language)
-    compact_payload = {
-        "musicGenre": content_template.get("musicGenre", ""),
-        "angle": content_template.get("angle", ""),
-        "audience": content_template.get("audience", ""),
-        "titleCount": _int_value(content_template.get("titleCount"), 3),
-        "descriptionCount": _int_value(content_template.get("descCount"), 1),
-        "thumbnailCount": _int_value(content_template.get("thumbCount"), 3),
-        "titleCharMin": _int_value(content_template.get("titleMin"), 80),
-        "titleCharMax": _int_value(content_template.get("titleMax"), 95),
-        "descriptionCharTarget": _int_value(content_template.get("descLen"), 300),
+    title_count = _int_value(content_template.get("titleCount"), 1)
+    desc_count = _int_value(content_template.get("descCount"), 1)
+    thumb_count = _int_value(content_template.get("thumbCount"), 1)
+    avoid_titles_text = " | ".join(
+        [str(item).strip() for item in (avoid_titles or []) if str(item).strip()][:2]
+    )
+    avoid_tag_text = " | ".join(
+        [str(item).strip() for item in (avoid_tag_signatures or []) if str(item).strip()][:1]
+    )
+    angle_text = str(content_template.get("angle") or "").strip() or "auto-create one strong angle"
+    audience_text = str(content_template.get("audience") or "").strip() or "music listeners"
+    genre_text = str(content_template.get("musicGenre") or "").strip() or "music"
+    title_hint = re.sub(r"\s+", " ", str(content_template.get("titleLibrary") or "").strip())[:80]
+    core_rules = re.sub(r"\s+", " ", str(render_master_prompt(content_template) or "").strip())[:120]
+    payload = {
+        "genre": genre_text,
+        "angle": angle_text,
+        "audience": audience_text,
+        "uniqueSeed": str(unique_seed or "").strip(),
+        "titleCount": title_count,
+        "descriptionCount": desc_count,
+        "thumbnailCount": thumb_count,
         "tagCountMin": tag_range[0],
         "tagCountMax": tag_range[1],
-        "outputLanguage": language_ui,
+        "language": language_ui,
         "thumbnailTextLanguage": language_english,
+        "avoidTitles": avoid_titles_text,
+        "avoidTagSignatures": avoid_tag_text,
+        "titleStyleHint": title_hint,
+        "coreRules": core_rules,
         "imageProvided": bool(image_data_url),
-        "uniqueSeed": str(unique_seed or "").strip(),
-        "recentlyUsedExamples": {
-            "titles": [str(item).strip() for item in (avoid_titles or []) if str(item).strip()][:6],
-            "descriptions": [str(item).strip() for item in (avoid_descriptions or []) if str(item).strip()][:3],
-            "thumbnailPrompts": [str(item).strip() for item in (avoid_thumbnail_prompts or []) if str(item).strip()][:3],
-            "tagSignatures": [str(item).strip() for item in (avoid_tag_signatures or []) if str(item).strip()][:3],
-        },
-        "masterPromptExcerpt": str(render_master_prompt(content_template) or "").strip()[:1500],
-        "titleLibraryExcerpt": str(content_template.get("titleLibrary") or "").strip()[:800],
     }
     return (
-        "你是 YouTube 内容生成器。只输出严格 JSON，不要输出 markdown 或解释。\n"
-        "本次输出必须和 recentlyUsedExamples 明显不同，禁止复用相同标题、相同简介、相同标签组合、相同缩略图指令。\n"
-        "uniqueSeed 是这支视频的唯一指纹，你必须按它分流创意。\n"
-        f"标题、简介、标签必须使用 {language_ui}。\n"
-        f"缩略图 prompt 可以使用英文，但必须包含: Use {language_english} text in the image.\n\n"
-        f"输入参数:\n{json.dumps(compact_payload, ensure_ascii=False, indent=2)}\n\n"
-        "JSON Schema:\n"
-        "{\n"
-        '  "usedAngle": "string",\n'
-        '  "titles": ["string"],\n'
-        '  "descriptions": ["string"],\n'
-        '  "seoHashtags": ["#tag"],\n'
-        '  "tagList": ["keyword"],\n'
-        '  "thumbnails": [{"forTitle": "string", "prompt": "string"}]\n'
-        "}\n"
+        "Return strict JSON only.\n"
+        "Task: create YouTube metadata for one music video.\n"
+        "All titles, descriptions and tags must be Traditional Chinese.\n"
+        f"Every thumbnail prompt must end with: Use {language_english} text in the image.\n"
+        "Never reuse or closely paraphrase avoidTitles or avoidTagSignatures.\n"
+        "If angle is empty, create one.\n"
+        "Keep titles clearly different from each other.\n\n"
+        f"Input:\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
+        "Need exact JSON schema:\n"
+        '{"usedAngle":"string","titles":["string"],"descriptions":["string"],"seoHashtags":["#tag"],"tagList":["keyword"],"thumbnails":[{"forTitle":"string","prompt":"string"}]}'
+    )
+
+
+def _trim_avoid_values(values: list[str] | None, *, limit: int = 12) -> list[str]:
+    cleaned = [str(item or "").strip() for item in (values or []) if str(item or "").strip()]
+    return cleaned[-max(1, limit):]
+
+
+def _compact_master_rules(content_template: dict, *, limit: int = 480) -> str:
+    raw = str(render_master_prompt(content_template) or "").strip()
+    if not raw:
+        return ""
+    cut_markers = [
+        "CASE PATCH LOCK",
+        "案例补丁",
+        "案例補丁",
+        "案例补丁来了",
+        "案例補丁來啦",
+        "【案例补丁",
+        "【案例補丁",
+    ]
+    lowered = raw.lower()
+    cut_positions = [lowered.find(marker.lower()) for marker in cut_markers if lowered.find(marker.lower()) >= 0]
+    if cut_positions:
+        raw = raw[: min(cut_positions)]
+    compact = re.sub(r"\s+", " ", raw).strip()
+    return compact[:limit]
+
+
+def _metadata_style_summary(content_template: dict) -> str:
+    summary_parts = [
+        f"musicGenre={str(content_template.get('musicGenre') or '').strip()}",
+        f"angle={str(content_template.get('angle') or '').strip()}",
+        f"audience={str(content_template.get('audience') or '').strip()}",
+        f"language={str(content_template.get('outputLanguage') or 'zh-TW').strip()}",
+    ]
+    compact_rules = _compact_master_rules(content_template)
+    if compact_rules:
+        summary_parts.append(f"rules={compact_rules}")
+    return " | ".join(part for part in summary_parts if part and not part.endswith("="))
+
+
+def _extract_opening_fragments(values: list[str] | None, *, limit: int = 8) -> list[str]:
+    fragments: list[str] = []
+    seen: set[str] = set()
+    for item in values or []:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        opening = re.split(r"[｜|:：，,。.!！？；;、]", text, maxsplit=1)[0].strip()
+        if len(opening) > 24:
+            opening = opening[:24].rstrip()
+        normalized = _normalize_generation_text(opening)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        fragments.append(opening)
+        if len(fragments) >= max(1, limit):
+            break
+    return fragments
+
+
+def _call_json_stage(
+    *,
+    api_preset: dict,
+    prompt: str,
+    stage: str,
+    image_data_url: str | None = None,
+    max_tokens_cap: int = 900,
+) -> tuple[str, dict[str, Any]]:
+    provider = str(api_preset.get("provider") or "").strip().lower()
+    request_preset = clone_json(api_preset)
+    request_preset["maxTokens"] = str(min(_int_value(api_preset.get("maxTokens"), 16000), max_tokens_cap))
+    last_exc: Exception | None = None
+    raw = ""
+    for api_attempt in range(1, 4):
+        try:
+            raw = call_text_model(request_preset, prompt, image_data_url=image_data_url)
+            parsed = _parse_json_like(raw)
+            if not isinstance(parsed, dict):
+                raise RuntimeError(f"{stage} did not return a JSON object")
+            return raw, parsed
+        except Exception as exc:
+            last_exc = exc
+            if api_attempt >= 3 or not _is_transient_text_api_error(exc):
+                raise RuntimeError(
+                    f"文案生成失败: stage={stage} provider={provider or 'unknown'} error={exc}"
+                ) from exc
+            time.sleep(2 * api_attempt)
+    raise RuntimeError(
+        f"文案生成失败: stage={stage} provider={provider or 'unknown'} error={last_exc}"
+    ) from last_exc
+
+
+def _build_title_stage_prompt(
+    content_template: dict,
+    *,
+    unique_seed: str,
+    avoid_titles: list[str] | None,
+    count: int,
+) -> str:
+    title_min = _int_value(content_template.get("titleMin"), 80)
+    title_max = _int_value(content_template.get("titleMax"), 95)
+    language_ui, _ = language_meta(str(content_template.get("outputLanguage") or "zh-TW"))
+    payload = {
+        "seed": str(unique_seed or "").strip(),
+        "count": int(max(1, count)),
+        "musicGenre": str(content_template.get("musicGenre") or "").strip(),
+        "angle": str(content_template.get("angle") or "").strip(),
+        "audience": str(content_template.get("audience") or "").strip(),
+        "language": language_ui,
+        "titleLength": {"min": title_min, "max": title_max},
+        "avoidTitles": _trim_avoid_values(avoid_titles, limit=10),
+        "avoidOpeningFragments": _extract_opening_fragments(avoid_titles, limit=8),
+        "styleSummary": _metadata_style_summary(content_template),
+    }
+    return (
+        "Return strict JSON only.\n"
+        "You are generating YouTube music video titles.\n"
+        "All titles must be Traditional Chinese.\n"
+        "Every title must feel genuinely different in angle, not just paraphrased.\n"
+        "Do not copy, lightly paraphrase, or continue any avoidTitles.\n"
+        "Do not begin a new title with the same opening wording as avoidOpeningFragments.\n"
+        "Do not output the same opening clause across multiple titles.\n"
+        "Treat the seed as a hard uniqueness constraint: produce a fresh hook and a fresh opening clause.\n"
+        "If a candidate title still resembles any avoidTitles, replace it instead of paraphrasing it.\n"
+        "Make the titles emotionally vivid, specific, and mature.\n\n"
+        f"Input:\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
+        'Return JSON schema: {"usedAngle":"string","titles":["string"]}'
+    )
+
+
+def _build_description_stage_prompt(
+    content_template: dict,
+    *,
+    unique_seed: str,
+    title: str,
+    avoid_descriptions: list[str] | None,
+    avoid_tag_signatures: list[str] | None,
+) -> str:
+    tag_range = parse_tag_range(str(content_template.get("tagRange") or "10-20"))
+    language_ui, _ = language_meta(str(content_template.get("outputLanguage") or "zh-TW"))
+    payload = {
+        "seed": str(unique_seed or "").strip(),
+        "title": str(title or "").strip(),
+        "musicGenre": str(content_template.get("musicGenre") or "").strip(),
+        "angle": str(content_template.get("angle") or "").strip(),
+        "audience": str(content_template.get("audience") or "").strip(),
+        "language": language_ui,
+        "descriptionLength": _int_value(content_template.get("descLen"), 300),
+        "tagCount": {"min": tag_range[0], "max": tag_range[1]},
+        "avoidDescriptions": _trim_avoid_values(avoid_descriptions, limit=8),
+        "avoidTagSignatures": _trim_avoid_values(avoid_tag_signatures, limit=6),
+        "styleSummary": _metadata_style_summary(content_template),
+    }
+    return (
+        "Return strict JSON only.\n"
+        "You are generating one YouTube description and one SEO tag list for a music video.\n"
+        "Description and tags must be Traditional Chinese.\n"
+        "Do not repeat or lightly paraphrase avoidDescriptions.\n"
+        "Do not reproduce avoidTagSignatures.\n\n"
+        f"Input:\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
+        'Return JSON schema: {"descriptions":["string"],"seoHashtags":["#tag"],"tagList":["keyword"]}'
+    )
+
+
+def _build_thumbnail_prompt_stage(
+    content_template: dict,
+    *,
+    unique_seed: str,
+    titles: list[str],
+    description: str,
+    avoid_thumbnail_prompts: list[str] | None,
+    count: int,
+) -> str:
+    _, language_english = language_meta(str(content_template.get("outputLanguage") or "zh-TW"))
+    payload = {
+        "seed": str(unique_seed or "").strip(),
+        "titles": [str(item or "").strip() for item in titles if str(item or "").strip()][: max(1, count)],
+        "description": str(description or "").strip(),
+        "musicGenre": str(content_template.get("musicGenre") or "").strip(),
+        "angle": str(content_template.get("angle") or "").strip(),
+        "audience": str(content_template.get("audience") or "").strip(),
+        "thumbnailTextLanguage": language_english,
+        "avoidThumbnailPrompts": _trim_avoid_values(avoid_thumbnail_prompts, limit=8),
+        "styleSummary": _metadata_style_summary(content_template),
+    }
+    return (
+        "Return strict JSON only.\n"
+        "Generate thumbnail image prompts for a music video.\n"
+        "Each prompt must describe a clear image concept and must end with "
+        f"'Use {language_english} text in the image.'\n"
+        "Do not reuse or lightly paraphrase avoidThumbnailPrompts.\n\n"
+        f"Input:\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
+        'Return JSON schema: {"thumbnails":[{"forTitle":"string","prompt":"string"}]}'
     )
 
 
@@ -468,7 +696,46 @@ def _fit_text_length(text: str, *, min_len: int, max_len: int, filler: str) -> s
 
 
 def _normalize_generation_text(value: str) -> str:
-    return "".join(str(value or "").strip().lower().split())
+    raw = unicodedata.normalize("NFKC", str(value or "").strip().lower())
+    collapsed = "".join(raw.split())
+    return re.sub(r"[\W_]+", "", collapsed, flags=re.UNICODE)
+
+
+def _looks_like_blocked_duplicate(candidate: str, blocked_values: list[str] | None = None) -> bool:
+    normalized_candidate = _normalize_generation_text(candidate)
+    if not normalized_candidate:
+        return False
+    prefix = normalized_candidate[:32]
+    for blocked in blocked_values or []:
+        normalized_blocked = _normalize_generation_text(blocked)
+        if not normalized_blocked:
+            continue
+        if normalized_candidate == normalized_blocked:
+            return True
+        if prefix and prefix == normalized_blocked[:32]:
+            return True
+        similarity = difflib.SequenceMatcher(None, normalized_candidate, normalized_blocked).ratio()
+        if similarity >= 0.93:
+            return True
+    return False
+
+
+def _ensure_unique_generated_values(
+    *,
+    label: str,
+    values: list[str],
+    blocked_values: list[str] | None = None,
+) -> None:
+    normalized_values = [_normalize_generation_text(item) for item in values if _normalize_generation_text(item)]
+    if len(normalized_values) != len(set(normalized_values)):
+        raise RuntimeError(f"API returned duplicate {label} values in the same response.")
+    duplicated_blocked = [
+        item
+        for item in values
+        if str(item or "").strip() and _looks_like_blocked_duplicate(str(item), blocked_values)
+    ]
+    if duplicated_blocked:
+        raise RuntimeError(f"API returned a blocked duplicate {label} value.")
 
 
 def _pick_unique_generation_text(
@@ -476,14 +743,9 @@ def _pick_unique_generation_text(
     avoid_values: list[str] | None,
     fallback: str,
 ) -> str:
-    blocked = {
-        _normalize_generation_text(item)
-        for item in (avoid_values or [])
-        if _normalize_generation_text(item)
-    }
     cleaned = [str(item or "").strip() for item in candidates if str(item or "").strip()]
     for item in cleaned:
-        if _normalize_generation_text(item) not in blocked:
+        if not _looks_like_blocked_duplicate(item, avoid_values):
             return item
     return cleaned[0] if cleaned else str(fallback or "").strip()
 
@@ -511,6 +773,7 @@ def _build_local_fallback_output(
     avoid_thumbnail_prompts: list[str] | None = None,
     avoid_tag_signatures: list[str] | None = None,
 ) -> dict[str, Any]:
+    raise RuntimeError("Local metadata fallback has been retired. API generation is required.")
     genre = str(content_template.get("musicGenre") or "背景音樂").strip() or "背景音樂"
     audience_text = str(content_template.get("audience") or "").strip()
     audience_hint = "台灣熟齡聽眾" if ("台灣" in audience_text or "台湾" in audience_text or "65" in audience_text) else "喜歡耐聽旋律的人"
@@ -642,6 +905,7 @@ def _build_local_fallback_output_v2(
     avoid_thumbnail_prompts: list[str] | None = None,
     avoid_tag_signatures: list[str] | None = None,
 ) -> dict[str, Any]:
+    raise RuntimeError("Local metadata fallback has been retired. API generation is required.")
     genre = str(content_template.get("musicGenre") or "背景音樂").strip() or "背景音樂"
     audience_text = str(content_template.get("audience") or "").strip()
     audience_hint = "台灣熟齡聽眾" if ("台灣" in audience_text or "台湾" in audience_text or "65" in audience_text) else "喜歡耐聽旋律的人"
@@ -803,23 +1067,12 @@ def _validate_output(parsed: dict[str, Any], content_template: dict) -> list[str
         "titleCount": _int_value(content_template.get("titleCount"), 3),
         "descCount": _int_value(content_template.get("descCount"), 1),
         "thumbCount": _int_value(content_template.get("thumbCount"), 3),
-        "titleMin": _int_value(content_template.get("titleMin"), 80),
-        "titleMax": _int_value(content_template.get("titleMax"), 95),
-        "descLen": _int_value(content_template.get("descLen"), 300),
     }
     issues: list[str] = []
     if len(parsed.get("titles", [])) != cfg["titleCount"]:
         issues.append(f"标题数量应为 {cfg['titleCount']}，当前 {len(parsed.get('titles', []))}")
-    for idx, title in enumerate(parsed.get("titles", []), 1):
-        length = _count_chars(title)
-        if length < cfg["titleMin"] or length > cfg["titleMax"]:
-            issues.append(f"标题{idx}字数 {length} 不在 {cfg['titleMin']}-{cfg['titleMax']}")
     if len(parsed.get("descriptions", [])) != cfg["descCount"]:
         issues.append(f"简介数量应为 {cfg['descCount']}，当前 {len(parsed.get('descriptions', []))}")
-    for idx, desc in enumerate(parsed.get("descriptions", []), 1):
-        length = _count_chars(desc)
-        if abs(length - cfg["descLen"]) > 60:
-            issues.append(f"简介{idx}字数 {length} 偏离目标 {cfg['descLen']}")
     if len(parsed.get("thumbnails", [])) != cfg["thumbCount"]:
         issues.append(f"缩略图指令数量应为 {cfg['thumbCount']}，当前 {len(parsed.get('thumbnails', []))}")
     for idx, item in enumerate(parsed.get("thumbnails", []), 1):
@@ -830,9 +1083,11 @@ def _validate_output(parsed: dict[str, Any], content_template: dict) -> list[str
 
 
 def _call_openai_compatible(api_preset: dict, user_prompt: str, image_data_url: str | None = None) -> str:
-    content: list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
     if image_data_url:
+        content: Any = [{"type": "text", "text": user_prompt}]
         content.append({"type": "image_url", "image_url": {"url": image_data_url}})
+    else:
+        content = user_prompt
 
     payload = {
         "model": api_preset.get("model", ""),
@@ -849,12 +1104,17 @@ def _call_openai_compatible(api_preset: dict, user_prompt: str, image_data_url: 
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_preset.get('apiKey', '')}",
     }
-    timeout_seconds = max(DEFAULT_TIMEOUT_SECONDS, 180)
+    timeout_seconds = max(120, DEFAULT_TIMEOUT_SECONDS)
     retryable_codes = {408, 429, 500, 502, 503, 504}
     for url in _build_openai_chat_urls(str(api_preset.get("baseUrl") or "")):
-        for attempt in range(3):
+        for attempt in range(2):
             try:
-                response = requests.post(url, headers=headers, json=payload, timeout=timeout_seconds)
+                response = _post_json(
+                    url,
+                    headers=headers,
+                    json_payload=payload,
+                    timeout=timeout_seconds,
+                )
                 try:
                     data = response.json()
                 except Exception:
@@ -874,7 +1134,7 @@ def _call_openai_compatible(api_preset: dict, user_prompt: str, image_data_url: 
                     break
             except Exception as exc:
                 last_error = str(exc)
-            if attempt < 2:
+            if attempt < 1:
                 time.sleep(2 + attempt)
     raise RuntimeError(f"OpenAI-compatible 调用失败: {last_error}")
 
@@ -891,14 +1151,14 @@ def _call_anthropic(api_preset: dict, user_prompt: str, image_data_url: str | No
             }
         )
 
-    response = requests.post(
+    response = _post_json(
         str(api_preset.get("baseUrl") or ""),
         headers={
             "Content-Type": "application/json",
             "x-api-key": str(api_preset.get("apiKey") or ""),
             "anthropic-version": "2023-06-01",
         },
-        json={
+        json_payload={
             "model": api_preset.get("model", ""),
             "max_tokens": _int_value(api_preset.get("maxTokens"), 16000),
             "temperature": _float_value(api_preset.get("temperature"), 0.9),
@@ -925,11 +1185,11 @@ def _call_gemini(api_preset: dict, user_prompt: str, image_data_url: str | None 
         media_type = _media_type_from_data_url(meta)
         parts.append({"inlineData": {"mimeType": media_type, "data": base64_data}})
 
-    response = requests.post(
+    response = _post_json(
         endpoint,
         params={"key": str(api_preset.get("apiKey") or "")},
         headers={"Content-Type": "application/json"},
-        json={
+        json_payload={
             "contents": [{"role": "user", "parts": parts}],
             "generationConfig": {
                 "temperature": _float_value(api_preset.get("temperature"), 0.9),
@@ -1075,6 +1335,28 @@ def load_generation_context(
     return prompt_cfg, clone_json(api_presets[chosen_api_name]), clone_json(content_templates[chosen_content_name])
 
 
+def _is_transient_text_api_error(exc: Exception) -> bool:
+    text = str(exc or "").strip().lower()
+    if not text:
+        return False
+    hints = (
+        "remote end closed connection",
+        "remotedisconnected",
+        "connection aborted",
+        "connection reset",
+        "connectionreseterror",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "502",
+        "503",
+        "504",
+        "408",
+        "429",
+    )
+    return any(hint in text for hint in hints)
+
+
 def generate_content_bundle(
     prompt_studio_path: Path,
     tag: str,
@@ -1088,7 +1370,15 @@ def generate_content_bundle(
     avoid_descriptions: list[str] | None = None,
     avoid_thumbnail_prompts: list[str] | None = None,
     avoid_tag_signatures: list[str] | None = None,
+    log: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
+    def emit(message: str) -> None:
+        if log:
+            try:
+                log(message)
+            except Exception:
+                pass
+
     _, api_preset, content_template = load_generation_context(
         prompt_studio_path,
         tag,
@@ -1096,83 +1386,140 @@ def generate_content_bundle(
         content_template_name=content_template_name,
     )
 
-    # 非 YPP 也生成多组候选，便于在同批视频里避开重复标题。
-    content_template["titleCount"] = str(max(3, _int_value(content_template.get("titleCount"), 1)))
-    content_template["descCount"] = str(max(2, _int_value(content_template.get("descCount"), 1)))
-    content_template["thumbCount"] = str(3 if is_ypp else max(2, _int_value(content_template.get("thumbCount"), 1)))
-
     if not api_preset.get("baseUrl") or not api_preset.get("apiKey") or not api_preset.get("model"):
         raise ValueError("当前 API 模板缺少 baseUrl / apiKey / model，无法生成内容")
 
-    user_prompt = _build_generation_prompt(
+    title_count = 3 if is_ypp else 1
+    thumb_count = 3 if is_ypp else 1
+    content_template["titleCount"] = str(title_count)
+    content_template["descCount"] = "1"
+    content_template["thumbCount"] = str(thumb_count)
+
+    title_prompt = _build_title_stage_prompt(
         content_template,
-        image_data_url=image_data_url,
         unique_seed=unique_seed,
         avoid_titles=avoid_titles,
-        avoid_descriptions=avoid_descriptions,
-        avoid_thumbnail_prompts=avoid_thumbnail_prompts,
-        avoid_tag_signatures=avoid_tag_signatures,
+        count=max(title_count + 2, 4),
     )
-    compact_prompt = _build_compact_generation_prompt(
-        content_template,
+    emit(
+        f"[API] {tag}: stage=titles -> provider={api_preset.get('provider', '')} "
+        f"model={api_preset.get('model', '')} chars={len(title_prompt)}"
+    )
+    raw_titles, title_payload = _call_json_stage(
+        api_preset=api_preset,
+        prompt=title_prompt,
+        stage="titles",
         image_data_url=image_data_url,
-        unique_seed=unique_seed,
-        avoid_titles=avoid_titles,
+        max_tokens_cap=700,
+    )
+    emit(f"[API] {tag}: stage=titles <- ok chars={len(raw_titles)}")
+    used_angle = str(title_payload.get("usedAngle") or content_template.get("angle") or "").strip()
+    titles = [str(item).strip() for item in title_payload.get("titles", []) if str(item).strip()]
+    if not titles:
+        raise RuntimeError("文案生成失败: stage=titles provider=api error=API 未返回标题")
+    _ensure_unique_generated_values(label="title", values=titles, blocked_values=avoid_titles)
+
+    primary_title = titles[0]
+    description_prompt = _build_description_stage_prompt(
+        content_template,
+        unique_seed=f"{unique_seed}|desc",
+        title=primary_title,
         avoid_descriptions=avoid_descriptions,
-        avoid_thumbnail_prompts=avoid_thumbnail_prompts,
         avoid_tag_signatures=avoid_tag_signatures,
     )
-    compact_preset = clone_json(api_preset)
-    compact_preset["maxTokens"] = str(min(_int_value(api_preset.get("maxTokens"), 16000), 4000))
-    provider = str(api_preset.get("provider") or "").strip().lower()
-    if len(user_prompt) > 8000 and provider == "openai_compatible":
-        parsed = _build_local_fallback_output_v2(
-            content_template,
-            is_ypp=is_ypp,
-            unique_seed=unique_seed,
-            avoid_titles=avoid_titles,
-            avoid_descriptions=avoid_descriptions,
-            avoid_thumbnail_prompts=avoid_thumbnail_prompts,
-            avoid_tag_signatures=avoid_tag_signatures,
-        )
-        raw = json.dumps(parsed, ensure_ascii=False, indent=2)
-    else:
-        try:
-            if len(user_prompt) > 8000 and provider == "openai_compatible":
-                raw = call_text_model(compact_preset, compact_prompt, image_data_url=image_data_url)
-            else:
-                raw = call_text_model(api_preset, user_prompt, image_data_url=image_data_url)
-            parsed = _parse_json_like(raw)
-            parsed = _repair_output_if_needed(parsed, api_preset, content_template, image_data_url=image_data_url)
-        except Exception:
-            parsed = _build_local_fallback_output_v2(
-                content_template,
-                is_ypp=is_ypp,
-                unique_seed=unique_seed,
-                avoid_titles=avoid_titles,
-                avoid_descriptions=avoid_descriptions,
-                avoid_thumbnail_prompts=avoid_thumbnail_prompts,
-                avoid_tag_signatures=avoid_tag_signatures,
-            )
-            raw = json.dumps(parsed, ensure_ascii=False, indent=2)
+    emit(
+        f"[API] {tag}: stage=description_tags -> provider={api_preset.get('provider', '')} "
+        f"model={api_preset.get('model', '')} chars={len(description_prompt)}"
+    )
+    raw_desc, description_payload = _call_json_stage(
+        api_preset=api_preset,
+        prompt=description_prompt,
+        stage="description_tags",
+        image_data_url=image_data_url,
+        max_tokens_cap=900,
+    )
+    emit(f"[API] {tag}: stage=description_tags <- ok chars={len(raw_desc)}")
+    descriptions = [
+        str(item).strip()
+        for item in description_payload.get("descriptions", [])
+        if str(item).strip()
+    ]
+    seo_hashtags = [
+        str(item).strip()
+        for item in description_payload.get("seoHashtags", [])
+        if str(item).strip()
+    ]
+    tag_list = [
+        str(item).strip()
+        for item in description_payload.get("tagList", [])
+        if str(item).strip()
+    ]
+    if not descriptions:
+        raise RuntimeError("文案生成失败: stage=description_tags provider=api error=API 未返回简介")
+    if not tag_list:
+        raise RuntimeError("文案生成失败: stage=description_tags provider=api error=API 未返回标签")
+    _ensure_unique_generated_values(label="description", values=descriptions, blocked_values=avoid_descriptions)
+    _ensure_unique_generated_values(
+        label="tag signature",
+        values=[" | ".join(tag_list)],
+        blocked_values=avoid_tag_signatures,
+    )
+
+    thumb_prompt = _build_thumbnail_prompt_stage(
+        content_template,
+        unique_seed=f"{unique_seed}|thumb",
+        titles=titles[: max(1, thumb_count)],
+        description=descriptions[0],
+        avoid_thumbnail_prompts=avoid_thumbnail_prompts,
+        count=thumb_count,
+    )
+    emit(
+        f"[API] {tag}: stage=thumbnail_prompts -> provider={api_preset.get('provider', '')} "
+        f"model={api_preset.get('model', '')} chars={len(thumb_prompt)}"
+    )
+    raw_thumb, thumb_payload = _call_json_stage(
+        api_preset=api_preset,
+        prompt=thumb_prompt,
+        stage="thumbnail_prompts",
+        image_data_url=image_data_url,
+        max_tokens_cap=900,
+    )
+    emit(f"[API] {tag}: stage=thumbnail_prompts <- ok chars={len(raw_thumb)}")
+    thumbnail_prompt_rows = [
+        {
+            "for_title": str((item or {}).get("forTitle") or "").strip(),
+            "prompt": str((item or {}).get("prompt") or "").strip(),
+        }
+        for item in thumb_payload.get("thumbnails", [])
+        if str((item or {}).get("prompt") or "").strip()
+    ]
+    if not thumbnail_prompt_rows:
+        raise RuntimeError("文案生成失败: stage=thumbnail_prompts provider=api error=API 未返回缩略图提示词")
+    thumbnail_prompts = [item["prompt"] for item in thumbnail_prompt_rows if item.get("prompt")]
+    _ensure_unique_generated_values(
+        label="thumbnail prompt",
+        values=thumbnail_prompts,
+        blocked_values=avoid_thumbnail_prompts,
+    )
 
     return {
         "api_preset": api_preset,
         "content_template": content_template,
-        "raw_text": raw,
-        "used_angle": parsed.get("usedAngle", content_template.get("angle", "")),
-        "titles": [str(item).strip() for item in parsed.get("titles", []) if str(item).strip()],
-        "descriptions": [str(item).strip() for item in parsed.get("descriptions", []) if str(item).strip()],
-        "seo_hashtags": [str(item).strip() for item in parsed.get("seoHashtags", []) if str(item).strip()],
-        "tag_list": [str(item).strip() for item in parsed.get("tagList", []) if str(item).strip()],
-        "thumbnail_prompts": [
+        "raw_text": json.dumps(
             {
-                "for_title": str((item or {}).get("forTitle") or "").strip(),
-                "prompt": str((item or {}).get("prompt") or "").strip(),
-            }
-            for item in parsed.get("thumbnails", [])
-            if str((item or {}).get("prompt") or "").strip()
-        ],
+                "titles_raw": raw_titles,
+                "description_raw": raw_desc,
+                "thumbnail_raw": raw_thumb,
+            },
+            ensure_ascii=False,
+        ),
+        "used_angle": used_angle,
+        "titles": titles,
+        "descriptions": descriptions,
+        "seo_hashtags": seo_hashtags,
+        "tag_list": tag_list,
+        "generation_source": "api",
+        "thumbnail_prompts": thumbnail_prompt_rows,
     }
 
 
@@ -1183,13 +1530,13 @@ def call_image_model(api_preset: dict, prompt: str) -> dict[str, Any]:
     if not base_url or not api_key or not model:
         raise ValueError("当前图片 API 模板缺少 imageBaseUrl / imageApiKey / imageModel")
 
-    response = requests.post(
+    response = _post_json(
         base_url,
         headers={
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",
         },
-        json={
+        json_payload={
             "model": model,
             "modalities": ["text", "image"],
             "messages": [{"role": "user", "content": str(prompt or "").strip()}],
