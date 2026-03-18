@@ -2380,12 +2380,28 @@ class DashboardApp(ctk.CTk):
     def _selected_module_labels(self) -> list[str]:
         return self._current_module_selection().labels()
 
+    def _current_runtime_config(self) -> dict[str, Any]:
+        config = load_scheduler_settings(SCHEDULER_CONFIG_FILE)
+        config.update(
+            {
+                "metadata_root": self.metadata_root_var.get().strip(),
+                "music_dir": self.music_dir_var.get().strip(),
+                "base_image_dir": self.base_image_dir_var.get().strip(),
+                "output_root": self.output_root_var.get().strip(),
+                "ffmpeg_bin": self.ffmpeg_var.get().strip() or "ffmpeg",
+                "ffmpeg_path": self.ffmpeg_var.get().strip() or "ffmpeg",
+                "used_media_root": self.used_media_root_var.get().strip(),
+                "render_cleanup_days": int(self.cleanup_days_var.get().strip() or "5"),
+            }
+        )
+        return config
+
     def _build_current_run_plan(self):
         return build_run_plan(
             tasks=self.window_tasks,
             defaults=self._collect_defaults(),
             modules=self._current_module_selection(),
-            config=load_scheduler_settings(),
+            config=self._current_runtime_config(),
         )
 
     def _build_start_tab(self) -> None:

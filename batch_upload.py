@@ -427,6 +427,15 @@ async def wait_for_upload_details_ready(page, timeout_ms: int = 25000) -> bool:
         "ytcp-uploads-dialog #textbox[contenteditable='true']",
         "ytcp-uploads-dialog textarea",
         "ytcp-uploads-dialog input[type='text']",
+        "ytcp-uploads-dialog #description-textarea",
+        "ytcp-uploads-dialog ytcp-video-thumbnail-with-info",
+        "ytcp-uploads-dialog #scrollable-content",
+        "ytcp-uploads-dialog #next-button",
+        "ytcp-uploads-dialog ytcp-button#next-button",
+        "ytcp-uploads-dialog tp-yt-paper-radio-button[name='VIDEO_HAS_ALTERED_CONTENT_YES']",
+        "ytcp-uploads-dialog tp-yt-paper-radio-button[name='VIDEO_HAS_ALTERED_CONTENT_NO']",
+        "ytcp-uploads-dialog ytcp-form-select#category",
+        "ytcp-uploads-dialog ytcp-video-upload-progress",
     ]
     deadline = time.monotonic() + max(1, timeout_ms) / 1000.0
 
@@ -446,7 +455,18 @@ async def wait_for_upload_details_ready(page, timeout_ms: int = 25000) -> bool:
                     const dlg = document.querySelector('ytcp-uploads-dialog');
                     if (!dlg) return false;
                     const text = (dlg.innerText || '').trim();
-                    return /Details|詳情|详细信息|詳細資料/i.test(text);
+                    const detailsRe = /Details|Video elements|Checks|Visibility|Filename|Video link|Uploading video|Upload complete|詳情|详细信息|詳細資料|影片元素|检查|檢查|可见度|可見度|檔名|文件名|视频链接|影片連結|上傳中|上传中|上传完成|上傳完成/i;
+                    if (detailsRe.test(text)) return true;
+                    return !!(
+                        dlg.querySelector('#scrollable-content') ||
+                        dlg.querySelector('#description-textarea') ||
+                        dlg.querySelector('#next-button') ||
+                        dlg.querySelector('ytcp-video-thumbnail-with-info') ||
+                        dlg.querySelector('ytcp-video-upload-progress') ||
+                        dlg.querySelector("tp-yt-paper-radio-button[name='VIDEO_HAS_ALTERED_CONTENT_YES']") ||
+                        dlg.querySelector("tp-yt-paper-radio-button[name='VIDEO_HAS_ALTERED_CONTENT_NO']") ||
+                        dlg.querySelector('ytcp-form-select#category')
+                    );
                 }
                 """
             )
