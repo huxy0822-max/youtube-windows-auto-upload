@@ -665,8 +665,6 @@ def _build_title_stage_prompt(
         "audience": str(content_template.get("audience") or "").strip(),
         "language": language_ui,
         "titleLength": {"min": title_min, "max": title_max},
-        "avoidTitles": _trim_avoid_values(avoid_titles, limit=10),
-        "avoidOpeningFragments": _extract_opening_fragments(avoid_titles, limit=8),
         "styleSummary": _metadata_style_summary(content_template),
     }
     return (
@@ -674,11 +672,8 @@ def _build_title_stage_prompt(
         "You are generating YouTube music video titles.\n"
         "All titles must be Traditional Chinese.\n"
         "Every title must feel genuinely different in angle, not just paraphrased.\n"
-        "Do not copy, lightly paraphrase, or continue any avoidTitles.\n"
-        "Do not begin a new title with the same opening wording as avoidOpeningFragments.\n"
         "Do not output the same opening clause across multiple titles.\n"
         "Treat the seed as a hard uniqueness constraint: produce a fresh hook and a fresh opening clause.\n"
-        "If a candidate title still resembles any avoidTitles, replace it instead of paraphrasing it.\n"
         "Make the titles emotionally vivid, specific, and mature.\n\n"
         f"Input:\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
         'Return JSON schema: {"usedAngle":"string","titles":["string"]}'
@@ -704,16 +699,13 @@ def _build_description_stage_prompt(
         "language": language_ui,
         "descriptionLength": _int_value(content_template.get("descLen"), 300),
         "tagCount": {"min": tag_range[0], "max": tag_range[1]},
-        "avoidDescriptions": _trim_avoid_values(avoid_descriptions, limit=8),
-        "avoidTagSignatures": _trim_avoid_values(avoid_tag_signatures, limit=6),
         "styleSummary": _metadata_style_summary(content_template),
     }
     return (
         "Return strict JSON only.\n"
         "You are generating one YouTube description and one SEO tag list for a music video.\n"
         "Description and tags must be Traditional Chinese.\n"
-        "Do not repeat or lightly paraphrase avoidDescriptions.\n"
-        "Do not reproduce avoidTagSignatures.\n\n"
+        "Make the wording natural, emotionally coherent, and clearly matched to the title.\n\n"
         f"Input:\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
         'Return JSON schema: {"descriptions":["string"],"seoHashtags":["#tag"],"tagList":["keyword"]}'
     )
@@ -737,7 +729,6 @@ def _build_thumbnail_prompt_stage(
         "angle": str(content_template.get("angle") or "").strip(),
         "audience": str(content_template.get("audience") or "").strip(),
         "thumbnailTextLanguage": language_english,
-        "avoidThumbnailPrompts": _trim_avoid_values(avoid_thumbnail_prompts, limit=8),
         "styleSummary": _metadata_style_summary(content_template),
     }
     return (
@@ -745,7 +736,7 @@ def _build_thumbnail_prompt_stage(
         "Generate thumbnail image prompts for a music video.\n"
         "Each prompt must describe a clear image concept and must end with "
         f"'Use {language_english} text in the image.'\n"
-        "Do not reuse or lightly paraphrase avoidThumbnailPrompts.\n\n"
+        "Make each prompt visually clear, elegant, and directly usable by an image model.\n\n"
         f"Input:\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
         'Return JSON schema: {"thumbnails":[{"forTitle":"string","prompt":"string"}]}'
     )
@@ -1493,8 +1484,6 @@ def generate_content_bundle(
     titles = [str(item).strip() for item in title_payload.get("titles", []) if str(item).strip()]
     if not titles:
         raise RuntimeError("文案生成失败: stage=titles provider=api error=API 未返回标题")
-    _ensure_unique_generated_values(label="title", values=titles, blocked_values=avoid_titles)
-
     primary_title = titles[0]
     description_prompt = _build_description_stage_prompt(
         content_template,
@@ -1534,13 +1523,6 @@ def generate_content_bundle(
         raise RuntimeError("文案生成失败: stage=description_tags provider=api error=API 未返回简介")
     if not tag_list:
         raise RuntimeError("文案生成失败: stage=description_tags provider=api error=API 未返回标签")
-    _ensure_unique_generated_values(label="description", values=descriptions, blocked_values=avoid_descriptions)
-    _ensure_unique_generated_values(
-        label="tag signature",
-        values=[" | ".join(tag_list)],
-        blocked_values=avoid_tag_signatures,
-    )
-
     thumb_prompt = _build_thumbnail_prompt_stage(
         content_template,
         unique_seed=f"{unique_seed}|thumb",
@@ -1572,12 +1554,6 @@ def generate_content_bundle(
     if not thumbnail_prompt_rows:
         raise RuntimeError("文案生成失败: stage=thumbnail_prompts provider=api error=API 未返回缩略图提示词")
     thumbnail_prompts = [item["prompt"] for item in thumbnail_prompt_rows if item.get("prompt")]
-    _ensure_unique_generated_values(
-        label="thumbnail prompt",
-        values=thumbnail_prompts,
-        blocked_values=avoid_thumbnail_prompts,
-    )
-
     return {
         "api_preset": api_preset,
         "content_template": content_template,

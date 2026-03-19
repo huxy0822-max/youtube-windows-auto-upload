@@ -1105,145 +1105,69 @@ def _generate_prompt_metadata(
         raise RuntimeError(f"{tag}/{task.serial} 未绑定 API 模板；当前文案链只允许走 API，不允许回退默认模板。")
     if not resolved_content_name:
         raise RuntimeError(f"{tag}/{task.serial} 未绑定内容模板；当前文案链只允许走 API，不允许回退默认模板。")
-    retry_titles = list(used_titles)
-    retry_descriptions = list(used_descriptions)
-    retry_thumbnail_prompts = list(used_thumbnail_prompts)
-    retry_tag_signatures = list(used_tag_signatures)
-
     log(
-        f"[文案] {tag}/{task.serial}: API={resolved_api_name} | 模板={resolved_content_name} | "
-        f"seed={unique_seed} | 历史标题={len(retry_titles)} | 历史简介={len(retry_descriptions)} | "
-        f"历史缩略图提示词={len(retry_thumbnail_prompts)}"
+        f"[文案] {tag}/{task.serial}: API={resolved_api_name} | 模板={resolved_content_name} | seed={unique_seed}"
+    )
+    bundle = generate_content_bundle(
+        PROMPT_STUDIO_FILE,
+        tag,
+        is_ypp=task.is_ypp,
+        api_preset_name=resolved_api_name,
+        content_template_name=resolved_content_name,
+        unique_seed=unique_seed,
+        avoid_titles=None,
+        avoid_descriptions=None,
+        avoid_thumbnail_prompts=None,
+        avoid_tag_signatures=None,
+        log=log,
+    )
+    if str(bundle.get("generation_source") or "").strip().lower() != "api":
+        raise RuntimeError(f"{tag}/{task.serial} 文案链路未返回 API 来源标记，已拒绝继续。")
+    if str((bundle.get("api_preset") or {}).get("name") or "") != str(resolved_api_name):
+        raise RuntimeError(
+            f"{tag}/{task.serial} API preset mismatch: expected={resolved_api_name} "
+            f"actual={str((bundle.get('api_preset') or {}).get('name') or '')}"
+        )
+    if str((bundle.get("content_template") or {}).get("name") or "") != str(resolved_content_name):
+        raise RuntimeError(
+            f"{tag}/{task.serial} content template mismatch: expected={resolved_content_name} "
+            f"actual={str((bundle.get('content_template') or {}).get('name') or '')}"
+        )
+
+    title_candidates = [str(item).strip() for item in bundle.get("titles", []) if str(item).strip()]
+    description_candidates = [str(item).strip() for item in bundle.get("descriptions", []) if str(item).strip()]
+    thumbnail_prompts = [
+        str(item.get("prompt") or "").strip()
+        for item in bundle.get("thumbnail_prompts", [])
+        if str(item.get("prompt") or "").strip()
+    ]
+    chosen_title = title_candidates[0] if title_candidates else ""
+    chosen_description = description_candidates[0] if description_candidates else ""
+    tag_list = [str(item).strip() for item in bundle.get("tag_list", []) if str(item).strip()]
+    ab_titles = (
+        [str(item).strip() for item in title_candidates[:3] if str(item).strip()]
+        if task.is_ypp
+        else []
     )
 
-    for attempt in range(1, 7):
-        live_scope = get_used_metadata_scope(tag, config=config, global_scope=True)
-        effective_titles = [
-            str(item).strip()
-            for item in [*live_scope.get("titles", []), *retry_titles]
-            if str(item).strip()
-        ]
-        effective_descriptions = [
-            str(item).strip()
-            for item in [*live_scope.get("descriptions", []), *retry_descriptions]
-            if str(item).strip()
-        ]
-        effective_thumbnail_prompts = [
-            str(item).strip()
-            for item in [*live_scope.get("thumbnail_prompts", []), *retry_thumbnail_prompts]
-            if str(item).strip()
-        ]
-        effective_tag_signatures = [
-            str(item).strip()
-            for item in [*live_scope.get("tag_signatures", []), *retry_tag_signatures]
-            if str(item).strip()
-        ]
-        retry_seed = unique_seed if attempt == 1 else _build_unique_seed(
-            defaults.date_mmdd,
-            tag,
-            task.serial,
-            unique_seed,
-            f"retry-{attempt}",
-        )
-        bundle = generate_content_bundle(
-            PROMPT_STUDIO_FILE,
-            tag,
-            is_ypp=task.is_ypp,
-            api_preset_name=resolved_api_name,
-            content_template_name=resolved_content_name,
-            unique_seed=retry_seed,
-            avoid_titles=effective_titles,
-            avoid_descriptions=effective_descriptions,
-            avoid_thumbnail_prompts=effective_thumbnail_prompts,
-            avoid_tag_signatures=effective_tag_signatures,
-            log=log,
-        )
-        if str(bundle.get("generation_source") or "").strip().lower() != "api":
-            raise RuntimeError(f"{tag}/{task.serial} 文案链路未返回 API 来源标记，已拒绝继续。")
-        if str((bundle.get("api_preset") or {}).get("name") or "") != str(resolved_api_name):
-            raise RuntimeError(
-                f"{tag}/{task.serial} API preset mismatch: expected={resolved_api_name} "
-                f"actual={str((bundle.get('api_preset') or {}).get('name') or '')}"
-            )
-        if str((bundle.get("content_template") or {}).get("name") or "") != str(resolved_content_name):
-            raise RuntimeError(
-                f"{tag}/{task.serial} content template mismatch: expected={resolved_content_name} "
-                f"actual={str((bundle.get('content_template') or {}).get('name') or '')}"
-            )
-        title_candidates = [str(item).strip() for item in bundle.get("titles", []) if str(item).strip()]
-        description_candidates = [str(item).strip() for item in bundle.get("descriptions", []) if str(item).strip()]
-        thumbnail_prompts = [
-            str(item.get("prompt") or "").strip()
-            for item in bundle.get("thumbnail_prompts", [])
-            if str(item.get("prompt") or "").strip()
-        ]
-        chosen_prompt = ""
-        if thumbnail_prompts:
-            chosen_prompt = _pick_fresh_candidate(thumbnail_prompts, effective_thumbnail_prompts, "")
-            if chosen_prompt:
-                thumbnail_prompts = [chosen_prompt] + [
-                    item
-                    for item in thumbnail_prompts
-                    if _normalized_text_key(item) != _normalized_text_key(chosen_prompt)
-                ]
+    if not chosen_title:
+        raise RuntimeError(f"{tag}/{task.serial} API 未返回标题。")
+    if not chosen_description:
+        raise RuntimeError(f"{tag}/{task.serial} API 未返回简介。")
+    if not tag_list:
+        raise RuntimeError(f"{tag}/{task.serial} API 未返回标签。")
+    if defaults.generate_thumbnails and not thumbnail_prompts:
+        raise RuntimeError(f"{tag}/{task.serial} API 未返回缩略图提示词。")
 
-        chosen_title = _pick_fresh_candidate(title_candidates, effective_titles, "")
-        chosen_description = _pick_fresh_candidate(description_candidates, effective_descriptions, "")
-        tag_list = [str(item).strip() for item in bundle.get("tag_list", []) if str(item).strip()]
-        tag_signature = " | ".join(tag_list)
-        ab_titles = (
-            [str(item).strip() for item in title_candidates[:3] if str(item).strip()]
-            if task.is_ypp
-            else []
-        )
-
-        title_ready = bool(chosen_title)
-        description_ready = bool(chosen_description)
-        tags_ready = bool(tag_signature)
-        prompt_ready = (not defaults.generate_thumbnails) or bool(chosen_prompt)
-
-        fresh_title = title_ready and _is_fresh_value(chosen_title, effective_titles)
-        fresh_description = description_ready and _is_fresh_value(chosen_description, effective_descriptions)
-        fresh_prompt = (not defaults.generate_thumbnails) or (
-            prompt_ready and _is_fresh_value(chosen_prompt, effective_thumbnail_prompts)
-        )
-        fresh_tags = tags_ready and _is_fresh_value(tag_signature, effective_tag_signatures)
-
-        result = {
-            "bundle": bundle,
-            "title": chosen_title,
-            "description": chosen_description,
-            "tag_list": tag_list,
-            "ab_titles": ab_titles,
-            "thumbnail_prompts": thumbnail_prompts,
-            "attempts": attempt,
-        }
-        if title_ready and description_ready and tags_ready and prompt_ready and fresh_title and fresh_description and fresh_prompt and fresh_tags:
-            if attempt > 1:
-                log(f"[文案] {tag}/{task.serial}: 第 {attempt} 次重试后拿到去重结果")
-            return result
-
-        duplicate_reasons: list[str] = []
-        if title_ready and not fresh_title:
-            duplicate_reasons.append("title")
-        if description_ready and not fresh_description:
-            duplicate_reasons.append("description")
-        if tags_ready and not fresh_tags:
-            duplicate_reasons.append("tags")
-        if defaults.generate_thumbnails and prompt_ready and not fresh_prompt:
-            duplicate_reasons.append("thumbnail_prompt")
-        if duplicate_reasons:
-            log(f"[文案] {tag}/{task.serial}: 第 {attempt} 次结果撞历史，重试字段 -> {', '.join(duplicate_reasons)}")
-
-        retry_titles.extend(title_candidates or ([chosen_title] if chosen_title else []))
-        retry_descriptions.extend(description_candidates or ([chosen_description] if chosen_description else []))
-        retry_thumbnail_prompts.extend(thumbnail_prompts)
-        if tag_signature:
-            retry_tag_signatures.append(tag_signature)
-
-    raise RuntimeError(
-        f"{tag}/{task.serial} API metadata generation failed to produce unique title/description/tags after 6 attempts."
-    )
+    return {
+        "bundle": bundle,
+        "title": chosen_title,
+        "description": chosen_description,
+        "tag_list": tag_list,
+        "ab_titles": ab_titles,
+        "thumbnail_prompts": thumbnail_prompts,
+        "attempts": 1,
+    }
 
 
 def _build_api_debug_payload(bundle: dict[str, Any] | None, *, unique_seed: str) -> dict[str, str]:
@@ -1519,19 +1443,6 @@ def refresh_existing_output_metadata(
                     log(f"[thumb] {tag}/{task.serial}: source={cover_source or 'existing'} | {thumb_preview}")
 
                 if defaults.generate_text or defaults.generate_thumbnails:
-                    _assert_api_metadata_is_unique(
-                        tag=tag,
-                        task=task,
-                        title=title,
-                        description=description,
-                        tag_list=tag_list,
-                        thumbnail_prompts=thumbnail_prompts,
-                        config=cfg,
-                        transient_titles=current_titles,
-                        transient_descriptions=current_descriptions,
-                        transient_thumbnail_prompts=current_thumbnail_prompts,
-                        transient_tag_signatures=current_tag_signatures,
-                    )
                     _save_daily_entry(
                         generation_map_path,
                         date_mmdd=defaults.date_mmdd,
@@ -2203,23 +2114,9 @@ def execute_metadata_only_workflow(
                     log(f"[thumb] {tag}/{task.serial}: source={cover_source or 'existing'} | {thumb_preview}")
 
                 if defaults.generate_text or defaults.generate_thumbnails:
-                    _assert_api_metadata_is_unique(
-                        tag=tag,
-                        task=task,
-                        title=title,
-                        description=description,
-                        tag_list=tag_list,
-                        thumbnail_prompts=thumbnail_prompts,
-                        config=config,
-                        transient_titles=state["titles"],
-                        transient_descriptions=state["descriptions"],
-                        transient_thumbnail_prompts=state["thumbnail_prompts"],
-                        transient_tag_signatures=state["tag_signatures"],
-                    )
-
-                _save_daily_entry(
-                    state["generation_map_path"],
-                    date_mmdd=defaults.date_mmdd,
+                    _save_daily_entry(
+                        state["generation_map_path"],
+                        date_mmdd=defaults.date_mmdd,
                     serial=task.serial,
                     is_ypp=task.is_ypp,
                     title=title,
@@ -2536,19 +2433,6 @@ def execute_direct_media_workflow(
                     log(f"[thumb] {tag}/{task.serial}: source={cover_source or 'existing'} | {thumb_preview}")
 
                 if defaults.generate_text or defaults.generate_thumbnails:
-                    _assert_api_metadata_is_unique(
-                        tag=tag,
-                        task=task,
-                        title=title,
-                        description=description,
-                        tag_list=tag_list,
-                        thumbnail_prompts=thumbnail_prompts,
-                        config=config,
-                        transient_titles=state["titles"],
-                        transient_descriptions=state["descriptions"],
-                        transient_thumbnail_prompts=state["thumbnail_prompts"],
-                        transient_tag_signatures=state["tag_signatures"],
-                    )
                     _save_daily_entry(
                         Path(state["generation_map_path"]),
                         date_mmdd=defaults.date_mmdd,
