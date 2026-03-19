@@ -349,7 +349,7 @@ class DashboardApp(ctk.CTk):
         )
         self.date_var = ctk.StringVar(value=state.get("date_mmdd", _today_mmdd()))
         self.simulate_seconds_var = ctk.StringVar(value=str(state.get("simulate_seconds", 90)))
-        self.randomize_effects_var = ctk.BooleanVar(value=bool(state.get("randomize_effects", True)))
+        self.randomize_effects_var = ctk.BooleanVar(value=False)
         visual_cfg = dict(self.scheduler_config.get("visual_settings") or {})
         self.visual_spectrum_var = ctk.StringVar(value=str(state.get("visual_spectrum", visual_cfg.get("spectrum", "yes"))))
         self.visual_timeline_var = ctk.StringVar(value=str(state.get("visual_timeline", visual_cfg.get("timeline", "yes"))))
@@ -1302,7 +1302,7 @@ class DashboardApp(ctk.CTk):
             "run_upload": bool(self.run_upload_var.get()),
             "date_mmdd": self.date_var.get(),
             "simulate_seconds": self.simulate_seconds_var.get(),
-            "randomize_effects": bool(self.randomize_effects_var.get()),
+            "randomize_effects": False,
             "visual_spectrum": self.visual_spectrum_var.get(),
             "visual_timeline": self.visual_timeline_var.get(),
             "visual_letterbox": self.visual_letterbox_var.get(),
@@ -2954,7 +2954,7 @@ class DashboardApp(ctk.CTk):
             generate_text=bool(modules["metadata"]),
             generate_thumbnails=bool(modules["metadata"]),
             sync_daily_content=bool(modules["metadata"]),
-            randomize_effects=bool(self.randomize_effects_var.get()),
+            randomize_effects=False,
             visual_settings=self._collect_visual_settings(),
         )
 
@@ -3144,6 +3144,218 @@ class DashboardApp(ctk.CTk):
             include_upload=bool(module_selection.upload),
         )
 
+
+    def _bind_scroll_frame_wheel(
+        self,
+        scroll_frame: ctk.CTkScrollableFrame,
+        *widgets: ctk.CTkBaseClass,
+        include_textboxes: bool = False,
+    ) -> None:
+        canvas = getattr(scroll_frame, "_parent_canvas", None)
+        if canvas is None:
+            return
+
+        try:
+            canvas.configure(yscrollincrement=24)
+        except Exception:
+            pass
+
+        def _on_mousewheel(event: Any) -> str | None:
+            delta = 0
+            if getattr(event, "delta", 0):
+                delta = -int(event.delta / 120) if event.delta else 0
+            elif getattr(event, "num", None) == 4:
+                delta = -1
+            elif getattr(event, "num", None) == 5:
+                delta = 1
+            if delta:
+                canvas.yview_scroll(delta, "units")
+                return "break"
+            return None
+
+        def _bind_tree(widget: Any) -> None:
+            if isinstance(widget, ctk.CTkTextbox) and not include_textboxes:
+                return
+            for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                try:
+                    widget.bind(sequence, _on_mousewheel, add="+")
+                except Exception:
+                    pass
+            for attr_name in ("_entry", "_text_label", "_canvas", "_dropdown_menu", "_scrollbar", "_textbox"):
+                inner = getattr(widget, attr_name, None)
+                if inner is None:
+                    continue
+                for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                    try:
+                        inner.bind(sequence, _on_mousewheel, add="+")
+                    except Exception:
+                        pass
+            for child in widget.winfo_children():
+                _bind_tree(child)
+
+        for widget in widgets:
+            _bind_tree(widget)
+
+    def _build_start_tab(self) -> None:
+        tab = self.tabview.tab("快捷开始")
+        tab.grid_columnconfigure(0, weight=1)
+
+        task_frame = ctk.CTkFrame(tab)
+        task_frame.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
+        for column in range(6):
+            task_frame.grid_columnconfigure(column, weight=1)
+        ctk.CTkLabel(task_frame, text="本次任务", font=ctk.CTkFont(size=24, weight="bold")).grid(
+            row=0, column=0, columnspan=6, sticky="w", padx=16, pady=(14, 8)
+        )
+        ctk.CTkLabel(
+            task_frame,
+            text="勾选今天要执行的模块。随机与否全部在高级视觉里用 random 控制，这里不再保留全局随机开关。",
+            text_color="#b8c1cc",
+        ).grid(row=1, column=0, columnspan=6, sticky="w", padx=16, pady=(0, 10))
+        ctk.CTkCheckBox(task_frame, text="生成标题/简介/标签/缩略图", variable=self.run_metadata_var).grid(
+            row=2, column=0, columnspan=2, sticky="w", padx=(16, 8), pady=(0, 10)
+        )
+        ctk.CTkCheckBox(task_frame, text="剪辑", variable=self.run_render_var).grid(
+            row=2, column=2, columnspan=2, sticky="w", padx=8, pady=(0, 10)
+        )
+        ctk.CTkCheckBox(task_frame, text="上传", variable=self.run_upload_var).grid(
+            row=2, column=4, columnspan=2, sticky="w", padx=8, pady=(0, 10)
+        )
+        ctk.CTkLabel(task_frame, text="日期").grid(row=3, column=0, sticky="w", padx=(16, 8), pady=(0, 8))
+        ctk.CTkEntry(task_frame, textvariable=self.date_var, width=140).grid(
+            row=3, column=1, sticky="w", padx=(0, 12), pady=(0, 8)
+        )
+        ctk.CTkLabel(task_frame, text="模拟时长(秒)").grid(row=3, column=2, sticky="w", padx=(0, 8), pady=(0, 8))
+        ctk.CTkEntry(task_frame, textvariable=self.simulate_seconds_var, width=120).grid(
+            row=3, column=3, sticky="w", padx=(0, 12), pady=(0, 8)
+        )
+        ctk.CTkButton(
+            task_frame,
+            text="打开高级视觉",
+            command=lambda: self.tabview.set("高级视觉"),
+            width=140,
+        ).grid(row=3, column=4, columnspan=2, sticky="w", padx=8, pady=(0, 8))
+
+        option_frame = ctk.CTkFrame(tab)
+        option_frame.grid(row=1, column=0, sticky="ew", padx=16, pady=8)
+        option_frame.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            option_frame,
+            text="文案模块只写标题、简介、标签和缩略图到文案输出目录。剪辑模块只生成成品视频。上传模块直接读取上面配置好的目录，如果缺文件会直接报错。",
+            text_color="#b8c1cc",
+            justify="left",
+        ).grid(row=0, column=0, sticky="w", padx=16, pady=16)
+
+        action_frame = ctk.CTkFrame(tab)
+        action_frame.grid(row=2, column=0, sticky="ew", padx=16, pady=8)
+        for column in range(5):
+            action_frame.grid_columnconfigure(column, weight=1)
+        ctk.CTkButton(action_frame, text="预览计划", command=self._preview_plan).grid(
+            row=0, column=0, sticky="ew", padx=12, pady=12
+        )
+        ctk.CTkButton(action_frame, text="路径检查", command=self._validate_paths).grid(
+            row=0, column=1, sticky="ew", padx=12, pady=12
+        )
+        ctk.CTkButton(action_frame, text="模拟 1-2 分钟", command=self._start_simulation).grid(
+            row=0, column=2, sticky="ew", padx=12, pady=12
+        )
+        ctk.CTkButton(action_frame, text="开始真实流程", command=self._start_real_flow).grid(
+            row=0, column=3, sticky="ew", padx=12, pady=12
+        )
+        ctk.CTkButton(action_frame, text="打开当前输出目录", command=self._open_current_output).grid(
+            row=0, column=4, sticky="ew", padx=12, pady=12
+        )
+
+        self.start_preview = ctk.CTkTextbox(tab, height=420)
+        self.start_preview.grid(row=3, column=0, sticky="nsew", padx=16, pady=(8, 16))
+        tab.grid_rowconfigure(3, weight=1)
+
+    def _build_paths_tab(self) -> None:
+        base_tab = self.tabview.tab("路径配置")
+        base_tab.grid_columnconfigure(0, weight=1)
+        base_tab.grid_rowconfigure(0, weight=1)
+        tab = ctk.CTkScrollableFrame(base_tab)
+        tab.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+        tab.grid_columnconfigure(0, weight=1)
+
+        path_frame = ctk.CTkFrame(tab)
+        path_frame.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 8))
+        path_frame.grid_columnconfigure(0, weight=0)
+        path_frame.grid_columnconfigure(1, weight=1)
+        path_frame.grid_columnconfigure(2, weight=1)
+        path_frame.grid_columnconfigure(3, weight=1)
+        ctk.CTkLabel(path_frame, text="全局路径", font=ctk.CTkFont(size=24, weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=16, pady=(14, 12)
+        )
+        for row, (label, var) in enumerate(
+            [
+                ("文案输出目录", self.metadata_root_var),
+                ("音乐目录", self.music_dir_var),
+                ("底图目录", self.base_image_dir_var),
+                ("成品视频输出目录", self.output_root_var),
+                ("FFmpeg", self.ffmpeg_var),
+                ("已用素材目录", self.used_media_root_var),
+                ("上传后保留天数", self.cleanup_days_var),
+            ],
+            start=1,
+        ):
+            entry_key = {
+                1: "metadata_root",
+                2: "music_dir",
+                3: "base_image_dir",
+                4: "output_root",
+                5: "ffmpeg_bin",
+                6: "used_media_root",
+                7: "render_cleanup_days",
+            }.get(row)
+            self._entry_row(path_frame, row, label, var, entry_key=entry_key)
+        ctk.CTkButton(path_frame, text="保存路径配置", command=self._save_paths).grid(
+            row=8, column=0, columnspan=4, sticky="w", padx=16, pady=(0, 14)
+        )
+
+        binding_frame = ctk.CTkFrame(tab)
+        binding_frame.grid(row=1, column=0, sticky="nsew", padx=8, pady=(8, 16))
+        for column in range(4):
+            binding_frame.grid_columnconfigure(column, weight=1)
+        binding_frame.grid_rowconfigure(6, weight=0)
+        ctk.CTkLabel(binding_frame, text="分组素材目录绑定", font=ctk.CTkFont(size=24, weight="bold")).grid(
+            row=0, column=0, columnspan=4, sticky="w", padx=16, pady=(14, 12)
+        )
+        ctk.CTkLabel(
+            binding_frame,
+            text="每个 BitBrowser 分组都可以长期绑定一个素材目录。上传页如果不单独覆盖，就自动使用这里的绑定。",
+            text_color="#b8c1cc",
+            justify="left",
+        ).grid(row=1, column=0, columnspan=4, sticky="w", padx=16, pady=(0, 10))
+        ctk.CTkLabel(binding_frame, text="分组").grid(row=2, column=0, sticky="w", padx=(16, 8), pady=(0, 6))
+        self.binding_group_menu = ctk.CTkOptionMenu(binding_frame, variable=self.binding_group_var, values=[""])
+        self.binding_group_menu.grid(row=3, column=0, sticky="ew", padx=(16, 8), pady=(0, 12))
+        ctk.CTkLabel(binding_frame, text="绑定目录").grid(row=2, column=1, sticky="w", padx=8, pady=(0, 6))
+        ctk.CTkEntry(binding_frame, textvariable=self.binding_folder_var).grid(
+            row=3, column=1, columnspan=2, sticky="ew", padx=8, pady=(0, 12)
+        )
+        ctk.CTkButton(binding_frame, text="选择文件夹", command=self._pick_binding_folder).grid(
+            row=3, column=3, sticky="ew", padx=(8, 16), pady=(0, 12)
+        )
+        bar = ctk.CTkFrame(binding_frame, fg_color="transparent")
+        bar.grid(row=4, column=0, columnspan=4, sticky="ew", padx=10, pady=(0, 8))
+        ctk.CTkButton(bar, text="保存绑定", command=self._save_binding).pack(side="left", padx=6)
+        ctk.CTkButton(bar, text="删除绑定", command=self._remove_binding).pack(side="left", padx=6)
+        ctk.CTkButton(bar, text="刷新分组", command=self._refresh_groups).pack(side="left", padx=6)
+        ctk.CTkLabel(binding_frame, text="当前绑定（这里也支持滚轮直接翻到底）").grid(
+            row=5, column=0, sticky="w", padx=16, pady=(0, 6)
+        )
+        self.binding_box = ctk.CTkTextbox(binding_frame, height=140)
+        self.binding_box.grid(row=6, column=0, columnspan=4, sticky="nsew", padx=16, pady=(0, 14))
+        self._bind_scroll_frame_wheel(
+            tab,
+            base_tab,
+            tab,
+            path_frame,
+            binding_frame,
+            self.binding_box,
+            include_textboxes=True,
+        )
 
     def _on_close(self) -> None:
         self._save_state()
