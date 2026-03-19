@@ -516,8 +516,8 @@ def _build_compact_generation_prompt(
     angle_text = str(content_template.get("angle") or "").strip()
     audience_text = str(content_template.get("audience") or "").strip()
     genre_text = str(content_template.get("musicGenre") or "").strip()
-    title_library = _compact_title_library(content_template, limit=900)
-    master_prompt = _compact_master_rules(content_template, limit=1800)
+    title_library = str(content_template.get("titleLibrary") or "").strip()
+    master_prompt = str(render_master_prompt(content_template) or "").strip()
     payload = {
         "musicGenre": genre_text,
         "angle": angle_text,
@@ -628,22 +628,37 @@ def _call_json_stage(
     provider = str(api_preset.get("provider") or "").strip().lower()
     request_preset = clone_json(api_preset)
     request_preset["maxTokens"] = str(min(_int_value(api_preset.get("maxTokens"), 16000), max_tokens_cap))
+    stage_presets: list[dict[str, Any]] = [request_preset]
+
     last_exc: Exception | None = None
     raw = ""
-    for api_attempt in range(1, 4):
-        try:
-            raw = call_text_model(request_preset, prompt, image_data_url=image_data_url)
-            parsed = _parse_json_like(raw)
-            if not isinstance(parsed, dict):
-                raise RuntimeError(f"{stage} did not return a JSON object")
-            return raw, parsed
-        except Exception as exc:
-            last_exc = exc
-            if api_attempt >= 3 or not _is_transient_text_api_error(exc):
-                raise RuntimeError(
-                    f"文案生成失败: stage={stage} provider={provider or 'unknown'} error={exc}"
-                ) from exc
-            time.sleep(2 * api_attempt)
+    for preset_index, active_preset in enumerate(stage_presets, 1):
+        active_base_url = str(active_preset.get("baseUrl") or "").strip().lower()
+        active_model = str(active_preset.get("model") or "").strip().lower()
+        if (
+            stage == "metadata_bundle"
+            and provider == "openai_compatible"
+            and "right.codes" in active_base_url
+            and active_model == "gpt-5.4-xhigh"
+        ):
+            max_attempts = 1
+        else:
+            max_attempts = 3
+        for api_attempt in range(1, max_attempts + 1):
+            try:
+                raw = call_text_model(active_preset, prompt, image_data_url=image_data_url)
+                parsed = _parse_json_like(raw)
+                if not isinstance(parsed, dict):
+                    raise RuntimeError(f"{stage} did not return a JSON object")
+                return raw, parsed
+            except Exception as exc:
+                last_exc = exc
+                if api_attempt < max_attempts and _is_transient_text_api_error(exc):
+                    time.sleep(2 * api_attempt)
+                    continue
+                break
+        if preset_index < len(stage_presets):
+            continue
     raise RuntimeError(
         f"文案生成失败: stage={stage} provider={provider or 'unknown'} error={last_exc}"
     ) from last_exc
@@ -659,8 +674,8 @@ def _build_title_stage_prompt(
     title_min = _int_value(content_template.get("titleMin"), 80)
     title_max = _int_value(content_template.get("titleMax"), 95)
     language_ui, _ = language_meta(str(content_template.get("outputLanguage") or "zh-TW"))
-    master_prompt = _compact_master_rules(content_template, limit=900)
-    title_library = _compact_title_library(content_template, limit=360)
+    master_prompt = str(render_master_prompt(content_template) or "").strip()
+    title_library = str(content_template.get("titleLibrary") or "").strip()
     payload = {
         "seed": str(unique_seed or "").strip(),
         "count": int(max(1, count)),
@@ -698,8 +713,8 @@ def _build_description_stage_prompt(
 ) -> str:
     tag_range = parse_tag_range(str(content_template.get("tagRange") or "10-20"))
     language_ui, _ = language_meta(str(content_template.get("outputLanguage") or "zh-TW"))
-    master_prompt = _compact_master_rules(content_template, limit=900)
-    title_library = _compact_title_library(content_template, limit=360)
+    master_prompt = str(render_master_prompt(content_template) or "").strip()
+    title_library = str(content_template.get("titleLibrary") or "").strip()
     payload = {
         "seed": str(unique_seed or "").strip(),
         "title": str(title or "").strip(),
@@ -735,8 +750,8 @@ def _build_thumbnail_prompt_stage(
     count: int,
 ) -> str:
     _, language_english = language_meta(str(content_template.get("outputLanguage") or "zh-TW"))
-    master_prompt = _compact_master_rules(content_template, limit=900)
-    title_library = _compact_title_library(content_template, limit=360)
+    master_prompt = str(render_master_prompt(content_template) or "").strip()
+    title_library = str(content_template.get("titleLibrary") or "").strip()
     payload = {
         "seed": str(unique_seed or "").strip(),
         "titles": [str(item or "").strip() for item in titles if str(item or "").strip()][: max(1, count)],
@@ -1187,7 +1202,21 @@ def _call_openai_compatible(api_preset: dict, user_prompt: str, image_data_url: 
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_preset.get('apiKey', '')}",
     }
-    timeout_seconds = max(120, DEFAULT_TIMEOUT_SECONDS)
+    prompt_chars = len(str(user_prompt or ""))
+    token_budget = _int_value(api_preset.get("maxTokens"), 16000)
+    timeout_seconds = 105
+    if prompt_chars > 4000:
+        timeout_seconds += 30
+    if prompt_chars > 9000:
+        timeout_seconds += 30
+    if token_budget > 8000:
+        timeout_seconds += 30
+    base_url = str(api_preset.get("baseUrl") or "").strip().lower()
+    model_name = str(api_preset.get("model") or "").strip().lower()
+    if "right.codes" in base_url and model_name == "gpt-5.4-xhigh":
+        timeout_seconds = max(timeout_seconds, 420)
+    timeout_seconds = max(timeout_seconds, DEFAULT_TIMEOUT_SECONDS)
+    timeout_seconds = min(timeout_seconds, 420)
     retryable_codes = {408, 429, 500, 502, 503, 504}
     for url in _build_openai_chat_urls(str(api_preset.get("baseUrl") or "")):
         for attempt in range(2):
