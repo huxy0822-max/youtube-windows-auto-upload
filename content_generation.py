@@ -513,22 +513,18 @@ def _build_compact_generation_prompt(
     title_count = _int_value(content_template.get("titleCount"), 1)
     desc_count = _int_value(content_template.get("descCount"), 1)
     thumb_count = _int_value(content_template.get("thumbCount"), 1)
-    avoid_titles_text = " | ".join(
-        [str(item).strip() for item in (avoid_titles or []) if str(item).strip()][:2]
-    )
-    avoid_tag_text = " | ".join(
-        [str(item).strip() for item in (avoid_tag_signatures or []) if str(item).strip()][:1]
-    )
-    angle_text = str(content_template.get("angle") or "").strip() or "auto-create one strong angle"
-    audience_text = str(content_template.get("audience") or "").strip() or "music listeners"
-    genre_text = str(content_template.get("musicGenre") or "").strip() or "music"
-    title_hint = re.sub(r"\s+", " ", str(content_template.get("titleLibrary") or "").strip())[:80]
-    core_rules = re.sub(r"\s+", " ", str(render_master_prompt(content_template) or "").strip())[:120]
+    angle_text = str(content_template.get("angle") or "").strip()
+    audience_text = str(content_template.get("audience") or "").strip()
+    genre_text = str(content_template.get("musicGenre") or "").strip()
+    title_library = _compact_title_library(content_template, limit=900)
+    master_prompt = _compact_master_rules(content_template, limit=1800)
     payload = {
-        "genre": genre_text,
+        "musicGenre": genre_text,
         "angle": angle_text,
         "audience": audience_text,
-        "uniqueSeed": str(unique_seed or "").strip(),
+        "masterPrompt": master_prompt,
+        "titleLibrary": title_library,
+        "seed": str(unique_seed or "").strip(),
         "titleCount": title_count,
         "descriptionCount": desc_count,
         "thumbnailCount": thumb_count,
@@ -536,20 +532,18 @@ def _build_compact_generation_prompt(
         "tagCountMax": tag_range[1],
         "language": language_ui,
         "thumbnailTextLanguage": language_english,
-        "avoidTitles": avoid_titles_text,
-        "avoidTagSignatures": avoid_tag_text,
-        "titleStyleHint": title_hint,
-        "coreRules": core_rules,
         "imageProvided": bool(image_data_url),
     }
     return (
         "Return strict JSON only.\n"
-        "Task: create YouTube metadata for one music video.\n"
+        "Task: create the full YouTube metadata bundle for one music video in a single response.\n"
         "All titles, descriptions and tags must be Traditional Chinese.\n"
         f"Every thumbnail prompt must end with: Use {language_english} text in the image.\n"
-        "Never reuse or closely paraphrase avoidTitles or avoidTagSignatures.\n"
-        "If angle is empty, create one.\n"
-        "Keep titles clearly different from each other.\n\n"
+        "Use the provided musicGenre, angle, and audience exactly as given. Do not rewrite, replace, soften, or auto-create them.\n"
+        "Treat masterPrompt as the highest-priority instruction.\n"
+        "Use titleLibrary as a style reference and flavor guide, but do not copy it verbatim.\n"
+        "Keep titles clearly different from each other.\n"
+        "Return the whole result in one valid JSON object.\n\n"
         f"Input:\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
         "Need exact JSON schema:\n"
         '{"usedAngle":"string","titles":["string"],"descriptions":["string"],"seoHashtags":["#tag"],"tagList":["keyword"],"thumbnails":[{"forTitle":"string","prompt":"string"}]}'
@@ -1487,6 +1481,79 @@ def generate_content_bundle(
     content_template["titleCount"] = str(title_count)
     content_template["descCount"] = "1"
     content_template["thumbCount"] = str(thumb_count)
+
+    bundle_prompt = _build_compact_generation_prompt(
+        content_template,
+        image_data_url=image_data_url,
+        unique_seed=unique_seed,
+        avoid_titles=None,
+        avoid_descriptions=None,
+        avoid_thumbnail_prompts=None,
+        avoid_tag_signatures=None,
+    )
+    emit(
+        f"[API] {tag}: stage=metadata_bundle -> provider={api_preset.get('provider', '')} "
+        f"model={api_preset.get('model', '')} chars={len(bundle_prompt)}"
+    )
+    raw_bundle, bundle_payload = _call_json_stage(
+        api_preset=api_preset,
+        prompt=bundle_prompt,
+        stage="metadata_bundle",
+        image_data_url=image_data_url,
+        max_tokens_cap=2200,
+    )
+    emit(f"[API] {tag}: stage=metadata_bundle <- ok chars={len(raw_bundle)}")
+    bundle_payload = _repair_output_if_needed(
+        bundle_payload,
+        api_preset,
+        content_template,
+        image_data_url=image_data_url,
+    )
+    used_angle = str(bundle_payload.get("usedAngle") or content_template.get("angle") or "").strip()
+    titles = [str(item).strip() for item in bundle_payload.get("titles", []) if str(item).strip()]
+    descriptions = [
+        str(item).strip()
+        for item in bundle_payload.get("descriptions", [])
+        if str(item).strip()
+    ]
+    seo_hashtags = [
+        str(item).strip()
+        for item in bundle_payload.get("seoHashtags", [])
+        if str(item).strip()
+    ]
+    tag_list = [
+        str(item).strip()
+        for item in bundle_payload.get("tagList", [])
+        if str(item).strip()
+    ]
+    thumbnail_prompt_rows = [
+        {
+            "for_title": str((item or {}).get("forTitle") or "").strip(),
+            "prompt": str((item or {}).get("prompt") or "").strip(),
+        }
+        for item in bundle_payload.get("thumbnails", [])
+        if str((item or {}).get("prompt") or "").strip()
+    ]
+    if not titles:
+        raise RuntimeError("文案生成失败: stage=metadata_bundle provider=api error=API 未返回标题")
+    if not descriptions:
+        raise RuntimeError("文案生成失败: stage=metadata_bundle provider=api error=API 未返回简介")
+    if not tag_list:
+        raise RuntimeError("文案生成失败: stage=metadata_bundle provider=api error=API 未返回标签")
+    if not thumbnail_prompt_rows:
+        raise RuntimeError("文案生成失败: stage=metadata_bundle provider=api error=API 未返回缩略图提示词")
+    return {
+        "api_preset": api_preset,
+        "content_template": content_template,
+        "raw_text": raw_bundle,
+        "used_angle": used_angle,
+        "titles": titles,
+        "descriptions": descriptions,
+        "seo_hashtags": seo_hashtags,
+        "tag_list": tag_list,
+        "generation_source": "api",
+        "thumbnail_prompts": thumbnail_prompt_rows,
+    }
 
     title_prompt = _build_title_stage_prompt(
         content_template,
