@@ -18,7 +18,7 @@ import customtkinter as ctk
 from PIL import Image, ImageGrab
 from tkinter import filedialog, messagebox, ttk
 
-from content_generation import analyze_audience_screenshot, call_image_model, call_text_model
+from content_generation import _parse_json_like, analyze_audience_screenshot, call_image_model, call_text_model
 from effects_library import (
     list_effects,
     list_font_names,
@@ -2211,7 +2211,7 @@ class DashboardApp(ctk.CTk):
                 self._current_api_form(),
                 '只返回严格 JSON，不要 markdown。{"titles":["1个繁体中文标题，长度20到40字"]}',
             )
-            parsed = json.loads(str(raw or "").strip())
+            parsed = _parse_json_like(str(raw or "").strip())
             titles = parsed.get("titles") if isinstance(parsed, dict) else None
             if not isinstance(titles, list) or not any(str(item).strip() for item in titles):
                 raise ValueError(f"文本接口返回了内容，但不是可用的大模型 JSON 结果: {str(raw)[:200]}")
@@ -3116,12 +3116,15 @@ class DashboardApp(ctk.CTk):
                 log=self._log,
             )
 
-            if stream_upload and upload_dispatched:
-                failures = self._wait_for_stream_uploads()
-                if self._cancel_requested:
-                    return False
-                if failures:
-                    raise RuntimeError(" | ".join(failures[:3]))
+            if stream_upload:
+                if upload_dispatched:
+                    failures = self._wait_for_stream_uploads()
+                    if self._cancel_requested:
+                        return False
+                    if failures:
+                        raise RuntimeError(" | ".join(failures[:3]))
+                else:
+                    self._log("[Upload] 本批没有可上传的已就绪项目；渲染会继续，失败的视频不会阻断后续任务。")
                 return False
 
             if run_plan.modules.upload:

@@ -227,7 +227,7 @@ class WorkflowDefaults:
     generate_text: bool = True
     generate_thumbnails: bool = True
     sync_daily_content: bool = True
-    randomize_effects: bool = True
+    randomize_effects: bool = False
     visual_settings: dict[str, Any] = field(default_factory=dict)
 
     def upload_defaults(self) -> dict[str, Any]:
@@ -261,7 +261,7 @@ def _coerce_float(value: Any, default: float) -> float:
 def _build_render_options_from_defaults(defaults: WorkflowDefaults) -> RenderOptions:
     settings = defaults.visual_settings or {}
     opts = RenderOptions()
-    opts.fx_randomize = bool(defaults.randomize_effects)
+    opts.fx_randomize = False
 
     opts.fx_spectrum = bool(settings.get("spectrum", True))
     opts.fx_timeline = bool(settings.get("timeline", True))
@@ -1456,141 +1456,144 @@ def refresh_existing_output_metadata(
                 source_image.stem if source_image else video_path.stem,
                 "upload_only_refresh",
             )
-
-            if defaults.metadata_mode == "prompt_api" and (defaults.generate_text or defaults.generate_thumbnails):
-                if control:
-                    control.check_cancelled()
-                    control.wait_if_paused(log=log, label=f"{tag}/{task.serial} 文案生成")
-                generated = _generate_prompt_metadata(
-                    tag=tag,
-                    task=task,
-                    defaults=defaults,
-                    config=cfg,
-                    unique_seed=unique_seed,
-                    title_fallback=title or video_path.stem,
-                    description_fallback=description,
-                    used_titles=[*(history_scope.get("titles") or []), *current_titles],
-                    used_descriptions=[*(history_scope.get("descriptions") or []), *current_descriptions],
-                    used_thumbnail_prompts=[*(history_scope.get("thumbnail_prompts") or []), *current_thumbnail_prompts],
-                    used_tag_signatures=[*(history_scope.get("tag_signatures") or []), *current_tag_signatures],
-                    log=log,
-                )
-                bundle = generated["bundle"]
-                log(
-                    f"[文案] {tag}/{task.serial}: API={bundle['api_preset'].get('name', '')} | "
-                    f"模板={bundle['content_template'].get('name', '')} | "
-                    f"来源={bundle.get('generation_source', 'unknown')} | 重试={generated['attempts']}"
-                )
-                thumbnail_prompts = list(generated["thumbnail_prompts"])
-                if defaults.generate_text:
-                    title = generated["title"]
-                    description = generated["description"]
-                    if not task.tag_list:
-                        tag_list = list(generated["tag_list"])
-                    if task.is_ypp and not task.ab_titles:
-                        ab_titles = list(generated["ab_titles"])
-
-            if defaults.generate_text and not bundle:
-                raise RuntimeError(f"{tag}/{task.serial} text generation requires API result, but no API bundle is available.")
-
-            cover_count = 3 if task.is_ypp else 1
-            if defaults.generate_thumbnails and not task.thumbnails:
-                cover_paths, cover_source = _generate_thumbnail_covers(
-                    bundle=bundle,
-                    thumbnail_prompts=thumbnail_prompts,
-                    source_image=source_image,
-                    target_dir=tag_metadata_dir,
-                    date_mmdd=defaults.date_mmdd,
-                    serial=task.serial,
-                    cover_count=cover_count,
-                    tag=tag,
-                    control=control,
-                    log=log,
-                )
-
-            if cover_paths:
-                log(
-                    f"[封面] {tag}/{task.serial}: 来源={cover_source or 'existing'} | "
-                    f"{', '.join(str(path) for path in cover_paths[:3])}"
-                )
-
-            if cover_paths:
-                thumb_preview = ", ".join(str(path) for path in cover_paths[:3])
-                log(f"[thumb] {tag}/{task.serial}: source={cover_source or 'existing'} | {thumb_preview}")
-
-            if defaults.generate_text or defaults.generate_thumbnails:
-                _assert_api_metadata_is_unique(
-                    tag=tag,
-                    task=task,
-                    title=title,
-                    description=description,
-                    tag_list=tag_list,
-                    thumbnail_prompts=thumbnail_prompts,
-                    config=cfg,
-                    transient_titles=current_titles,
-                    transient_descriptions=current_descriptions,
-                    transient_thumbnail_prompts=current_thumbnail_prompts,
-                    transient_tag_signatures=current_tag_signatures,
-                )
-                _save_daily_entry(
-                    generation_map_path,
-                    date_mmdd=defaults.date_mmdd,
-                    serial=task.serial,
-                    is_ypp=task.is_ypp,
-                    title=title,
-                    description=description,
-                    covers=[path.name for path in cover_paths],
-                    ab_titles=ab_titles,
-                )
-
-            if defaults.generate_text or defaults.generate_thumbnails:
-                record_used_metadata(
-                    tag=tag,
-                    title=title,
-                    description=description,
-                    tag_list=tag_list,
-                    thumbnail_prompts=thumbnail_prompts,
-                    config=cfg,
-                    serial=task.serial,
-                    date_mmdd=defaults.date_mmdd,
-                    thumbnails=cover_paths,
-                    source="metadata_refresh",
-                )
-                current_titles.append(title)
-                if description:
-                    current_descriptions.append(description)
-                current_thumbnail_prompts.extend(thumbnail_prompts)
-                if tag_list:
-                    current_tag_signatures.append(" | ".join(tag_list))
-
-            updated_channel = dict(channel)
-            updated_channel.update(
-                {
-                    "video": str(video_path),
-                    "channel_name": task.channel_name.strip() or str(channel.get("channel_name") or "").strip(),
-                    "title": title,
-                    "description": description,
-                    **_build_api_debug_payload(
-                        bundle or ({"generation_source": "api"} if (defaults.generate_text or defaults.generate_thumbnails) else {}),
+            try:
+                if defaults.metadata_mode == "prompt_api" and (defaults.generate_text or defaults.generate_thumbnails):
+                    if control:
+                        control.check_cancelled()
+                        control.wait_if_paused(log=log, label=f"{tag}/{task.serial} 文案生成")
+                    generated = _generate_prompt_metadata(
+                        tag=tag,
+                        task=task,
+                        defaults=defaults,
+                        config=cfg,
                         unique_seed=unique_seed,
-                    ),
-                    "content_template_name": str((((bundle or {}).get("content_template") or {}).get("name")) or ""),
-                    "thumbnails": [str(path) for path in cover_paths],
-                    "thumbnail_source": cover_source or "existing",
-                    "thumbnail_prompt_source": "api_text" if thumbnail_prompts else "",
-                    "thumbnail_prompts": thumbnail_prompts,
-                    "tag_list": tag_list,
-                    "is_ypp": bool(task.is_ypp),
-                    "ab_titles": ab_titles,
-                    "set": int(channel.get("set") or 1),
-                    "upload_options": _build_upload_options(task),
-                }
-            )
-            if source_image:
-                updated_channel["source_image"] = str(source_image)
-            if source_audio:
-                updated_channel["source_audio"] = str(source_audio)
-            channels[str(task.serial)] = updated_channel
+                        title_fallback=title or video_path.stem,
+                        description_fallback=description,
+                        used_titles=[*(history_scope.get("titles") or []), *current_titles],
+                        used_descriptions=[*(history_scope.get("descriptions") or []), *current_descriptions],
+                        used_thumbnail_prompts=[*(history_scope.get("thumbnail_prompts") or []), *current_thumbnail_prompts],
+                        used_tag_signatures=[*(history_scope.get("tag_signatures") or []), *current_tag_signatures],
+                        log=log,
+                    )
+                    bundle = generated["bundle"]
+                    log(
+                        f"[文案] {tag}/{task.serial}: API={bundle['api_preset'].get('name', '')} | "
+                        f"模板={bundle['content_template'].get('name', '')} | "
+                        f"来源={bundle.get('generation_source', 'unknown')} | 重试={generated['attempts']}"
+                    )
+                    thumbnail_prompts = list(generated["thumbnail_prompts"])
+                    if defaults.generate_text:
+                        title = generated["title"]
+                        description = generated["description"]
+                        if not task.tag_list:
+                            tag_list = list(generated["tag_list"])
+                        if task.is_ypp and not task.ab_titles:
+                            ab_titles = list(generated["ab_titles"])
+
+                if defaults.generate_text and not bundle:
+                    raise RuntimeError(f"{tag}/{task.serial} text generation requires API result, but no API bundle is available.")
+
+                cover_count = 3 if task.is_ypp else 1
+                if defaults.generate_thumbnails and not task.thumbnails:
+                    cover_paths, cover_source = _generate_thumbnail_covers(
+                        bundle=bundle,
+                        thumbnail_prompts=thumbnail_prompts,
+                        source_image=source_image,
+                        target_dir=tag_metadata_dir,
+                        date_mmdd=defaults.date_mmdd,
+                        serial=task.serial,
+                        cover_count=cover_count,
+                        tag=tag,
+                        control=control,
+                        log=log,
+                    )
+
+                if cover_paths:
+                    log(
+                        f"[封面] {tag}/{task.serial}: 来源={cover_source or 'existing'} | "
+                        f"{', '.join(str(path) for path in cover_paths[:3])}"
+                    )
+
+                if cover_paths:
+                    thumb_preview = ", ".join(str(path) for path in cover_paths[:3])
+                    log(f"[thumb] {tag}/{task.serial}: source={cover_source or 'existing'} | {thumb_preview}")
+
+                if defaults.generate_text or defaults.generate_thumbnails:
+                    _assert_api_metadata_is_unique(
+                        tag=tag,
+                        task=task,
+                        title=title,
+                        description=description,
+                        tag_list=tag_list,
+                        thumbnail_prompts=thumbnail_prompts,
+                        config=cfg,
+                        transient_titles=current_titles,
+                        transient_descriptions=current_descriptions,
+                        transient_thumbnail_prompts=current_thumbnail_prompts,
+                        transient_tag_signatures=current_tag_signatures,
+                    )
+                    _save_daily_entry(
+                        generation_map_path,
+                        date_mmdd=defaults.date_mmdd,
+                        serial=task.serial,
+                        is_ypp=task.is_ypp,
+                        title=title,
+                        description=description,
+                        covers=[path.name for path in cover_paths],
+                        ab_titles=ab_titles,
+                    )
+
+                if defaults.generate_text or defaults.generate_thumbnails:
+                    record_used_metadata(
+                        tag=tag,
+                        title=title,
+                        description=description,
+                        tag_list=tag_list,
+                        thumbnail_prompts=thumbnail_prompts,
+                        config=cfg,
+                        serial=task.serial,
+                        date_mmdd=defaults.date_mmdd,
+                        thumbnails=cover_paths,
+                        source="metadata_refresh",
+                    )
+                    current_titles.append(title)
+                    if description:
+                        current_descriptions.append(description)
+                    current_thumbnail_prompts.extend(thumbnail_prompts)
+                    if tag_list:
+                        current_tag_signatures.append(" | ".join(tag_list))
+
+                updated_channel = dict(channel)
+                updated_channel.update(
+                    {
+                        "video": str(video_path),
+                        "channel_name": task.channel_name.strip() or str(channel.get("channel_name") or "").strip(),
+                        "title": title,
+                        "description": description,
+                        **_build_api_debug_payload(
+                            bundle or ({"generation_source": "api"} if (defaults.generate_text or defaults.generate_thumbnails) else {}),
+                            unique_seed=unique_seed,
+                        ),
+                        "content_template_name": str((((bundle or {}).get("content_template") or {}).get("name")) or ""),
+                        "thumbnails": [str(path) for path in cover_paths],
+                        "thumbnail_source": cover_source or "existing",
+                        "thumbnail_prompt_source": "api_text" if thumbnail_prompts else "",
+                        "thumbnail_prompts": thumbnail_prompts,
+                        "tag_list": tag_list,
+                        "is_ypp": bool(task.is_ypp),
+                        "ab_titles": ab_titles,
+                        "set": int(channel.get("set") or 1),
+                        "upload_options": _build_upload_options(task),
+                    }
+                )
+                if source_image:
+                    updated_channel["source_image"] = str(source_image)
+                if source_audio:
+                    updated_channel["source_audio"] = str(source_audio)
+                channels[str(task.serial)] = updated_channel
+            except Exception as exc:
+                log(f"[错误] {tag}/{task.serial} 文案/封面阶段失败，已跳过当前视频，其它视频继续处理: {exc}")
+                continue
 
         manifest["date"] = defaults.date_mmdd
         manifest["tag"] = tag
@@ -2142,146 +2145,152 @@ def execute_metadata_only_workflow(
                 cover_source = "source_image"
             thumbnail_prompts: list[str] = []
             bundle = None
+            item_failed = False
+            try:
+                if defaults.metadata_mode == "prompt_api" and (defaults.generate_text or defaults.generate_thumbnails):
+                    if control:
+                        control.check_cancelled()
+                        control.wait_if_paused(log=log, label=f"{tag}/{task.serial} 文案生成")
+                    generated = _generate_prompt_metadata(
+                        tag=tag,
+                        task=task,
+                        defaults=defaults,
+                        config=config,
+                        unique_seed=unique_seed,
+                        title_fallback=title or existing_video.stem,
+                        description_fallback=description,
+                        used_titles=[*(history_scope.get("titles") or []), *state["titles"]],
+                        used_descriptions=[*(history_scope.get("descriptions") or []), *state["descriptions"]],
+                        used_thumbnail_prompts=[*(history_scope.get("thumbnail_prompts") or []), *state["thumbnail_prompts"]],
+                        used_tag_signatures=[*(history_scope.get("tag_signatures") or []), *state["tag_signatures"]],
+                        log=log,
+                    )
+                    bundle = generated["bundle"]
+                    log(
+                        f"[文案] {tag}/{task.serial}: API={bundle['api_preset'].get('name', '')} | "
+                        f"模板={bundle['content_template'].get('name', '')} | "
+                        f"来源={bundle.get('generation_source', 'unknown')} | 重试={generated['attempts']}"
+                    )
+                    if defaults.generate_text:
+                        title = generated["title"]
+                        description = generated["description"]
+                        if not tag_list:
+                            tag_list = list(generated["tag_list"])
+                        if task.is_ypp and not ab_titles:
+                            ab_titles = list(generated["ab_titles"])
+                    thumbnail_prompts = list(generated["thumbnail_prompts"])
 
-            if defaults.metadata_mode == "prompt_api" and (defaults.generate_text or defaults.generate_thumbnails):
-                if control:
-                    control.check_cancelled()
-                    control.wait_if_paused(log=log, label=f"{tag}/{task.serial} 文案生成")
-                generated = _generate_prompt_metadata(
-                    tag=tag,
-                    task=task,
-                    defaults=defaults,
-                    config=config,
-                    unique_seed=unique_seed,
-                    title_fallback=title or existing_video.stem,
-                    description_fallback=description,
-                    used_titles=[*(history_scope.get("titles") or []), *state["titles"]],
-                    used_descriptions=[*(history_scope.get("descriptions") or []), *state["descriptions"]],
-                    used_thumbnail_prompts=[*(history_scope.get("thumbnail_prompts") or []), *state["thumbnail_prompts"]],
-                    used_tag_signatures=[*(history_scope.get("tag_signatures") or []), *state["tag_signatures"]],
-                    log=log,
-                )
-                bundle = generated["bundle"]
-                log(
-                    f"[文案] {tag}/{task.serial}: API={bundle['api_preset'].get('name', '')} | "
-                    f"模板={bundle['content_template'].get('name', '')} | "
-                    f"来源={bundle.get('generation_source', 'unknown')} | 重试={generated['attempts']}"
-                )
-                if defaults.generate_text:
-                    title = generated["title"]
-                    description = generated["description"]
-                    if not tag_list:
-                        tag_list = list(generated["tag_list"])
-                    if task.is_ypp and not ab_titles:
-                        ab_titles = list(generated["ab_titles"])
-                thumbnail_prompts = list(generated["thumbnail_prompts"])
+                if defaults.generate_text and not bundle:
+                    raise RuntimeError(f"{tag}/{task.serial} text generation requires API result, but no API bundle is available.")
 
-            if defaults.generate_text and not bundle:
-                raise RuntimeError(f"{tag}/{task.serial} text generation requires API result, but no API bundle is available.")
+                if defaults.generate_thumbnails:
+                    cover_count = 3 if task.is_ypp else 1
+                    cover_paths, cover_source = _generate_thumbnail_covers(
+                        bundle=bundle,
+                        thumbnail_prompts=thumbnail_prompts,
+                        source_image=source_image,
+                        target_dir=Path(state["metadata_dir"]),
+                        date_mmdd=defaults.date_mmdd,
+                        serial=task.serial,
+                        cover_count=cover_count,
+                        tag=tag,
+                        control=control,
+                        log=log,
+                    )
 
-            if defaults.generate_thumbnails:
-                cover_count = 3 if task.is_ypp else 1
-                cover_paths, cover_source = _generate_thumbnail_covers(
-                    bundle=bundle,
-                    thumbnail_prompts=thumbnail_prompts,
-                    source_image=source_image,
-                    target_dir=Path(state["metadata_dir"]),
+                if cover_paths:
+                    thumb_preview = ", ".join(str(path) for path in cover_paths[:3])
+                    log(f"[thumb] {tag}/{task.serial}: source={cover_source or 'existing'} | {thumb_preview}")
+
+                if defaults.generate_text or defaults.generate_thumbnails:
+                    _assert_api_metadata_is_unique(
+                        tag=tag,
+                        task=task,
+                        title=title,
+                        description=description,
+                        tag_list=tag_list,
+                        thumbnail_prompts=thumbnail_prompts,
+                        config=config,
+                        transient_titles=state["titles"],
+                        transient_descriptions=state["descriptions"],
+                        transient_thumbnail_prompts=state["thumbnail_prompts"],
+                        transient_tag_signatures=state["tag_signatures"],
+                    )
+
+                _save_daily_entry(
+                    state["generation_map_path"],
                     date_mmdd=defaults.date_mmdd,
                     serial=task.serial,
-                    cover_count=cover_count,
-                    tag=tag,
-                    control=control,
-                    log=log,
+                    is_ypp=task.is_ypp,
+                    title=title,
+                    description=description,
+                    covers=[path.name for path in cover_paths],
+                    ab_titles=ab_titles,
                 )
-
-            if cover_paths:
-                thumb_preview = ", ".join(str(path) for path in cover_paths[:3])
-                log(f"[thumb] {tag}/{task.serial}: source={cover_source or 'existing'} | {thumb_preview}")
-
-            if defaults.generate_text or defaults.generate_thumbnails:
-                _assert_api_metadata_is_unique(
+                record_used_metadata(
                     tag=tag,
-                    task=task,
                     title=title,
                     description=description,
                     tag_list=tag_list,
                     thumbnail_prompts=thumbnail_prompts,
                     config=config,
-                    transient_titles=state["titles"],
-                    transient_descriptions=state["descriptions"],
-                    transient_thumbnail_prompts=state["thumbnail_prompts"],
-                    transient_tag_signatures=state["tag_signatures"],
-                )
-
-            _save_daily_entry(
-                state["generation_map_path"],
-                date_mmdd=defaults.date_mmdd,
-                serial=task.serial,
-                is_ypp=task.is_ypp,
-                title=title,
-                description=description,
-                covers=[path.name for path in cover_paths],
-                ab_titles=ab_titles,
-            )
-            record_used_metadata(
-                tag=tag,
-                title=title,
-                description=description,
-                tag_list=tag_list,
-                thumbnail_prompts=thumbnail_prompts,
-                config=config,
-                serial=task.serial,
-                date_mmdd=defaults.date_mmdd,
-                thumbnails=cover_paths,
-                source="metadata_only",
-            )
-            state["titles"].append(title)
-            if description:
-                state["descriptions"].append(description)
-            state["thumbnail_prompts"].extend(thumbnail_prompts)
-            if tag_list:
-                state["tag_signatures"].append(" | ".join(tag_list))
-
-            if existing_video:
-                updated_channel = {
-                    "video": str(existing_video),
-                    "effect_desc": str(channel.get("effect_desc") or ""),
-                    "channel_name": task.channel_name.strip() or str(channel.get("channel_name") or "").strip(),
-                    "title": title,
-                    "description": description,
-                    **_build_api_debug_payload(
-                        bundle or ({"generation_source": "api"} if (defaults.generate_text or defaults.generate_thumbnails) else {}),
-                        unique_seed=unique_seed,
-                    ),
-                    "content_template_name": str((((bundle or {}).get("content_template") or {}).get("name")) or ""),
-                    "thumbnails": [str(path) for path in cover_paths],
-                    "thumbnail_source": cover_source or "existing",
-                    "thumbnail_prompt_source": "api_text" if thumbnail_prompts else "",
-                    "thumbnail_prompts": thumbnail_prompts,
-                    "tag_list": tag_list,
-                    "is_ypp": bool(task.is_ypp),
-                    "ab_titles": ab_titles,
-                    "set": 1,
-                    "upload_options": _build_upload_options(task),
-                }
-                if source_image:
-                    updated_channel["source_image"] = str(source_image)
-                if source_audio:
-                    updated_channel["source_audio"] = str(source_audio)
-                state["channels"][str(task.serial)] = updated_channel
-                manifest_path = _write_manifest(
-                    output_dir=Path(state["output_dir"]),
+                    serial=task.serial,
                     date_mmdd=defaults.date_mmdd,
-                    tag=str(state["tag"]),
-                    channels=dict(state["channels"]),
-                    source_label="metadata_only",
+                    thumbnails=cover_paths,
+                    source="metadata_only",
                 )
-                manifest_path_text = str(manifest_path)
-                if manifest_path_text not in result.manifest_paths:
-                    result.manifest_paths.append(manifest_path_text)
-                log(f"[清单] {state['tag']} metadata manifest 已更新: {manifest_path}")
-                if on_item_ready:
-                    on_item_ready(task, Path(state["output_dir"]), manifest_path)
+                state["titles"].append(title)
+                if description:
+                    state["descriptions"].append(description)
+                state["thumbnail_prompts"].extend(thumbnail_prompts)
+                if tag_list:
+                    state["tag_signatures"].append(" | ".join(tag_list))
+
+                if existing_video:
+                    updated_channel = {
+                        "video": str(existing_video),
+                        "effect_desc": str(channel.get("effect_desc") or ""),
+                        "channel_name": task.channel_name.strip() or str(channel.get("channel_name") or "").strip(),
+                        "title": title,
+                        "description": description,
+                        **_build_api_debug_payload(
+                            bundle or ({"generation_source": "api"} if (defaults.generate_text or defaults.generate_thumbnails) else {}),
+                            unique_seed=unique_seed,
+                        ),
+                        "content_template_name": str((((bundle or {}).get("content_template") or {}).get("name")) or ""),
+                        "thumbnails": [str(path) for path in cover_paths],
+                        "thumbnail_source": cover_source or "existing",
+                        "thumbnail_prompt_source": "api_text" if thumbnail_prompts else "",
+                        "thumbnail_prompts": thumbnail_prompts,
+                        "tag_list": tag_list,
+                        "is_ypp": bool(task.is_ypp),
+                        "ab_titles": ab_titles,
+                        "set": 1,
+                        "upload_options": _build_upload_options(task),
+                    }
+                    if source_image:
+                        updated_channel["source_image"] = str(source_image)
+                    if source_audio:
+                        updated_channel["source_audio"] = str(source_audio)
+                    state["channels"][str(task.serial)] = updated_channel
+                    manifest_path = _write_manifest(
+                        output_dir=Path(state["output_dir"]),
+                        date_mmdd=defaults.date_mmdd,
+                        tag=str(state["tag"]),
+                        channels=dict(state["channels"]),
+                        source_label="metadata_only",
+                    )
+                    manifest_path_text = str(manifest_path)
+                    if manifest_path_text not in result.manifest_paths:
+                        result.manifest_paths.append(manifest_path_text)
+                    log(f"[清单] {state['tag']} metadata manifest 已更新: {manifest_path}")
+                    if on_item_ready:
+                        on_item_ready(task, Path(state["output_dir"]), manifest_path)
+            except Exception as exc:
+                item_failed = True
+                warning = f"{tag}/{task.serial} 文案/封面阶段失败，已跳过当前视频，其它视频继续处理: {exc}"
+                result.warnings.append(warning)
+                log(f"[错误] {warning}")
 
             result.items.append(
                 RenderedItem(
@@ -2298,6 +2307,9 @@ def execute_metadata_only_workflow(
                     effect_desc="metadata_only",
                 )
             )
+
+            if item_failed:
+                continue
 
     for state in tag_states.values():
         output_dir = Path(state["output_dir"])
@@ -2456,152 +2468,162 @@ def execute_direct_media_workflow(
                 source_audio.stem,
                 source_image.stem,
             )
+            metadata_failed = False
+            metadata_error = ""
+            try:
+                if defaults.metadata_mode == "prompt_api" and (defaults.generate_text or defaults.generate_thumbnails):
+                    if control:
+                        control.check_cancelled()
+                        control.wait_if_paused(log=log, label=f"{tag}/{task.serial} 文案生成")
+                    generated = _generate_prompt_metadata(
+                        tag=tag,
+                        task=task,
+                        defaults=defaults,
+                        config=config,
+                        unique_seed=unique_seed,
+                        title_fallback=title or output_video.stem,
+                        description_fallback=description,
+                        used_titles=[*(history_scope.get("titles") or []), *state["titles"]],
+                        used_descriptions=[*(history_scope.get("descriptions") or []), *state["descriptions"]],
+                        used_thumbnail_prompts=[*(history_scope.get("thumbnail_prompts") or []), *state["thumbnail_prompts"]],
+                        used_tag_signatures=[*(history_scope.get("tag_signatures") or []), *state["tag_signatures"]],
+                        log=log,
+                    )
+                    bundle = generated["bundle"]
+                    log(
+                        f"[文案] {tag}/{task.serial}: API={bundle['api_preset'].get('name', '')} | "
+                        f"模板={bundle['content_template'].get('name', '')} | "
+                        f"来源={bundle.get('generation_source', 'unknown')} | 重试={generated['attempts']}"
+                    )
+                    thumbnail_prompts = list(generated["thumbnail_prompts"])
+                    if defaults.generate_text:
+                        title = generated["title"]
+                        description = generated["description"]
+                        if not tag_list:
+                            tag_list = list(generated["tag_list"])
+                        if task.is_ypp and not ab_titles:
+                            ab_titles = list(generated["ab_titles"])
 
-            if defaults.metadata_mode == "prompt_api" and (defaults.generate_text or defaults.generate_thumbnails):
-                if control:
-                    control.check_cancelled()
-                    control.wait_if_paused(log=log, label=f"{tag}/{task.serial} 文案生成")
-                generated = _generate_prompt_metadata(
-                    tag=tag,
-                    task=task,
-                    defaults=defaults,
-                    config=config,
-                    unique_seed=unique_seed,
-                    title_fallback=title or output_video.stem,
-                    description_fallback=description,
-                    used_titles=[*(history_scope.get("titles") or []), *state["titles"]],
-                    used_descriptions=[*(history_scope.get("descriptions") or []), *state["descriptions"]],
-                    used_thumbnail_prompts=[*(history_scope.get("thumbnail_prompts") or []), *state["thumbnail_prompts"]],
-                    used_tag_signatures=[*(history_scope.get("tag_signatures") or []), *state["tag_signatures"]],
-                    log=log,
-                )
-                bundle = generated["bundle"]
-                log(
-                    f"[文案] {tag}/{task.serial}: API={bundle['api_preset'].get('name', '')} | "
-                    f"模板={bundle['content_template'].get('name', '')} | "
-                    f"来源={bundle.get('generation_source', 'unknown')} | 重试={generated['attempts']}"
-                )
-                thumbnail_prompts = list(generated["thumbnail_prompts"])
                 if defaults.generate_text:
-                    title = generated["title"]
-                    description = generated["description"]
-                    if not tag_list:
-                        tag_list = list(generated["tag_list"])
-                    if task.is_ypp and not ab_titles:
-                        ab_titles = list(generated["ab_titles"])
+                    if not bundle:
+                        raise RuntimeError(f"{tag}/{task.serial} text generation requires API result, but no API bundle is available.")
+                elif not title:
+                    title = output_video.stem
 
-            if defaults.generate_text:
-                if not bundle:
-                    raise RuntimeError(f"{tag}/{task.serial} text generation requires API result, but no API bundle is available.")
-            elif not title:
-                title = output_video.stem
+                cover_count = 3 if task.is_ypp else 1
+                if defaults.generate_thumbnails:
+                    cover_paths, cover_source = _generate_thumbnail_covers(
+                        bundle=bundle,
+                        thumbnail_prompts=thumbnail_prompts,
+                        source_image=source_image,
+                        target_dir=Path(state["metadata_dir"]),
+                        date_mmdd=defaults.date_mmdd,
+                        serial=task.serial,
+                        cover_count=cover_count,
+                        tag=tag,
+                        control=control,
+                        log=log,
+                    )
 
-            cover_count = 3 if task.is_ypp else 1
-            if defaults.generate_thumbnails:
-                cover_paths, cover_source = _generate_thumbnail_covers(
-                    bundle=bundle,
-                    thumbnail_prompts=thumbnail_prompts,
-                    source_image=source_image,
-                    target_dir=Path(state["metadata_dir"]),
-                    date_mmdd=defaults.date_mmdd,
-                    serial=task.serial,
-                    cover_count=cover_count,
+                if cover_paths:
+                    log(
+                        f"[封面] {tag}/{task.serial}: 来源={cover_source or 'existing'} | "
+                        f"{', '.join(str(path) for path in cover_paths[:3])}"
+                    )
+
+                thumb_preview = ", ".join(str(path) for path in cover_paths[:3]) if cover_paths else ""
+                if thumb_preview:
+                    log(f"[thumb] {tag}/{task.serial}: source={cover_source or 'existing'} | {thumb_preview}")
+
+                if defaults.generate_text or defaults.generate_thumbnails:
+                    _assert_api_metadata_is_unique(
+                        tag=tag,
+                        task=task,
+                        title=title,
+                        description=description,
+                        tag_list=tag_list,
+                        thumbnail_prompts=thumbnail_prompts,
+                        config=config,
+                        transient_titles=state["titles"],
+                        transient_descriptions=state["descriptions"],
+                        transient_thumbnail_prompts=state["thumbnail_prompts"],
+                        transient_tag_signatures=state["tag_signatures"],
+                    )
+                    _save_daily_entry(
+                        Path(state["generation_map_path"]),
+                        date_mmdd=defaults.date_mmdd,
+                        serial=task.serial,
+                        is_ypp=task.is_ypp,
+                        title=title,
+                        description=description,
+                        covers=[path.name for path in cover_paths],
+                        ab_titles=ab_titles,
+                    )
+
+                record_used_metadata(
                     tag=tag,
-                    control=control,
-                    log=log,
-                )
-
-            if cover_paths:
-                log(
-                    f"[封面] {tag}/{task.serial}: 来源={cover_source or 'existing'} | "
-                    f"{', '.join(str(path) for path in cover_paths[:3])}"
-                )
-
-            thumb_preview = ", ".join(str(path) for path in cover_paths[:3]) if cover_paths else ""
-            if thumb_preview:
-                log(f"[thumb] {tag}/{task.serial}: source={cover_source or 'existing'} | {thumb_preview}")
-
-            if defaults.generate_text or defaults.generate_thumbnails:
-                _assert_api_metadata_is_unique(
-                    tag=tag,
-                    task=task,
                     title=title,
                     description=description,
                     tag_list=tag_list,
                     thumbnail_prompts=thumbnail_prompts,
                     config=config,
-                    transient_titles=state["titles"],
-                    transient_descriptions=state["descriptions"],
-                    transient_thumbnail_prompts=state["thumbnail_prompts"],
-                    transient_tag_signatures=state["tag_signatures"],
-                )
-                _save_daily_entry(
-                    Path(state["generation_map_path"]),
-                    date_mmdd=defaults.date_mmdd,
                     serial=task.serial,
-                    is_ypp=task.is_ypp,
-                    title=title,
-                    description=description,
-                    covers=[path.name for path in cover_paths],
-                    ab_titles=ab_titles,
-                )
-
-            record_used_metadata(
-                tag=tag,
-                title=title,
-                description=description,
-                tag_list=tag_list,
-                thumbnail_prompts=thumbnail_prompts,
-                config=config,
-                serial=task.serial,
-                date_mmdd=defaults.date_mmdd,
-                thumbnails=cover_paths,
-                source="render",
-            )
-            state["titles"].append(title)
-            if description:
-                state["descriptions"].append(description)
-            state["thumbnail_prompts"].extend(thumbnail_prompts)
-            if tag_list:
-                state["tag_signatures"].append(" | ".join(tag_list))
-
-            state["manifest_channels"][str(task.serial)] = {
-                "video": output_video.name,
-                "source_image": str(source_image),
-                "source_audio": str(source_audio),
-                "effect_desc": effect_desc,
-                "channel_name": task.channel_name.strip(),
-                "title": title,
-                "description": description,
-                **_build_api_debug_payload(
-                    bundle or ({"generation_source": "api"} if (defaults.generate_text or defaults.generate_thumbnails) else {}),
-                    unique_seed=unique_seed,
-                ),
-                "content_template_name": str((((bundle or {}).get("content_template") or {}).get("name")) or ""),
-                "thumbnails": [str(path) for path in cover_paths],
-                "thumbnail_source": cover_source or "existing",
-                "thumbnail_prompt_source": "api_text" if thumbnail_prompts else "",
-                "thumbnail_prompts": thumbnail_prompts,
-                "tag_list": tag_list,
-                "is_ypp": bool(task.is_ypp),
-                "ab_titles": ab_titles,
-                "set": 1,
-                "upload_options": _build_upload_options(task),
-            }
-            if simulation is None or simulation.save_manifest:
-                manifest_path = _write_manifest(
-                    output_dir=Path(state["output_dir"]),
                     date_mmdd=defaults.date_mmdd,
-                    tag=str(state["tag"]),
-                    channels=dict(state["manifest_channels"]),
-                    source_label="group_bound_media",
+                    thumbnails=cover_paths,
+                    source="render",
                 )
-                manifest_path_text = str(manifest_path)
-                if manifest_path_text not in result.manifest_paths:
-                    result.manifest_paths.append(manifest_path_text)
-                log(f"[清单] {state['tag']} manifest 已写入: {manifest_path}")
-                if on_item_ready:
-                    on_item_ready(task, Path(state["output_dir"]), manifest_path)
+                state["titles"].append(title)
+                if description:
+                    state["descriptions"].append(description)
+                state["thumbnail_prompts"].extend(thumbnail_prompts)
+                if tag_list:
+                    state["tag_signatures"].append(" | ".join(tag_list))
+
+                state["manifest_channels"][str(task.serial)] = {
+                    "video": output_video.name,
+                    "source_image": str(source_image),
+                    "source_audio": str(source_audio),
+                    "effect_desc": effect_desc,
+                    "channel_name": task.channel_name.strip(),
+                    "title": title,
+                    "description": description,
+                    **_build_api_debug_payload(
+                        bundle or ({"generation_source": "api"} if (defaults.generate_text or defaults.generate_thumbnails) else {}),
+                        unique_seed=unique_seed,
+                    ),
+                    "content_template_name": str((((bundle or {}).get("content_template") or {}).get("name")) or ""),
+                    "thumbnails": [str(path) for path in cover_paths],
+                    "thumbnail_source": cover_source or "existing",
+                    "thumbnail_prompt_source": "api_text" if thumbnail_prompts else "",
+                    "thumbnail_prompts": thumbnail_prompts,
+                    "tag_list": tag_list,
+                    "is_ypp": bool(task.is_ypp),
+                    "ab_titles": ab_titles,
+                    "set": 1,
+                    "upload_options": _build_upload_options(task),
+                }
+                if simulation is None or simulation.save_manifest:
+                    manifest_path = _write_manifest(
+                        output_dir=Path(state["output_dir"]),
+                        date_mmdd=defaults.date_mmdd,
+                        tag=str(state["tag"]),
+                        channels=dict(state["manifest_channels"]),
+                        source_label="group_bound_media",
+                    )
+                    manifest_path_text = str(manifest_path)
+                    if manifest_path_text not in result.manifest_paths:
+                        result.manifest_paths.append(manifest_path_text)
+                    log(f"[清单] {state['tag']} manifest 已写入: {manifest_path}")
+                    if on_item_ready:
+                        on_item_ready(task, Path(state["output_dir"]), manifest_path)
+            except Exception as exc:
+                metadata_failed = True
+                metadata_error = str(exc)
+                warning = f"{tag}/{task.serial} 文案/封面阶段失败，已保留渲染成品并跳过该视频上传: {exc}"
+                result.warnings.append(warning)
+                log(f"[错误] {warning}")
+                if not title:
+                    title = output_video.stem
             result.items.append(
                 RenderedItem(
                     tag=tag,
@@ -2617,6 +2639,12 @@ def execute_direct_media_workflow(
                     effect_desc=effect_desc,
                 )
             )
+
+            if metadata_failed:
+                if simulation and simulation.consume_sources:
+                    _move_to_used(source_image, used_media_root, tag=tag, kind="images")
+                    _move_to_used(source_audio, used_media_root, tag=tag, kind="audio")
+                continue
 
             if simulation and simulation.consume_sources:
                 _move_to_used(source_image, used_media_root, tag=tag, kind="images")

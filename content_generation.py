@@ -173,9 +173,14 @@ def _build_openai_chat_urls(base_url: str) -> list[str]:
             ordered.append(url)
 
     parsed = urllib.parse.urlparse(clean)
+    host = str(parsed.netloc or "").strip().lower()
     path = str(parsed.path or "").strip("/")
 
-    if clean.endswith("/v1/chat/completions") or clean.endswith("/chat/completions"):
+    if host.endswith("right.codes") and clean.endswith("/chat/completions") and not clean.endswith("/v1/chat/completions"):
+        root = clean.removesuffix("/chat/completions")
+        add(f"{root}/v1/chat/completions")
+        add(clean)
+    elif clean.endswith("/v1/chat/completions") or clean.endswith("/chat/completions"):
         add(clean)
     elif clean.endswith("/v1"):
         add(f"{clean}/chat/completions")
@@ -192,6 +197,65 @@ def _build_openai_chat_urls(base_url: str) -> list[str]:
         add(f"{clean}/chat/completions")
         add(clean)
     return ordered
+
+
+def _extract_openai_response_text(data: Any) -> str:
+    if not isinstance(data, dict):
+        return ""
+
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0] if isinstance(choices[0], dict) else {}
+        message = first.get("message") if isinstance(first, dict) else {}
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, str) and content.strip():
+            return content
+        if isinstance(content, list):
+            text_parts: list[str] = []
+            for item in content:
+                if isinstance(item, str) and item.strip():
+                    text_parts.append(item.strip())
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                candidate = str(item.get("text") or item.get("content") or "").strip()
+                if candidate:
+                    text_parts.append(candidate)
+            if text_parts:
+                return "\n".join(text_parts)
+        direct_text = str(first.get("text") or "").strip()
+        if direct_text:
+            return direct_text
+
+    output_text = str(data.get("output_text") or "").strip()
+    if output_text:
+        return output_text
+
+    response_payload = data.get("response")
+    if isinstance(response_payload, dict):
+        response_text = str(response_payload.get("output_text") or "").strip()
+        if response_text:
+            return response_text
+
+    return ""
+
+
+def _describe_openai_error(*, status_code: int, data: Any, url: str) -> str:
+    if isinstance(data, dict):
+        error_payload = data.get("error")
+        if isinstance(error_payload, dict):
+            message = str(error_payload.get("message") or "").strip()
+            if message:
+                return f"{message} | url={url} | status={status_code}"
+        if error_payload:
+            return f"{error_payload} | url={url} | status={status_code}"
+        message = str(data.get("message") or "").strip()
+        if message:
+            return f"{message} | url={url} | status={status_code}"
+        raw_text = str(data.get("raw_text") or "").strip()
+        if raw_text:
+            return f"{raw_text[:240]} | url={url} | status={status_code}"
+    return f"HTTP {status_code} | url={url}"
 
 
 def _extract_data_url(value: Any) -> str | None:
@@ -236,6 +300,14 @@ def _parse_json_like(raw: str) -> dict[str, Any]:
         parsed = json.loads(cleaned[first : last + 1])
     except Exception as exc:
         raise ValueError("模型返回的 JSON 无法解析") from exc
+
+    if isinstance(parsed, dict) and isinstance(parsed.get("data"), dict):
+        wrapped = parsed.get("data") or {}
+        if any(key in wrapped for key in ("titles", "descriptions", "seoHashtags", "tagList", "thumbnails", "usedAngle")):
+            parsed = wrapped
+
+    if not isinstance(parsed, dict):
+        raise ValueError("模型返回的 JSON 不是对象")
 
     parsed["titles"] = parsed["titles"] if isinstance(parsed.get("titles"), list) else []
     parsed["descriptions"] = parsed["descriptions"] if isinstance(parsed.get("descriptions"), list) else []
@@ -1120,16 +1192,20 @@ def _call_openai_compatible(api_preset: dict, user_prompt: str, image_data_url: 
                 except Exception:
                     data = {"raw_text": response.text}
                 if response.ok:
-                    text = data.get("choices", [{}])[0].get("message", {}).get("content") or data.get("output_text")
+                    text = _extract_openai_response_text(data)
                     if text:
                         return text
-                error_payload = data.get("error") if isinstance(data, dict) else None
-                if isinstance(error_payload, dict):
-                    last_error = error_payload.get("message") or f"HTTP {response.status_code}"
-                elif error_payload:
-                    last_error = str(error_payload)
+                    last_error = _describe_openai_error(
+                        status_code=response.status_code,
+                        data=data,
+                        url=url,
+                    )
                 else:
-                    last_error = data.get("message") if isinstance(data, dict) else f"HTTP {response.status_code}"
+                    last_error = _describe_openai_error(
+                        status_code=response.status_code,
+                        data=data,
+                        url=url,
+                    )
                 if response.status_code not in retryable_codes:
                     break
             except Exception as exc:
