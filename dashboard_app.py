@@ -30,6 +30,8 @@ from effects_library import (
     list_zoom_modes,
 )
 from prompt_studio import (
+    get_bound_api_preset_name,
+    get_bound_content_template_name,
     load_prompt_studio_config,
     pick_api_preset_name,
     pick_content_template_name,
@@ -54,14 +56,17 @@ from workflow_core import (
     WindowTask,
     WorkflowDefaults,
     WorkflowCancelledError,
+    bind_group_api_preset,
+    bind_group_content_template,
     create_task,
     describe_group_bindings,
-    ensure_prompt_presets,
     get_group_bindings,
     get_group_catalog,
     get_metadata_root,
     load_prompt_settings,
     load_scheduler_settings,
+    save_api_preset,
+    save_content_template,
     save_scheduler_settings,
     save_window_plan,
     set_group_binding,
@@ -104,6 +109,7 @@ METADATA_MODE_VALUES = list(METADATA_MODE_LABELS.keys())
 SCHEDULE_TIMEZONE_VALUES = ["Asia/Taipei (+08:00)"]
 WINDOW_BUTTONS_PER_ROW = 6
 VISUAL_TOGGLE_VALUES = ["yes", "no"]
+RANDOM_OPTION = "random"
 
 
 ctk.set_appearance_mode("dark")
@@ -116,6 +122,52 @@ def _bool_from_yes_no(value: str) -> bool:
 
 def _yes_no_from_bool(value: bool) -> str:
     return "yes" if value else "no"
+
+
+def _with_random(values: list[str]) -> list[str]:
+    base = [str(item) for item in values if str(item)]
+    filtered = [item for item in base if item != RANDOM_OPTION]
+    if filtered and filtered[0].lower() == "none":
+        return [filtered[0], RANDOM_OPTION, *filtered[1:]]
+    return [RANDOM_OPTION, *filtered]
+
+
+def _with_random_first(values: list[str]) -> list[str]:
+    base = [str(item) for item in values if str(item)]
+    filtered = [item for item in base if item != RANDOM_OPTION]
+    return [RANDOM_OPTION, *filtered]
+
+
+def _split_range_value(raw: Any, default_min: Any, default_max: Any) -> tuple[str, str]:
+    value = str(raw or "").strip()
+    if not value:
+        return str(default_min), str(default_max)
+    if "-" in value:
+        left, right = value.split("-", 1)
+        left = left.strip()
+        right = right.strip()
+        if not left and not right:
+            return str(default_min), str(default_max)
+        if not left:
+            left = right
+        if not right:
+            right = left
+        return left, right
+    return value, value
+
+
+def _compose_range_value(min_value: str, max_value: str, fallback: Any) -> str:
+    min_text = str(min_value or "").strip()
+    max_text = str(max_value or "").strip()
+    if not min_text and not max_text:
+        return str(fallback)
+    if not min_text:
+        min_text = max_text
+    if not max_text:
+        max_text = min_text
+    if min_text == max_text:
+        return min_text
+    return f"{min_text}-{max_text}"
 
 
 def _today_mmdd() -> str:
@@ -257,7 +309,7 @@ class DashboardApp(ctk.CTk):
         self._build_layout()
         self._refresh_groups()
         self._refresh_prompt_dropdowns()
-        self._load_prompt_for_group()
+        self._sync_prompt_selection_from_group()
         self._refresh_task_tree()
         self._refresh_bindings_box()
         self._bind_variable_events()
@@ -290,7 +342,7 @@ class DashboardApp(ctk.CTk):
         )
         self.date_var = ctk.StringVar(value=state.get("date_mmdd", _today_mmdd()))
         self.simulate_seconds_var = ctk.StringVar(value=str(state.get("simulate_seconds", 90)))
-        self.randomize_effects_var = ctk.BooleanVar(value=bool(state.get("randomize_effects", True)))
+        self.randomize_effects_var = ctk.BooleanVar(value=False)
         visual_cfg = dict(self.scheduler_config.get("visual_settings") or {})
         self.visual_spectrum_var = ctk.StringVar(value=str(state.get("visual_spectrum", visual_cfg.get("spectrum", "yes"))))
         self.visual_timeline_var = ctk.StringVar(value=str(state.get("visual_timeline", visual_cfg.get("timeline", "yes"))))
@@ -301,20 +353,56 @@ class DashboardApp(ctk.CTk):
         self.visual_color_timeline_var = ctk.StringVar(value=str(state.get("visual_color_timeline", visual_cfg.get("color_timeline", "WhiteGold"))))
         self.visual_spectrum_y_var = ctk.StringVar(value=str(state.get("visual_spectrum_y", visual_cfg.get("spectrum_y", 530))))
         self.visual_spectrum_x_var = ctk.StringVar(value=str(state.get("visual_spectrum_x", visual_cfg.get("spectrum_x", -1))))
-        self.visual_spectrum_w_var = ctk.StringVar(value=str(state.get("visual_spectrum_w", visual_cfg.get("spectrum_w", 1200))))
+        spectrum_w_min, spectrum_w_max = _split_range_value(
+            state.get("visual_spectrum_w", visual_cfg.get("spectrum_w", 1200)),
+            1200,
+            1200,
+        )
+        self.visual_spectrum_w_min_var = ctk.StringVar(value=spectrum_w_min)
+        self.visual_spectrum_w_max_var = ctk.StringVar(value=spectrum_w_max)
         self.visual_film_grain_var = ctk.StringVar(value=str(state.get("visual_film_grain", visual_cfg.get("film_grain", "no"))))
-        self.visual_grain_strength_var = ctk.StringVar(value=str(state.get("visual_grain_strength", visual_cfg.get("grain_strength", 15))))
+        grain_strength_min, grain_strength_max = _split_range_value(
+            state.get("visual_grain_strength", visual_cfg.get("grain_strength", 15)),
+            15,
+            15,
+        )
+        self.visual_grain_strength_min_var = ctk.StringVar(value=grain_strength_min)
+        self.visual_grain_strength_max_var = ctk.StringVar(value=grain_strength_max)
         self.visual_vignette_var = ctk.StringVar(value=str(state.get("visual_vignette", visual_cfg.get("vignette", "no"))))
         self.visual_tint_var = ctk.StringVar(value=str(state.get("visual_tint", visual_cfg.get("color_tint", "none"))))
         self.visual_soft_focus_var = ctk.StringVar(value=str(state.get("visual_soft_focus", visual_cfg.get("soft_focus", "no"))))
-        self.visual_soft_focus_sigma_var = ctk.StringVar(value=str(state.get("visual_soft_focus_sigma", visual_cfg.get("soft_focus_sigma", 1.5))))
+        soft_focus_min, soft_focus_max = _split_range_value(
+            state.get("visual_soft_focus_sigma", visual_cfg.get("soft_focus_sigma", 1.5)),
+            1.5,
+            1.5,
+        )
+        self.visual_soft_focus_sigma_min_var = ctk.StringVar(value=soft_focus_min)
+        self.visual_soft_focus_sigma_max_var = ctk.StringVar(value=soft_focus_max)
         self.visual_particle_var = ctk.StringVar(value=str(state.get("visual_particle", visual_cfg.get("particle", "none"))))
-        self.visual_particle_opacity_var = ctk.StringVar(value=str(state.get("visual_particle_opacity", visual_cfg.get("particle_opacity", 0.6))))
-        self.visual_particle_speed_var = ctk.StringVar(value=str(state.get("visual_particle_speed", visual_cfg.get("particle_speed", 1.0))))
+        particle_opacity_min, particle_opacity_max = _split_range_value(
+            state.get("visual_particle_opacity", visual_cfg.get("particle_opacity", 0.6)),
+            0.6,
+            0.6,
+        )
+        self.visual_particle_opacity_min_var = ctk.StringVar(value=particle_opacity_min)
+        self.visual_particle_opacity_max_var = ctk.StringVar(value=particle_opacity_max)
+        particle_speed_min, particle_speed_max = _split_range_value(
+            state.get("visual_particle_speed", visual_cfg.get("particle_speed", 1.0)),
+            1.0,
+            1.0,
+        )
+        self.visual_particle_speed_min_var = ctk.StringVar(value=particle_speed_min)
+        self.visual_particle_speed_max_var = ctk.StringVar(value=particle_speed_max)
         self.visual_text_var = ctk.StringVar(value=str(state.get("visual_text", visual_cfg.get("text", ""))))
         self.visual_text_font_var = ctk.StringVar(value=str(state.get("visual_text_font", visual_cfg.get("text_font", "default"))))
         self.visual_text_pos_var = ctk.StringVar(value=str(state.get("visual_text_pos", visual_cfg.get("text_pos", "center"))))
-        self.visual_text_size_var = ctk.StringVar(value=str(state.get("visual_text_size", visual_cfg.get("text_size", 60))))
+        text_size_min, text_size_max = _split_range_value(
+            state.get("visual_text_size", visual_cfg.get("text_size", 60)),
+            60,
+            60,
+        )
+        self.visual_text_size_min_var = ctk.StringVar(value=text_size_min)
+        self.visual_text_size_max_var = ctk.StringVar(value=text_size_max)
         self.visual_text_style_var = ctk.StringVar(value=str(state.get("visual_text_style", visual_cfg.get("text_style", "Classic"))))
         self.generate_text_var = ctk.BooleanVar(value=bool(state.get("generate_text", True)))
         self.generate_thumbnails_var = ctk.BooleanVar(value=bool(state.get("generate_thumbnails", True)))
@@ -521,7 +609,7 @@ class DashboardApp(ctk.CTk):
     def _bind_variable_events(self) -> None:
         self.current_group_var.trace_add("write", lambda *_: self._refresh_window_buttons())
         self.binding_group_var.trace_add("write", lambda *_: self.binding_folder_var.set(get_group_bindings(self.scheduler_config).get(self.binding_group_var.get(), "")))
-        self.prompt_group_var.trace_add("write", lambda *_: self._load_prompt_for_group())
+        self.prompt_group_var.trace_add("write", lambda *_: self._sync_prompt_selection_from_group())
         self.run_metadata_var.trace_add("write", lambda *_: self._preview_plan())
         self.run_render_var.trace_add("write", lambda *_: self._preview_plan())
         self.run_upload_var.trace_add("write", lambda *_: self._preview_plan())
@@ -760,7 +848,10 @@ class DashboardApp(ctk.CTk):
         )
         ctk.CTkLabel(
             intro,
-            text="关闭随机视觉特效后，下面这些手动参数才会生效。这里改的是渲染特效，不影响上传规则。",
+            text=(
+                "这里改的是渲染特效，不影响上传规则。涉及“有没有”的开关仍按你手动勾选执行；"
+                "只有你选成 random 的样式、配色、贴纸、字体和数值区间，才会按每个视频单独随机。"
+            ),
             text_color="#b8c1cc",
             justify="left",
         ).grid(row=1, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 14))
@@ -775,11 +866,11 @@ class DashboardApp(ctk.CTk):
         self._entry_row(basic, 1, "频谱", self.visual_spectrum_var, values=VISUAL_TOGGLE_VALUES)
         self._entry_row(basic, 2, "时间轴", self.visual_timeline_var, values=VISUAL_TOGGLE_VALUES)
         self._entry_row(basic, 3, "黑边", self.visual_letterbox_var, values=VISUAL_TOGGLE_VALUES)
-        self._entry_row(basic, 4, "镜头缩放", self.visual_zoom_var, values=list_zoom_modes())
-        self._entry_row(basic, 5, "频谱样式", self.visual_style_var, values=list_effects())
+        self._entry_row(basic, 4, "镜头缩放", self.visual_zoom_var, values=_with_random(list_zoom_modes()))
+        self._entry_row(basic, 5, "频谱样式", self.visual_style_var, values=_with_random(list_effects()))
         self._entry_row(basic, 6, "频谱 Y", self.visual_spectrum_y_var)
         self._entry_row(basic, 7, "频谱 X (-1=居中)", self.visual_spectrum_x_var)
-        self._entry_row(basic, 8, "频谱宽度", self.visual_spectrum_w_var)
+        self._range_row(basic, 8, "频谱宽度", self.visual_spectrum_w_min_var, self.visual_spectrum_w_max_var)
 
         mood = ctk.CTkFrame(tab)
         mood.grid(row=2, column=0, sticky="ew", padx=8, pady=8)
@@ -788,14 +879,20 @@ class DashboardApp(ctk.CTk):
         ctk.CTkLabel(mood, text="色彩与氛围", font=ctk.CTkFont(size=22, weight="bold")).grid(
             row=0, column=0, columnspan=4, sticky="w", padx=16, pady=(14, 12)
         )
-        self._entry_row(mood, 1, "频谱配色", self.visual_color_spectrum_var, values=list_palette_names())
-        self._entry_row(mood, 2, "时间轴配色", self.visual_color_timeline_var, values=list_palette_names())
+        self._entry_row(mood, 1, "频谱配色", self.visual_color_spectrum_var, values=_with_random(list_palette_names()))
+        self._entry_row(mood, 2, "时间轴配色", self.visual_color_timeline_var, values=_with_random(list_palette_names()))
         self._entry_row(mood, 3, "胶片颗粒", self.visual_film_grain_var, values=VISUAL_TOGGLE_VALUES)
-        self._entry_row(mood, 4, "颗粒强度", self.visual_grain_strength_var)
+        self._range_row(mood, 4, "颗粒强度", self.visual_grain_strength_min_var, self.visual_grain_strength_max_var)
         self._entry_row(mood, 5, "暗角", self.visual_vignette_var, values=VISUAL_TOGGLE_VALUES)
-        self._entry_row(mood, 6, "色调", self.visual_tint_var, values=list_tint_names())
+        self._entry_row(mood, 6, "色调", self.visual_tint_var, values=_with_random(list_tint_names()))
         self._entry_row(mood, 7, "柔焦", self.visual_soft_focus_var, values=VISUAL_TOGGLE_VALUES)
-        self._entry_row(mood, 8, "柔焦强度", self.visual_soft_focus_sigma_var)
+        self._range_row(
+            mood,
+            8,
+            "柔焦强度",
+            self.visual_soft_focus_sigma_min_var,
+            self.visual_soft_focus_sigma_max_var,
+        )
 
         overlay = ctk.CTkFrame(tab)
         overlay.grid(row=3, column=0, sticky="ew", padx=8, pady=8)
@@ -804,14 +901,32 @@ class DashboardApp(ctk.CTk):
         ctk.CTkLabel(overlay, text="贴纸 / 粒子 / 叠字", font=ctk.CTkFont(size=22, weight="bold")).grid(
             row=0, column=0, columnspan=4, sticky="w", padx=16, pady=(14, 12)
         )
-        self._entry_row(overlay, 1, "贴纸 / 粒子", self.visual_particle_var, values=list_particle_effects())
-        self._entry_row(overlay, 2, "贴纸透明度", self.visual_particle_opacity_var)
-        self._entry_row(overlay, 3, "贴纸速度", self.visual_particle_speed_var)
+        self._entry_row(
+            overlay,
+            1,
+            "贴纸 / 粒子",
+            self.visual_particle_var,
+            values=_with_random_first(list_particle_effects()),
+        )
+        self._range_row(
+            overlay,
+            2,
+            "贴纸透明度",
+            self.visual_particle_opacity_min_var,
+            self.visual_particle_opacity_max_var,
+        )
+        self._range_row(
+            overlay,
+            3,
+            "贴纸速度",
+            self.visual_particle_speed_min_var,
+            self.visual_particle_speed_max_var,
+        )
         self._entry_row(overlay, 4, "叠字内容", self.visual_text_var)
-        self._entry_row(overlay, 5, "字体", self.visual_text_font_var, values=list_font_names())
-        self._entry_row(overlay, 6, "文字位置", self.visual_text_pos_var, values=list_text_positions())
-        self._entry_row(overlay, 7, "文字大小", self.visual_text_size_var)
-        self._entry_row(overlay, 8, "文字样式", self.visual_text_style_var, values=list_text_styles())
+        self._entry_row(overlay, 5, "字体", self.visual_text_font_var, values=_with_random(list_font_names()))
+        self._entry_row(overlay, 6, "文字位置", self.visual_text_pos_var, values=_with_random(list_text_positions()))
+        self._range_row(overlay, 7, "文字大小", self.visual_text_size_min_var, self.visual_text_size_max_var)
+        self._entry_row(overlay, 8, "文字样式", self.visual_text_style_var, values=_with_random(list_text_styles()))
 
         help_frame = ctk.CTkFrame(tab)
         help_frame.grid(row=4, column=0, sticky="ew", padx=8, pady=(8, 16))
@@ -824,7 +939,9 @@ class DashboardApp(ctk.CTk):
             text=(
                 "1. 把新的 mp4 / mov / webm / mkv 叠层素材直接放进 overlays 文件夹。\n"
                 "2. 重开控制台后，新文件名会自动出现在“贴纸 / 粒子”下拉里。\n"
-                "3. 如果要新增真正的新滤镜，再扩 effects_library.py 里的 get_effect。"
+                "3. 想按视频随机时，把下拉切成 random；像频谱宽度、颗粒强度、贴纸透明度、贴纸速度、文字大小，"
+                "现在直接填左边最小值、右边最大值，系统会按每个视频单独随机。\n"
+                "4. 如果要新增真正的新滤镜，再扩 effects_library.py 里的 get_effect。"
             ),
             text_color="#b8c1cc",
             justify="left",
@@ -941,63 +1058,6 @@ class DashboardApp(ctk.CTk):
         self.audience_result_box = ctk.CTkTextbox(audience_frame, height=140)
         self.audience_result_box.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 14))
 
-    def _build_paths_tab(self) -> None:
-        tab = self.tabview.tab("路径配置")
-        tab.grid_columnconfigure(0, weight=1)
-        tab.grid_rowconfigure(1, weight=1)
-
-        path_frame = ctk.CTkFrame(tab)
-        path_frame.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
-        path_frame.grid_columnconfigure(0, weight=0)
-        path_frame.grid_columnconfigure(1, weight=1)
-        path_frame.grid_columnconfigure(2, weight=1)
-        path_frame.grid_columnconfigure(3, weight=1)
-        ctk.CTkLabel(path_frame, text="全局路径", font=ctk.CTkFont(size=24, weight="bold")).grid(
-            row=0, column=0, sticky="w", padx=16, pady=(14, 12)
-        )
-        for row, (label, var) in enumerate(
-            [
-                ("音乐目录", self.music_dir_var),
-                ("底图目录", self.base_image_dir_var),
-                ("输出目录", self.output_root_var),
-                ("FFmpeg", self.ffmpeg_var),
-                ("已用素材目录", self.used_media_root_var),
-                ("上传后保留天数", self.cleanup_days_var),
-            ],
-            start=1,
-        ):
-            self._entry_row(path_frame, row, label, var)
-        ctk.CTkButton(path_frame, text="保存路径配置", command=self._save_paths).grid(
-            row=7, column=0, columnspan=4, sticky="w", padx=16, pady=(0, 14)
-        )
-
-        binding_frame = ctk.CTkFrame(tab)
-        binding_frame.grid(row=1, column=0, sticky="nsew", padx=16, pady=(8, 16))
-        for column in range(4):
-            binding_frame.grid_columnconfigure(column, weight=1)
-        binding_frame.grid_rowconfigure(5, weight=1)
-        ctk.CTkLabel(binding_frame, text="分组绑定素材文件夹", font=ctk.CTkFont(size=24, weight="bold")).grid(
-            row=0, column=0, columnspan=4, sticky="w", padx=16, pady=(14, 12)
-        )
-        ctk.CTkLabel(binding_frame, text="分组").grid(row=1, column=0, sticky="w", padx=(16, 8), pady=(0, 6))
-        self.binding_group_menu = ctk.CTkOptionMenu(binding_frame, variable=self.binding_group_var, values=[""])
-        self.binding_group_menu.grid(row=2, column=0, sticky="ew", padx=(16, 8), pady=(0, 12))
-        ctk.CTkLabel(binding_frame, text="绑定目录").grid(row=1, column=1, sticky="w", padx=8, pady=(0, 6))
-        ctk.CTkEntry(binding_frame, textvariable=self.binding_folder_var).grid(
-            row=2, column=1, columnspan=2, sticky="ew", padx=8, pady=(0, 12)
-        )
-        ctk.CTkButton(binding_frame, text="选择目录", command=self._pick_binding_folder).grid(
-            row=2, column=3, sticky="ew", padx=(8, 16), pady=(0, 12)
-        )
-        bar = ctk.CTkFrame(binding_frame, fg_color="transparent")
-        bar.grid(row=3, column=0, columnspan=4, sticky="ew", padx=10, pady=(0, 8))
-        ctk.CTkButton(bar, text="保存绑定", command=self._save_binding).pack(side="left", padx=6)
-        ctk.CTkButton(bar, text="移除绑定", command=self._remove_binding).pack(side="left", padx=6)
-        ctk.CTkButton(bar, text="刷新分组列表", command=self._refresh_groups).pack(side="left", padx=6)
-        ctk.CTkLabel(binding_frame, text="当前绑定一览").grid(row=4, column=0, sticky="w", padx=16, pady=(0, 6))
-        self.binding_box = ctk.CTkTextbox(binding_frame, height=220)
-        self.binding_box.grid(row=5, column=0, columnspan=4, sticky="nsew", padx=16, pady=(0, 14))
-
     def _build_log_tab(self) -> None:
         tab = self.tabview.tab("日志")
         tab.grid_columnconfigure(0, weight=1)
@@ -1025,6 +1085,23 @@ class DashboardApp(ctk.CTk):
             widget = ctk.CTkEntry(parent, textvariable=variable, show=show or "")
         widget.grid(row=row, column=1, columnspan=3, sticky="ew", padx=16, pady=(0, 12))
 
+    def _range_row(
+        self,
+        parent: ctk.CTkFrame,
+        row: int,
+        label: str,
+        min_var: ctk.StringVar,
+        max_var: ctk.StringVar,
+    ) -> None:
+        ctk.CTkLabel(parent, text=label).grid(row=row, column=0, sticky="w", padx=16, pady=(0, 6))
+        ctk.CTkEntry(parent, textvariable=min_var, placeholder_text="最小值").grid(
+            row=row, column=1, sticky="ew", padx=(16, 8), pady=(0, 12)
+        )
+        ctk.CTkLabel(parent, text="到").grid(row=row, column=2, sticky="ew", padx=4, pady=(0, 12))
+        ctk.CTkEntry(parent, textvariable=max_var, placeholder_text="最大值").grid(
+            row=row, column=3, sticky="ew", padx=(8, 16), pady=(0, 12)
+        )
+
     def _collect_visual_settings(self) -> dict[str, Any]:
         return {
             "spectrum": _bool_from_yes_no(self.visual_spectrum_var.get()),
@@ -1036,20 +1113,44 @@ class DashboardApp(ctk.CTk):
             "color_timeline": self.visual_color_timeline_var.get().strip() or "WhiteGold",
             "spectrum_y": self.visual_spectrum_y_var.get().strip() or "530",
             "spectrum_x": self.visual_spectrum_x_var.get().strip() or "-1",
-            "spectrum_w": self.visual_spectrum_w_var.get().strip() or "1200",
+            "spectrum_w": _compose_range_value(
+                self.visual_spectrum_w_min_var.get(),
+                self.visual_spectrum_w_max_var.get(),
+                "1200",
+            ),
             "film_grain": _bool_from_yes_no(self.visual_film_grain_var.get()),
-            "grain_strength": self.visual_grain_strength_var.get().strip() or "15",
+            "grain_strength": _compose_range_value(
+                self.visual_grain_strength_min_var.get(),
+                self.visual_grain_strength_max_var.get(),
+                "15",
+            ),
             "vignette": _bool_from_yes_no(self.visual_vignette_var.get()),
             "color_tint": self.visual_tint_var.get().strip() or "none",
             "soft_focus": _bool_from_yes_no(self.visual_soft_focus_var.get()),
-            "soft_focus_sigma": self.visual_soft_focus_sigma_var.get().strip() or "1.5",
+            "soft_focus_sigma": _compose_range_value(
+                self.visual_soft_focus_sigma_min_var.get(),
+                self.visual_soft_focus_sigma_max_var.get(),
+                "1.5",
+            ),
             "particle": self.visual_particle_var.get().strip() or "none",
-            "particle_opacity": self.visual_particle_opacity_var.get().strip() or "0.6",
-            "particle_speed": self.visual_particle_speed_var.get().strip() or "1.0",
+            "particle_opacity": _compose_range_value(
+                self.visual_particle_opacity_min_var.get(),
+                self.visual_particle_opacity_max_var.get(),
+                "0.6",
+            ),
+            "particle_speed": _compose_range_value(
+                self.visual_particle_speed_min_var.get(),
+                self.visual_particle_speed_max_var.get(),
+                "1.0",
+            ),
             "text": self.visual_text_var.get(),
             "text_font": self.visual_text_font_var.get().strip() or "default",
             "text_pos": self.visual_text_pos_var.get().strip() or "center",
-            "text_size": self.visual_text_size_var.get().strip() or "60",
+            "text_size": _compose_range_value(
+                self.visual_text_size_min_var.get(),
+                self.visual_text_size_max_var.get(),
+                "60",
+            ),
             "text_style": self.visual_text_style_var.get().strip() or "Classic",
         }
 
@@ -1075,7 +1176,7 @@ class DashboardApp(ctk.CTk):
             "run_upload": bool(self.run_upload_var.get()),
             "date_mmdd": self.date_var.get(),
             "simulate_seconds": self.simulate_seconds_var.get(),
-            "randomize_effects": bool(self.randomize_effects_var.get()),
+            "randomize_effects": False,
             "visual_spectrum": self.visual_spectrum_var.get(),
             "visual_timeline": self.visual_timeline_var.get(),
             "visual_letterbox": self.visual_letterbox_var.get(),
@@ -1085,20 +1186,56 @@ class DashboardApp(ctk.CTk):
             "visual_color_timeline": self.visual_color_timeline_var.get(),
             "visual_spectrum_y": self.visual_spectrum_y_var.get(),
             "visual_spectrum_x": self.visual_spectrum_x_var.get(),
-            "visual_spectrum_w": self.visual_spectrum_w_var.get(),
+            "visual_spectrum_w": _compose_range_value(
+                self.visual_spectrum_w_min_var.get(),
+                self.visual_spectrum_w_max_var.get(),
+                "1200",
+            ),
+            "visual_spectrum_w_min": self.visual_spectrum_w_min_var.get(),
+            "visual_spectrum_w_max": self.visual_spectrum_w_max_var.get(),
             "visual_film_grain": self.visual_film_grain_var.get(),
-            "visual_grain_strength": self.visual_grain_strength_var.get(),
+            "visual_grain_strength": _compose_range_value(
+                self.visual_grain_strength_min_var.get(),
+                self.visual_grain_strength_max_var.get(),
+                "15",
+            ),
+            "visual_grain_strength_min": self.visual_grain_strength_min_var.get(),
+            "visual_grain_strength_max": self.visual_grain_strength_max_var.get(),
             "visual_vignette": self.visual_vignette_var.get(),
             "visual_tint": self.visual_tint_var.get(),
             "visual_soft_focus": self.visual_soft_focus_var.get(),
-            "visual_soft_focus_sigma": self.visual_soft_focus_sigma_var.get(),
+            "visual_soft_focus_sigma": _compose_range_value(
+                self.visual_soft_focus_sigma_min_var.get(),
+                self.visual_soft_focus_sigma_max_var.get(),
+                "1.5",
+            ),
+            "visual_soft_focus_sigma_min": self.visual_soft_focus_sigma_min_var.get(),
+            "visual_soft_focus_sigma_max": self.visual_soft_focus_sigma_max_var.get(),
             "visual_particle": self.visual_particle_var.get(),
-            "visual_particle_opacity": self.visual_particle_opacity_var.get(),
-            "visual_particle_speed": self.visual_particle_speed_var.get(),
+            "visual_particle_opacity": _compose_range_value(
+                self.visual_particle_opacity_min_var.get(),
+                self.visual_particle_opacity_max_var.get(),
+                "0.6",
+            ),
+            "visual_particle_opacity_min": self.visual_particle_opacity_min_var.get(),
+            "visual_particle_opacity_max": self.visual_particle_opacity_max_var.get(),
+            "visual_particle_speed": _compose_range_value(
+                self.visual_particle_speed_min_var.get(),
+                self.visual_particle_speed_max_var.get(),
+                "1.0",
+            ),
+            "visual_particle_speed_min": self.visual_particle_speed_min_var.get(),
+            "visual_particle_speed_max": self.visual_particle_speed_max_var.get(),
             "visual_text": self.visual_text_var.get(),
             "visual_text_font": self.visual_text_font_var.get(),
             "visual_text_pos": self.visual_text_pos_var.get(),
-            "visual_text_size": self.visual_text_size_var.get(),
+            "visual_text_size": _compose_range_value(
+                self.visual_text_size_min_var.get(),
+                self.visual_text_size_max_var.get(),
+                "60",
+            ),
+            "visual_text_size_min": self.visual_text_size_min_var.get(),
+            "visual_text_size_max": self.visual_text_size_max_var.get(),
             "visual_text_style": self.visual_text_style_var.get(),
             "generate_text": bool(self.generate_text_var.get()),
             "generate_thumbnails": bool(self.generate_thumbnails_var.get()),
@@ -1567,6 +1704,7 @@ class DashboardApp(ctk.CTk):
             schedule_timezone=self.add_schedule_timezone_var.get() if self.add_schedule_enabled_var.get() else "",
             source_dir=self.source_dir_override_var.get(),
             channel_name=info.channel_name,
+            container_code=info.container_code,
         )
         for index, existing in enumerate(self.window_tasks):
             if existing.tag == task.tag and existing.serial == task.serial:
@@ -1594,24 +1732,6 @@ class DashboardApp(ctk.CTk):
         selected = filedialog.askdirectory(title="选择分组长期绑定目录")
         if selected:
             self.binding_folder_var.set(selected)
-
-    def _save_paths(self) -> None:
-        config = load_scheduler_settings(SCHEDULER_CONFIG_FILE)
-        config.update(
-            {
-                "music_dir": self.music_dir_var.get().strip(),
-                "base_image_dir": self.base_image_dir_var.get().strip(),
-                "output_root": self.output_root_var.get().strip(),
-                "metadata_root": self.metadata_root_var.get().strip(),
-                "ffmpeg_bin": self.ffmpeg_var.get().strip() or "ffmpeg",
-                "ffmpeg_path": self.ffmpeg_var.get().strip() or "ffmpeg",
-                "used_media_root": self.used_media_root_var.get().strip(),
-                "render_cleanup_days": int(self.cleanup_days_var.get().strip() or "5"),
-            }
-        )
-        self.scheduler_config = save_scheduler_settings(config, SCHEDULER_CONFIG_FILE)
-        self._refresh_bindings_box()
-        self._log("[路径] 路径配置已保存")
 
     def _save_binding(self) -> None:
         self.scheduler_config = set_group_binding(self.binding_group_var.get(), self.binding_folder_var.get())
@@ -1662,45 +1782,41 @@ class DashboardApp(ctk.CTk):
         if not task_tags:
             return
 
-        if len(task_tags) == 1:
-            target_tag = task_tags[0]
-        else:
-            target_tag = self.prompt_group_var.get().strip()
-            if not target_tag or target_tag not in task_tags:
-                self._log("[提示词] 本次包含多个分组，当前表单不会自动覆盖全部分组；将使用各分组已保存绑定")
-                return
-
-        api_name = self.api_save_name_var.get().strip() or self.api_preset_var.get().strip() or "默认API模板"
-        content_name = (
-            self.content_save_name_var.get().strip()
-            or self.content_template_var.get().strip()
-            or "默认内容模板"
-        )
-        ensure_prompt_presets(
-            api_name=api_name,
-            api_payload=self._current_api_form(),
-            content_name=content_name,
-            content_payload=self._current_content_form(),
-            tag=target_tag,
-            path=PROMPT_STUDIO_FILE,
-        )
         self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
-        self._refresh_prompt_dropdowns()
-        self.prompt_group_var.set(target_tag)
-        self.api_preset_var.set(api_name)
-        self.content_template_var.set(content_name)
-        self._log(f"[提示词] 运行前已同步当前表单 -> {target_tag} | API={api_name} | 内容模板={content_name}")
+        for tag in task_tags:
+            bound_api = get_bound_api_preset_name(self.prompt_config, tag)
+            bound_content = get_bound_content_template_name(self.prompt_config, tag)
+            if bound_api and bound_content:
+                self._log(f"[提示词] 运行使用绑定模板 -> {tag} | API={bound_api} | 内容模板={bound_content}")
+            else:
+                self._log(f"[提示词] {tag} 尚未完成模板绑定，运行前会在路径检查里报错")
 
-    def _load_prompt_for_group(self) -> None:
+    def _sync_prompt_selection_from_group(self) -> None:
         self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
-        tag = self.prompt_group_var.get()
+        tag = self.prompt_group_var.get().strip()
         api_name = pick_api_preset_name(self.prompt_config, tag)
         content_name = pick_content_template_name(self.prompt_config, tag)
         self.api_preset_var.set(api_name)
         self.content_template_var.set(content_name)
+        self._load_prompt_for_group()
 
-        api_data = dict((self.prompt_config.get("apiPresets") or {}).get(api_name) or {})
-        content_data = dict((self.prompt_config.get("contentTemplates") or {}).get(content_name) or {})
+    def _load_prompt_for_group(self) -> None:
+        self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
+        api_presets = self.prompt_config.get("apiPresets") or {}
+        content_templates = self.prompt_config.get("contentTemplates") or {}
+        tag = self.prompt_group_var.get().strip()
+        api_name = self.api_preset_var.get().strip()
+        content_name = self.content_template_var.get().strip()
+
+        if api_name not in api_presets:
+            api_name = pick_api_preset_name(self.prompt_config, tag)
+        if content_name not in content_templates:
+            content_name = pick_content_template_name(self.prompt_config, tag)
+        self.api_preset_var.set(api_name)
+        self.content_template_var.set(content_name)
+
+        api_data = dict(api_presets.get(api_name) or {})
+        content_data = dict(content_templates.get(content_name) or {})
 
         self.provider_var.set(str(api_data.get("provider") or "openai_compatible"))
         self.base_url_var.set(str(api_data.get("baseUrl") or ""))
@@ -1731,65 +1847,60 @@ class DashboardApp(ctk.CTk):
         self.title_library_box.insert("1.0", str(content_data.get("titleLibrary") or ""))
 
     def _save_api_preset(self) -> None:
-        tag = self.prompt_group_var.get()
         name = self.api_save_name_var.get().strip() or self.api_preset_var.get().strip()
         if not name:
             messagebox.showerror("保存失败", "请填写 API 模板名称")
             return
-        ensure_prompt_presets(
-            api_name=name,
-            api_payload=self._current_api_form(),
-            content_name=self.content_template_var.get().strip() or "默认内容模板",
-            content_payload=self._current_content_form(),
+        self.prompt_config = save_api_preset(
+            name=name,
+            payload=self._current_api_form(),
             path=PROMPT_STUDIO_FILE,
         )
-        self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
         self._refresh_prompt_dropdowns()
         self.api_preset_var.set(name)
+        self.api_save_name_var.set(name)
         self._log(f"[提示词] 已保存 API 模板: {name}")
-        if tag:
-            self.api_save_name_var.set(name)
 
     def _save_content_template(self) -> None:
         name = self.content_save_name_var.get().strip() or self.content_template_var.get().strip()
         if not name:
             messagebox.showerror("保存失败", "请填写内容模板名称")
             return
-        ensure_prompt_presets(
-            api_name=self.api_preset_var.get().strip() or "默认API模板",
-            api_payload=self._current_api_form(),
-            content_name=name,
-            content_payload=self._current_content_form(),
+        self.prompt_config = save_content_template(
+            name=name,
+            payload=self._current_content_form(),
             path=PROMPT_STUDIO_FILE,
         )
-        self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
         self._refresh_prompt_dropdowns()
         self.content_template_var.set(name)
+        self.content_save_name_var.set(name)
         self._log(f"[提示词] 已保存内容模板: {name}")
 
     def _bind_group_api(self) -> None:
-        ensure_prompt_presets(
-            api_name=self.api_preset_var.get().strip() or "默认API模板",
-            api_payload=self._current_api_form(),
-            content_name=self.content_template_var.get().strip() or "默认内容模板",
-            content_payload=self._current_content_form(),
-            tag=self.prompt_group_var.get(),
-            path=PROMPT_STUDIO_FILE,
-        )
+        tag = self.prompt_group_var.get().strip()
+        api_name = self.api_preset_var.get().strip()
+        if not tag or not api_name:
+            messagebox.showerror("绑定失败", "请先选择分组和 API 模板")
+            return
         self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
-        self._log(f"[提示词] {self.prompt_group_var.get()} 已绑定 API 模板 {self.api_preset_var.get()}")
+        if api_name not in (self.prompt_config.get("apiPresets") or {}):
+            messagebox.showerror("绑定失败", f"未找到 API 模板：{api_name}")
+            return
+        self.prompt_config = bind_group_api_preset(tag=tag, api_name=api_name, path=PROMPT_STUDIO_FILE)
+        self._log(f"[提示词] {tag} 已绑定 API 模板 {api_name}")
 
     def _bind_group_content(self) -> None:
-        ensure_prompt_presets(
-            api_name=self.api_preset_var.get().strip() or "默认API模板",
-            api_payload=self._current_api_form(),
-            content_name=self.content_template_var.get().strip() or "默认内容模板",
-            content_payload=self._current_content_form(),
-            tag=self.prompt_group_var.get(),
-            path=PROMPT_STUDIO_FILE,
-        )
+        tag = self.prompt_group_var.get().strip()
+        content_name = self.content_template_var.get().strip()
+        if not tag or not content_name:
+            messagebox.showerror("绑定失败", "请先选择分组和内容模板")
+            return
         self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
-        self._log(f"[提示词] {self.prompt_group_var.get()} 已绑定内容模板 {self.content_template_var.get()}")
+        if content_name not in (self.prompt_config.get("contentTemplates") or {}):
+            messagebox.showerror("绑定失败", f"未找到内容模板：{content_name}")
+            return
+        self.prompt_config = bind_group_content_template(tag=tag, content_name=content_name, path=PROMPT_STUDIO_FILE)
+        self._log(f"[提示词] {tag} 已绑定内容模板 {content_name}")
 
     def _test_text_api(self) -> None:
         try:
@@ -2133,7 +2244,7 @@ class DashboardApp(ctk.CTk):
         )
         ctk.CTkLabel(
             task_frame,
-            text="勾选今天要执行的模块。只勾一个就单独跑那一个，勾多个就按顺序连续执行。",
+            text="勾选今天要执行的模块。随机与否全部在高级视觉里用 random 或区间控制，这里不再保留全局随机开关。",
             text_color="#b8c1cc",
         ).grid(row=1, column=0, columnspan=6, sticky="w", padx=16, pady=(0, 10))
         ctk.CTkCheckBox(task_frame, text="生成标题/简介/标签/缩略图", variable=self.run_metadata_var).grid(
@@ -2153,15 +2264,12 @@ class DashboardApp(ctk.CTk):
         ctk.CTkEntry(task_frame, textvariable=self.simulate_seconds_var, width=120).grid(
             row=3, column=3, sticky="w", padx=(0, 12), pady=(0, 8)
         )
-        ctk.CTkSwitch(task_frame, text="随机视觉特效", variable=self.randomize_effects_var).grid(
-            row=3, column=4, columnspan=2, sticky="w", padx=8, pady=(0, 8)
-        )
         ctk.CTkButton(
             task_frame,
             text="打开高级视觉",
             command=lambda: self.tabview.set("高级视觉"),
             width=140,
-        ).grid(row=4, column=4, columnspan=2, sticky="w", padx=8, pady=(0, 8))
+        ).grid(row=3, column=4, columnspan=2, sticky="w", padx=8, pady=(0, 8))
 
         option_frame = ctk.CTkFrame(tab)
         option_frame.grid(row=1, column=0, sticky="ew", padx=16, pady=8)
@@ -2294,10 +2402,10 @@ class DashboardApp(ctk.CTk):
             schedule_interval_minutes=int(self.schedule_interval_var.get().strip() or "60"),
             schedule_timezone=self.schedule_timezone_var.get().strip() or SCHEDULE_TIMEZONE_VALUES[0],
             metadata_mode="prompt_api",
-            generate_text=bool(modules["metadata"] and self.generate_text_var.get()),
-            generate_thumbnails=bool(modules["metadata"] and self.generate_thumbnails_var.get()),
+            generate_text=bool(modules["metadata"]),
+            generate_thumbnails=bool(modules["metadata"]),
             sync_daily_content=bool(modules["metadata"]),
-            randomize_effects=bool(self.randomize_effects_var.get()),
+            randomize_effects=False,
             visual_settings=self._collect_visual_settings(),
         )
 

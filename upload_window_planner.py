@@ -14,12 +14,13 @@ SCOPE_MULTI_GROUP = "multi_group"
 SCOPE_MANUAL = "manual_windows"
 VALID_SCOPE_MODES = {SCOPE_SAME_GROUP, SCOPE_MULTI_GROUP, SCOPE_MANUAL}
 
-TASK_META_KEYS = {"index", "serial", "tag"}
+TASK_META_KEYS = {"index", "serial", "tag", "container_code"}
 UPLOAD_OPTION_KEYS = {
     "visibility",
     "category",
     "made_for_kids",
     "altered_content",
+    "notify_subscribers",
     "scheduled_publish_at",
     "schedule_timezone",
 }
@@ -58,11 +59,24 @@ def _normalize_override(task: dict[str, Any], key: str, value: str) -> None:
     value = value.strip()
     if not key:
         return
-    if key in {"visibility", "category", "title", "description", "scheduled_publish_at", "schedule_timezone", "channel_name"}:
+    if key in {
+        "visibility",
+        "category",
+        "title",
+        "description",
+        "scheduled_publish_at",
+        "schedule_timezone",
+        "channel_name",
+        "source_dir",
+        "container_code",
+    }:
         task[key] = value
         return
-    if key in {"made_for_kids", "altered_content"}:
+    if key in {"made_for_kids", "altered_content", "notify_subscribers"}:
         task[key] = _parse_bool(value)
+        return
+    if key in {"container", "browser_id"}:
+        task["container_code"] = value
         return
     if key in {"is_ypp", "ypp"}:
         task["is_ypp"] = _parse_bool(value)
@@ -91,6 +105,8 @@ def _finalize_task(task: dict[str, Any], index: int) -> dict[str, Any]:
         "title",
         "description",
         "channel_name",
+        "container_code",
+        "source_dir",
         "tag_list",
         "thumbnails",
         "ab_titles",
@@ -99,6 +115,7 @@ def _finalize_task(task: dict[str, Any], index: int) -> dict[str, Any]:
         "category",
         "made_for_kids",
         "altered_content",
+        "notify_subscribers",
         "scheduled_publish_at",
         "schedule_timezone",
     ):
@@ -322,7 +339,7 @@ def merge_manifest_with_window_task(
         upload_options.setdefault(key, value)
 
     if task:
-        for key in ("title", "description", "channel_name", "tag_list", "thumbnails", "ab_titles", "is_ypp"):
+        for key in ("title", "description", "channel_name", "container_code", "tag_list", "thumbnails", "ab_titles", "is_ypp"):
             if key in task:
                 merged[key] = task[key]
         for key in UPLOAD_OPTION_KEYS:

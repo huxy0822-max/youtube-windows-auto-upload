@@ -363,6 +363,7 @@ def prepare_group_upload_batch(
             "video": staged_video.name,
             "source_video": str(source_video),
             "channel_name": channel_name_map.get(serial, ""),
+            "container_code": str(task.get("container_code") or ""),
             "title": title,
             "description": description,
             "thumbnails": [str(path) for path in cover_paths],
@@ -377,7 +378,9 @@ def prepare_group_upload_batch(
                 "altered_content": bool(altered_content),
                 "category": category,
                 "visibility": visibility,
+                "notify_subscribers": False,
                 "scheduled_publish_at": scheduled_publish_at,
+                "schedule_timezone": None,
             },
         }
         channels[str(serial)] = channel_payload
@@ -573,9 +576,11 @@ def prepare_window_task_upload_batch(
             "altered_content": bool(default_upload_options.get("altered_content", True)),
             "category": str(default_upload_options.get("category") or "Music").strip() or "Music",
             "visibility": str(default_upload_options.get("visibility") or "public").strip() or "public",
+            "notify_subscribers": bool(default_upload_options.get("notify_subscribers", False)),
             "scheduled_publish_at": str(task.get("scheduled_publish_at") or default_upload_options.get("scheduled_publish_at") or "").strip() or None,
+            "schedule_timezone": str(task.get("schedule_timezone") or default_upload_options.get("schedule_timezone") or "").strip() or None,
         }
-        for key in ("made_for_kids", "altered_content", "category", "visibility", "scheduled_publish_at"):
+        for key in ("made_for_kids", "altered_content", "category", "visibility", "notify_subscribers", "scheduled_publish_at", "schedule_timezone"):
             if key in task:
                 upload_options[key] = task[key]
 
@@ -609,6 +614,7 @@ def prepare_window_task_upload_batch(
             "video": staged_video.name,
             "source_video": str(source_video),
             "channel_name": str(task.get("channel_name") or channel_name_map.get(serial, "")).strip(),
+            "container_code": str(task.get("container_code") or ""),
             "title": title,
             "description": description,
             "thumbnails": [str(path) for path in cover_paths],

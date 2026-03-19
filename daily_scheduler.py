@@ -229,6 +229,24 @@ def _ffmpeg_has_encoder(encoder_name: str) -> bool:
     return bool(needle) and needle in blob
 
 
+@lru_cache(maxsize=8)
+def _ffmpeg_has_filter(filter_name: str) -> bool:
+    try:
+        result = subprocess.run(
+            [FFMPEG_BIN, "-hide_banner", "-filters"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+    except Exception:
+        return False
+    blob = f"{result.stdout}\n{result.stderr}".lower()
+    needle = str(filter_name or "").strip().lower()
+    return bool(needle) and needle in blob
+
+
 @lru_cache(maxsize=1)
 def _windows_has_amf_runtime() -> bool:
     if not IS_WINDOWS:
@@ -295,41 +313,56 @@ def _windows_has_nvenc_runtime() -> bool:
 # ============ FFmpeg 编码参数 (平台自适应) ============
 if IS_MAC:
     VIDEO_CODEC = "h264_videotoolbox"
-    VIDEO_BITRATE = "5000k"
+    VIDEO_BITRATE = "8000k"
     VIDEO_SPATIAL_AQ = True
     _CODEC_EXTRA_ARGS = ['-spatial_aq', '1']
 elif IS_WINDOWS and _windows_has_nvenc_runtime():
     VIDEO_CODEC = "h264_nvenc"
-    VIDEO_BITRATE = "5000k"
+    VIDEO_BITRATE = "8000k"
     VIDEO_SPATIAL_AQ = False
     _CODEC_EXTRA_ARGS = [
         "-preset", "p4",
         "-tune", "hq",
         "-rc", "vbr",
+        "-maxrate", "10000k",
+        "-bufsize", "16000k",
     ]
 elif IS_WINDOWS and _ffmpeg_has_encoder("h264_amf") and _windows_has_amf_runtime():
     VIDEO_CODEC = "h264_amf"
-    VIDEO_BITRATE = "5000k"
+    VIDEO_BITRATE = "8000k"
     VIDEO_SPATIAL_AQ = False
     _CODEC_EXTRA_ARGS = [
         "-usage", "transcoding",
         "-quality", "balanced",
         "-profile:v", "high",
         "-rc", "cbr",
-        "-maxrate", "6500k",
-        "-bufsize", "12000k",
+        "-maxrate", "10000k",
+        "-bufsize", "16000k",
     ]
 else:
     VIDEO_CODEC = "libx264"           # CPU 编码 (最大兼容性)
-    VIDEO_BITRATE = "5000k"
+    VIDEO_BITRATE = "8000k"
     VIDEO_SPATIAL_AQ = False
     _CODEC_EXTRA_ARGS = ['-preset', 'veryfast']
 AUDIO_BITRATE = "320k"
 AUDIO_SAMPLERATE = "44100"
+DRAWTEXT_FILTER_AVAILABLE = _ffmpeg_has_filter("drawtext")
 
 # ============ 特效库导入 ============
 sys.path.insert(0, str(_BUNDLE_DIR))
-from effects_library import get_effect, list_effects, PALETTES, ZOOM_SPEEDS
+from effects_library import (
+    PALETTES,
+    ZOOM_SPEEDS,
+    get_effect,
+    list_effects,
+    list_font_names,
+    list_palette_names,
+    list_particle_effects,
+    list_text_positions,
+    list_text_styles,
+    list_tint_names,
+    list_zoom_modes,
+)
 
 # ============ 完成标记系统 ============
 # 用 .done 标记文件代替文件大小启发式判断，彻底避免渲染中断后误跳过不完整文件
@@ -890,62 +923,119 @@ def parse_arguments() -> RenderOptions:
 
 
 def build_effect_kwargs(opts: RenderOptions) -> dict:
+    def choose_value(value, *, default=None, choices: list | None = None):
+        raw = value
+        if isinstance(raw, str):
+            raw = raw.strip()
+            if raw.lower() == "random":
+                if choices:
+                    return random.choice(list(choices))
+                return default
+        return raw if raw not in (None, "") else default
+
+    def choose_int(value, *, default: int, minimum: int | None = None, maximum: int | None = None):
+        raw = value
+        if isinstance(raw, str):
+            text = raw.strip()
+            matched = re.fullmatch(r"\s*(-?\d+)\s*[-,~]\s*(-?\d+)\s*", text)
+            if matched:
+                left = int(matched.group(1))
+                right = int(matched.group(2))
+                low, high = sorted((left, right))
+                if low != high:
+                    picked = random.randint(low, high)
+                    if minimum is not None:
+                        picked = max(minimum, picked)
+                    if maximum is not None:
+                        picked = min(maximum, picked)
+                    return picked
+                text = matched.group(1)
+            if text.lower() == "random" and minimum is not None and maximum is not None:
+                return random.randint(minimum, maximum)
+            try:
+                picked = int(text)
+            except Exception:
+                picked = default
+        else:
+            try:
+                picked = int(raw)
+            except Exception:
+                picked = default
+        if minimum is not None:
+            picked = max(minimum, picked)
+        if maximum is not None:
+            picked = min(maximum, picked)
+        return picked
+
+    def choose_float(
+        value,
+        *,
+        default: float,
+        minimum: float | None = None,
+        maximum: float | None = None,
+        precision: int = 2,
+    ):
+        raw = value
+        if isinstance(raw, str):
+            text = raw.strip()
+            matched = re.fullmatch(r"\s*(-?\d+(?:\.\d+)?)\s*[-,~]\s*(-?\d+(?:\.\d+)?)\s*", text)
+            if matched:
+                left = float(matched.group(1))
+                right = float(matched.group(2))
+                low, high = sorted((left, right))
+                if abs(low - high) > 1e-9:
+                    picked = round(random.uniform(low, high), precision)
+                    if minimum is not None:
+                        picked = max(minimum, picked)
+                    if maximum is not None:
+                        picked = min(maximum, picked)
+                    return picked
+                text = matched.group(1)
+            if text.lower() == "random" and minimum is not None and maximum is not None:
+                return round(random.uniform(minimum, maximum), precision)
+            try:
+                picked = float(text)
+            except Exception:
+                picked = default
+        else:
+            try:
+                picked = float(raw)
+            except Exception:
+                picked = default
+        if minimum is not None:
+            picked = max(minimum, picked)
+        if maximum is not None:
+            picked = min(maximum, picked)
+        return picked
+
     kwargs = {
         "spectrum": opts.fx_spectrum,
         "timeline": opts.fx_timeline,
         "letterbox": opts.fx_letterbox,
-        "zoom": opts.fx_zoom,
-        "color_spectrum": opts.fx_color_spectrum,
-        "color_timeline": opts.fx_color_timeline,
-        "spectrum_y": opts.fx_spectrum_y,
-        "spectrum_x": opts.fx_spectrum_x,
-        "spectrum_w": opts.fx_spectrum_w,
-        "style": opts.fx_style,
+        "zoom": choose_value(opts.fx_zoom, default="normal", choices=list_zoom_modes()),
+        "color_spectrum": choose_value(opts.fx_color_spectrum, default="WhiteGold", choices=list_palette_names()),
+        "color_timeline": choose_value(opts.fx_color_timeline, default="WhiteGold", choices=list_palette_names()),
+        "spectrum_y": choose_int(opts.fx_spectrum_y, default=530, minimum=0, maximum=1000),
+        "spectrum_x": choose_int(opts.fx_spectrum_x, default=-1, minimum=-1, maximum=1800),
+        "spectrum_w": choose_int(opts.fx_spectrum_w, default=1200, minimum=360, maximum=1800),
+        "style": choose_value(opts.fx_style, default="bar", choices=list_effects()),
         "text": opts.fx_text,
-        "text_pos": opts.fx_text_pos,
-        "text_size": opts.fx_text_size,
-        "text_style": opts.fx_text_style,
+        "text_pos": choose_value(opts.fx_text_pos, default="center", choices=list_text_positions()),
+        "text_size": choose_int(opts.fx_text_size, default=60, minimum=18, maximum=180),
+        "text_style": choose_value(opts.fx_text_style, default="Classic", choices=list_text_styles()),
         "film_grain": opts.fx_film_grain,
-        "grain_strength": opts.fx_grain_strength,
+        "grain_strength": choose_int(opts.fx_grain_strength, default=15, minimum=0, maximum=60),
         "vignette": opts.fx_vignette,
-        "color_tint": opts.fx_color_tint,
+        "color_tint": choose_value(opts.fx_color_tint, default="none", choices=list_tint_names()),
         "soft_focus": opts.fx_soft_focus,
-        "soft_focus_sigma": opts.fx_soft_focus_sigma,
-        "particle": opts.fx_particle,
-        "particle_opacity": opts.fx_particle_opacity,
-        "particle_speed": opts.fx_particle_speed,
-        "text_font": opts.fx_text_font,
+        "soft_focus_sigma": choose_float(opts.fx_soft_focus_sigma, default=1.5, minimum=0.3, maximum=6.0),
+        "particle": choose_value(opts.fx_particle, default="none", choices=list_particle_effects()),
+        "particle_opacity": choose_float(opts.fx_particle_opacity, default=0.6, minimum=0.0, maximum=1.0),
+        "particle_speed": choose_float(opts.fx_particle_speed, default=1.0, minimum=0.2, maximum=3.0),
+        "text_font": choose_value(opts.fx_text_font, default="default", choices=list_font_names()),
     }
-    if not opts.fx_randomize:
-        return kwargs
-
-    # 统一的随机视觉策略，避免不同入口渲染结果过于同质。
-    kwargs.update(
-        {
-            "spectrum": "random",
-            "timeline": "random",
-            "letterbox": "random",
-            "zoom": "random",
-            "color_spectrum": "random",
-            "color_timeline": "random",
-            "spectrum_y": random.choice([470, 500, 530, 560, 590]),
-            "spectrum_x": random.choice([-1, -1, -1, 80, 120, 160]),
-            "spectrum_w": random.choice([1080, 1200, 1320, 1440, 1600]),
-            "style": "random",
-            "film_grain": "random",
-            "grain_strength": random.randint(6, 18),
-            "vignette": "random",
-            "color_tint": "random",
-            "soft_focus": "random",
-            "soft_focus_sigma": round(random.uniform(0.8, 1.8), 2),
-            "particle": "random",
-            "particle_opacity": round(random.uniform(0.35, 0.75), 2),
-            "particle_speed": round(random.uniform(0.85, 1.15), 2),
-        }
-    )
-    if opts.fx_text:
-        kwargs["text_style"] = "random"
-        kwargs["text_size"] = random.choice([48, 56, 64, 72])
+    if kwargs["text"] and not DRAWTEXT_FILTER_AVAILABLE:
+        kwargs["text"] = ""
     return kwargs
 
 def phase2_build_master_audios(active_projects: list) -> dict:

@@ -127,19 +127,21 @@ def _overlay_needs_colorkey(path: Path) -> bool:
 def _particle_overlay_plan(name: str) -> dict[str, float]:
     lower = name.lower()
     if any(token in lower for token in ("snow", "glitter", "dust", "spark", "magic", "fairy", "bokeh")):
-        scale = random.uniform(0.42, 0.95)
+        scale = random.uniform(1.55, 2.30)
     elif any(token in lower for token in ("smoke", "rain", "fireflies", "light", "flare")):
-        scale = random.uniform(0.72, 1.22)
+        scale = random.uniform(1.30, 1.95)
     else:
-        scale = random.uniform(0.55, 1.05)
+        scale = random.uniform(1.40, 2.10)
     return {
         "scale": scale,
-        "base_x": random.uniform(-0.15, 1.05),
-        "base_y": random.uniform(-0.12, 0.98),
-        "sway_px": random.uniform(10.0, 58.0),
-        "sway_speed": random.uniform(0.18, 0.75),
-        "drift_px": random.uniform(6.0, 28.0),
-        "drift_speed": random.uniform(0.12, 0.48),
+        "base_x": random.uniform(0.0, 1.0),
+        "base_y": random.uniform(0.0, 1.0),
+        "sway_px": random.uniform(18.0, 80.0),
+        "sway_speed": random.uniform(0.12, 0.56),
+        "drift_px": random.uniform(12.0, 64.0),
+        "drift_speed": random.uniform(0.10, 0.40),
+        "flip_h": 1.0 if random.random() < 0.5 else 0.0,
+        "flip_v": 1.0 if random.random() < 0.18 else 0.0,
     }
 
 
@@ -164,7 +166,8 @@ def _pick_style(name: str) -> str:
 def _pick_particle(name: str) -> str:
     particle_files = discover_particle_files()
     if name == "random":
-        return random.choice(["none", *list(particle_files.keys())])
+        choices = list(particle_files.keys())
+        return random.choice(choices) if choices else "none"
     return name if name in particle_files or name == "none" else "none"
 
 
@@ -362,29 +365,39 @@ def get_effect(
         overlay_file = OVERLAY_DIR / particle_files.get(particle_name, "")
         if overlay_file.exists():
             overlay_plan = _particle_overlay_plan(particle_name)
+            overlay_scale = max(float(overlay_plan.get("scale", 1.0)), 1.0)
+            overlay_w = max(1920, int(round((1920 * overlay_scale) / 2.0) * 2))
+            overlay_h = max(1080, int(round((1080 * overlay_scale) / 2.0) * 2))
             input_index = 2
             extra_inputs.extend(["-stream_loop", "-1", "-i", str(overlay_file)])
             overlay_label = "overlay0"
             next_label = "base6"
+            crop_x_base = max(0.0, min(1.0, float(overlay_plan.get("base_x", 0.5))))
+            crop_y_base = max(0.0, min(1.0, float(overlay_plan.get("base_y", 0.5))))
             overlay_parts = [
-                f"scale='trunc(iw*{overlay_plan['scale']:.3f}/2)*2':'trunc(ih*{overlay_plan['scale']:.3f}/2)*2'",
+                f"scale={overlay_w}:{overlay_h}:force_original_aspect_ratio=increase",
                 f"setpts=PTS/{particle_speed:.3f}",
                 "format=rgba",
             ]
+            if overlay_plan["flip_h"] > 0.5:
+                overlay_parts.append("hflip")
+            if overlay_plan["flip_v"] > 0.5:
+                overlay_parts.append("vflip")
+            crop_x_expr = (
+                "max(0,min(iw-ow,"
+                f"(iw-ow)*{crop_x_base:.3f}+{overlay_plan['sway_px']:.1f}*sin(t*{overlay_plan['sway_speed']:.3f})))"
+            )
+            crop_y_expr = (
+                "max(0,min(ih-oh,"
+                f"(ih-oh)*{crop_y_base:.3f}+{overlay_plan['drift_px']:.1f}*sin(t*{overlay_plan['drift_speed']:.3f})))"
+            )
+            overlay_parts.append(f"crop=1920:1080:x='{crop_x_expr}':y='{crop_y_expr}'")
             if _overlay_needs_colorkey(overlay_file):
                 overlay_parts.append("colorkey=0x000000:0.20:0.10")
             overlay_parts.append(f"colorchannelmixer=aa={particle_opacity:.3f}")
             chains.append(f"[{input_index}:v]{','.join(overlay_parts)}[{overlay_label}]")
-            x_expr = (
-                f"min(max({overlay_plan['base_x']:.3f}*(W-w)+{overlay_plan['sway_px']:.1f}*sin(t*{overlay_plan['sway_speed']:.3f}),"
-                f"-w*0.20),W-w*0.05)"
-            )
-            y_expr = (
-                f"min(max({overlay_plan['base_y']:.3f}*(H-h)+{overlay_plan['drift_px']:.1f}*sin(t*{overlay_plan['drift_speed']:.3f}),"
-                f"-h*0.20),H-h*0.05)"
-            )
             chains.append(
-                f"[{current}][{overlay_label}]overlay=x='{x_expr}':y='{y_expr}':shortest=1:format=auto[{next_label}]"
+                f"[{current}][{overlay_label}]overlay=x=0:y=0:shortest=1:format=auto[{next_label}]"
             )
             current = next_label
 

@@ -7,6 +7,7 @@ from typing import Any, Callable
 
 from workflow_core import (
     ExecutionControl,
+    PROMPT_STUDIO_FILE,
     SimulationOptions,
     WindowTask,
     WorkflowDefaults,
@@ -21,6 +22,8 @@ from workflow_core import (
     resolve_task_image_dir,
     validate_existing_output_dirs,
     validate_group_sources,
+    validate_prompt_bindings,
+    validate_task_containers,
 )
 
 LogFunc = Callable[[str], None]
@@ -204,16 +207,37 @@ def validate_run_plan(run_plan: RunPlan, *, log: LogFunc = _noop_log) -> Validat
         report.errors.append("至少需要一个窗口任务。")
         return report
 
-    if modules.render or modules.metadata:
+    if modules.metadata and run_plan.defaults.metadata_mode != "prompt_api":
+        report.errors.append("生成标题/简介/标签/缩略图模块只支持 prompt_api 模式。")
+        return report
+
+    # 只在真正依赖源图/源音时校验素材目录；metadata+upload / upload-only 应该直接吃现成成品。
+    if modules.render or (modules.metadata and not modules.upload):
         errors, warnings = validate_group_sources(run_plan.tasks, config=run_plan.config, log=log)
         report.errors.extend(errors)
         report.warnings.extend(warnings)
+
+    if modules.metadata:
+        prompt_errors, prompt_warnings = validate_prompt_bindings(
+            tags=[task.tag for task in run_plan.tasks],
+            require_text_generation=bool(run_plan.defaults.generate_text),
+            require_image_generation=bool(run_plan.defaults.generate_thumbnails),
+            path=PROMPT_STUDIO_FILE,
+        )
+        report.errors.extend(prompt_errors)
+        report.warnings.extend(prompt_warnings)
+
+    if modules.upload:
+        container_errors, container_warnings = validate_task_containers(run_plan.tasks)
+        report.errors.extend(container_errors)
+        report.warnings.extend(container_warnings)
 
     if modules.upload and not modules.render:
         errors, warnings, resolved_dirs = validate_existing_output_dirs(
             run_plan.tasks,
             date_mmdd=run_plan.defaults.date_mmdd,
             config=run_plan.config,
+            allow_bootstrap=bool(modules.metadata),
             log=log,
         )
         report.errors.extend(errors)
@@ -293,23 +317,26 @@ def execute_run_plan(
         result.prepared_output_dirs.update(collect_output_dirs(workflow_result))
         return result
 
-    if run_plan.modules.metadata:
+    if run_plan.modules.metadata and not run_plan.modules.upload:
         log("[Start] Metadata module")
         result.workflow_result = execute_metadata_only_workflow(
             tasks=run_plan.tasks,
             defaults=run_plan.defaults,
             config=run_plan.config,
+            output_dir_overrides=dict(run_plan.window_plan.get("tag_output_dirs") or {}),
+            metadata_dir_overrides=dict(run_plan.window_plan.get("tag_metadata_dirs") or {}),
             control=control,
             log=log,
         )
 
     if run_plan.modules.upload and run_plan.modules.metadata:
-        log("[Upload] Refresh existing manifests using current metadata settings")
+        log("[Metadata] Refresh existing manifests and metadata from prepared output folders")
         result.prepared_output_dirs = refresh_existing_output_metadata(
             tasks=run_plan.tasks,
             defaults=run_plan.defaults,
             prepared_output_dirs=result.prepared_output_dirs,
             config=run_plan.config,
+            metadata_dir_overrides=dict(run_plan.window_plan.get("tag_metadata_dirs") or {}),
             control=control,
             log=log,
         )
