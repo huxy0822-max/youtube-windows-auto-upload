@@ -595,6 +595,14 @@ def _metadata_style_summary(content_template: dict) -> str:
     return " | ".join(part for part in summary_parts if part and not part.endswith("="))
 
 
+def _compact_title_library(content_template: dict, *, limit: int = 480) -> str:
+    raw = str(content_template.get("titleLibrary") or "").strip()
+    if not raw:
+        return ""
+    compact = re.sub(r"\s+", " ", raw).strip()
+    return compact[:limit]
+
+
 def _extract_opening_fragments(values: list[str] | None, *, limit: int = 8) -> list[str]:
     fragments: list[str] = []
     seen: set[str] = set()
@@ -657,6 +665,8 @@ def _build_title_stage_prompt(
     title_min = _int_value(content_template.get("titleMin"), 80)
     title_max = _int_value(content_template.get("titleMax"), 95)
     language_ui, _ = language_meta(str(content_template.get("outputLanguage") or "zh-TW"))
+    master_prompt = _compact_master_rules(content_template, limit=900)
+    title_library = _compact_title_library(content_template, limit=360)
     payload = {
         "seed": str(unique_seed or "").strip(),
         "count": int(max(1, count)),
@@ -665,6 +675,8 @@ def _build_title_stage_prompt(
         "audience": str(content_template.get("audience") or "").strip(),
         "language": language_ui,
         "titleLength": {"min": title_min, "max": title_max},
+        "masterPrompt": master_prompt,
+        "titleLibrary": title_library,
         "styleSummary": _metadata_style_summary(content_template),
     }
     return (
@@ -672,6 +684,8 @@ def _build_title_stage_prompt(
         "You are generating YouTube music video titles.\n"
         "All titles must be Traditional Chinese.\n"
         "Every title must feel genuinely different in angle, not just paraphrased.\n"
+        "Treat masterPrompt as the hard creative constraint.\n"
+        "Use titleLibrary as a style reference and inspiration source, but do not copy it verbatim.\n"
         "Do not output the same opening clause across multiple titles.\n"
         "Treat the seed as a hard uniqueness constraint: produce a fresh hook and a fresh opening clause.\n"
         "Make the titles emotionally vivid, specific, and mature.\n\n"
@@ -690,6 +704,8 @@ def _build_description_stage_prompt(
 ) -> str:
     tag_range = parse_tag_range(str(content_template.get("tagRange") or "10-20"))
     language_ui, _ = language_meta(str(content_template.get("outputLanguage") or "zh-TW"))
+    master_prompt = _compact_master_rules(content_template, limit=900)
+    title_library = _compact_title_library(content_template, limit=360)
     payload = {
         "seed": str(unique_seed or "").strip(),
         "title": str(title or "").strip(),
@@ -699,12 +715,16 @@ def _build_description_stage_prompt(
         "language": language_ui,
         "descriptionLength": _int_value(content_template.get("descLen"), 300),
         "tagCount": {"min": tag_range[0], "max": tag_range[1]},
+        "masterPrompt": master_prompt,
+        "titleLibrary": title_library,
         "styleSummary": _metadata_style_summary(content_template),
     }
     return (
         "Return strict JSON only.\n"
         "You are generating one YouTube description and one SEO tag list for a music video.\n"
         "Description and tags must be Traditional Chinese.\n"
+        "Treat masterPrompt as the hard content constraint.\n"
+        "Use titleLibrary to stay aligned with the intended channel tone and headline flavor.\n"
         "Make the wording natural, emotionally coherent, and clearly matched to the title.\n\n"
         f"Input:\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
         'Return JSON schema: {"descriptions":["string"],"seoHashtags":["#tag"],"tagList":["keyword"]}'
@@ -721,6 +741,8 @@ def _build_thumbnail_prompt_stage(
     count: int,
 ) -> str:
     _, language_english = language_meta(str(content_template.get("outputLanguage") or "zh-TW"))
+    master_prompt = _compact_master_rules(content_template, limit=900)
+    title_library = _compact_title_library(content_template, limit=360)
     payload = {
         "seed": str(unique_seed or "").strip(),
         "titles": [str(item or "").strip() for item in titles if str(item or "").strip()][: max(1, count)],
@@ -729,6 +751,8 @@ def _build_thumbnail_prompt_stage(
         "angle": str(content_template.get("angle") or "").strip(),
         "audience": str(content_template.get("audience") or "").strip(),
         "thumbnailTextLanguage": language_english,
+        "masterPrompt": master_prompt,
+        "titleLibrary": title_library,
         "styleSummary": _metadata_style_summary(content_template),
     }
     return (
@@ -736,6 +760,8 @@ def _build_thumbnail_prompt_stage(
         "Generate thumbnail image prompts for a music video.\n"
         "Each prompt must describe a clear image concept and must end with "
         f"'Use {language_english} text in the image.'\n"
+        "Treat masterPrompt as the hard creative constraint.\n"
+        "Use titleLibrary to inherit the channel's proven title/thumbnail flavor, but do not copy it literally.\n"
         "Make each prompt visually clear, elegant, and directly usable by an image model.\n\n"
         f"Input:\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
         'Return JSON schema: {"thumbnails":[{"forTitle":"string","prompt":"string"}]}'
