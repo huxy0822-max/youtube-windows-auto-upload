@@ -2394,6 +2394,7 @@ def execute_direct_media_workflow(
             description = task.description.strip()
             tag_list = [item for item in task.tag_list if str(item).strip()]
             ab_titles = [item for item in task.ab_titles if str(item).strip()]
+            cover_count = 3 if task.is_ypp else 1
             cover_paths, cover_source = _pick_preferred_cover_paths(
                 task=task,
                 metadata_dir=Path(state["metadata_dir"]),
@@ -2401,7 +2402,13 @@ def execute_direct_media_workflow(
                 serial=task.serial,
             )
             if not defaults.generate_thumbnails and source_image.exists():
-                cover_paths = [source_image]
+                cover_paths = _make_cover_fallbacks(
+                    source_image,
+                    Path(state["metadata_dir"]),
+                    defaults.date_mmdd,
+                    task.serial,
+                    cover_count,
+                )
                 cover_source = "source_image"
             thumbnail_prompts: list[str] = []
             history_scope = get_used_metadata_scope(tag, config=config)
@@ -2446,7 +2453,6 @@ def execute_direct_media_workflow(
             elif not title:
                 title = output_video.stem
 
-            cover_count = 3 if task.is_ypp else 1
             if defaults.generate_thumbnails:
                 if bundle and str(bundle["api_preset"].get("autoImageEnabled") or "0") == "1" and not cover_paths:
                     for cover_index, prompt in enumerate(thumbnail_prompts[:cover_count], 1):
@@ -2463,7 +2469,13 @@ def execute_direct_media_workflow(
                             result.warnings.append(f"{tag}/{task.serial} 缩略图生成失败: {exc}")
                             log(f"[警告] {tag}/{task.serial} 缩略图生成失败: {exc}")
                 if not cover_paths:
-                    cover_paths = [source_image]
+                    cover_paths = _make_cover_fallbacks(
+                        source_image,
+                        Path(state["metadata_dir"]),
+                        defaults.date_mmdd,
+                        task.serial,
+                        cover_count,
+                    )
                     cover_source = "source_image"
 
             if cover_paths:

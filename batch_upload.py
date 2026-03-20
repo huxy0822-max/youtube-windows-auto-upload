@@ -3724,7 +3724,7 @@ async def get_upload_monitor_snapshot(page) -> Dict[str, Any]:
             const rowPublishedRe = /\\bPublished\\b|已发布|已發佈/i;
             const rowScheduledRe = /\\bScheduled\\b|已排程|已定時|定时发布|定時發布/i;
             const rowUploadedRe = /\\bUploaded\\b|已上传|已上傳/i;
-            const rowVisibilityRe = /\\b(Public|Private|Unlisted|Scheduled)\\b|公开|公開|私密|不公开|不公開|已排程|已定時/i;
+            const rowVisibilityRe = /\\b(Public|Private|Unlisted|Scheduled)\\b|公开|公開|私密|私享|不公开|不公開|已排程|已定時/i;
 
             result.active_processing =
                 processingRe.test(combinedText) &&
@@ -6462,6 +6462,7 @@ async def upload_single(
             create_btn = None
             used_selector = None
             max_create_retries = 2  # 最多重试 2 轮 (含刷新)
+            opened_direct_upload = False
             
             for create_round in range(max_create_retries):
                 # 先快速扫一遍
@@ -6494,10 +6495,15 @@ async def upload_single(
                 # 仍然找不到，刷新页面再试一次
                 if create_round < max_create_retries - 1:
                     log("Create 按钮仍未找到，刷新页面重试...", "WARN")
-                    await page.reload(wait_until="domcontentloaded")
-                    await asyncio.sleep(10)
+                    try:
+                        await page.reload(wait_until="domcontentloaded", timeout=15000)
+                        await asyncio.sleep(10)
+                    except Exception as exc:
+                        log(f"刷新页面超时，改用直达上传页兜底: {exc}", "WARN")
+                        opened_direct_upload = await open_direct_upload_page(page)
+                        if opened_direct_upload:
+                            break
             
-            opened_direct_upload = False
             if create_btn:
                 await human_click(page, create_btn, f"Create ({used_selector})")
                 await random_delay(1, 2)

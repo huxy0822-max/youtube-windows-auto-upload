@@ -1223,26 +1223,16 @@ def _call_openai_compatible(api_preset: dict, user_prompt: str, image_data_url: 
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_preset.get('apiKey', '')}",
     }
-    timeout_seconds = 60
-    retryable_codes = {408, 429, 500, 502, 503, 504}
-    prefer_curl = bool(shutil.which("curl"))
+    timeout_seconds = DEFAULT_TIMEOUT_SECONDS
     for url in _build_openai_chat_urls(str(api_preset.get("baseUrl") or "")):
-        for attempt in range(1):
+        for attempt in range(1, 3):
             try:
-                if prefer_curl:
-                    response = _post_json_with_curl(
-                        url,
-                        headers=headers,
-                        json_payload=payload,
-                        timeout=timeout_seconds,
-                    )
-                else:
-                    response = _post_json(
-                        url,
-                        headers=headers,
-                        json_payload=payload,
-                        timeout=timeout_seconds,
-                    )
+                response = _post_json(
+                    url,
+                    headers=headers,
+                    json_payload=payload,
+                    timeout=timeout_seconds,
+                )
                 try:
                     data = response.json()
                 except Exception:
@@ -1251,18 +1241,17 @@ def _call_openai_compatible(api_preset: dict, user_prompt: str, image_data_url: 
                     text = _extract_openai_compatible_text(data)
                     if text:
                         return text
-                error_payload = data.get("error") if isinstance(data, dict) else None
-                if isinstance(error_payload, dict):
-                    last_error = error_payload.get("message") or f"HTTP {response.status_code}"
-                elif error_payload:
-                    last_error = str(error_payload)
+                    last_error = "API 未返回文本内容"
                 else:
-                    fallback_message = data.get("message") if isinstance(data, dict) else ""
-                    last_error = fallback_message or f"HTTP {response.status_code}"
-                if response.status_code not in retryable_codes:
+                    last_error = _extract_api_error_message(data, response.status_code)
+                if not (_is_retryable_http_status(response.status_code) or _is_transient_api_error_text(last_error)):
                     break
             except Exception as exc:
                 last_error = str(exc)
+                if not _is_transient_api_error_text(last_error):
+                    break
+            if attempt < 2:
+                time.sleep(_retry_delay_seconds(attempt))
     raise RuntimeError(f"OpenAI-compatible 调用失败: {last_error}")
 
 
@@ -1462,9 +1451,33 @@ def load_generation_context(
     return prompt_cfg, clone_json(api_presets[chosen_api_name]), clone_json(content_templates[chosen_content_name])
 
 
-def _is_transient_text_api_error(exc: Exception) -> bool:
-    text = str(exc or "").strip().lower()
-    if not text:
+def _retry_delay_seconds(attempt: int) -> float:
+    return float(min(8, max(1, attempt) * 2))
+
+
+def _is_retryable_http_status(status_code: int) -> bool:
+    return int(status_code) in {408, 409, 425, 429, 500, 502, 503, 504}
+
+
+def _extract_api_error_message(payload: Any, status_code: int) -> str:
+    if isinstance(payload, dict):
+        error_payload = payload.get("error")
+        if isinstance(error_payload, dict):
+            message = str(error_payload.get("message") or "").strip()
+            if message:
+                return message
+        if error_payload:
+            return str(error_payload).strip()
+        for key in ("message", "detail", "raw_text"):
+            value = str(payload.get(key) or "").strip()
+            if value:
+                return value
+    return f"HTTP {status_code}"
+
+
+def _is_transient_api_error_text(text: str) -> bool:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
         return False
     hints = (
         "remote end closed connection",
@@ -1478,13 +1491,41 @@ def _is_transient_text_api_error(exc: Exception) -> bool:
         "timed out",
         "timeout",
         "temporarily unavailable",
+        "server busy",
+        "service unavailable",
+        "overloaded",
+        "upstream saturated",
+        "rate limit",
+        "too many requests",
+        "try again later",
+        "please retry",
+        "bad gateway",
+        "gateway timeout",
         "502",
         "503",
         "504",
         "408",
+        "409",
+        "425",
         "429",
+        "负载已饱和",
+        "稍后再试",
+        "服务繁忙",
+        "请求过于频繁",
+        "限流",
+        "超时",
+        "连接被重置",
+        "连接已关闭",
     )
-    return any(hint in text for hint in hints)
+    return any(hint in lowered for hint in hints)
+
+
+def _is_transient_text_api_error(exc: Exception) -> bool:
+    return _is_transient_api_error_text(str(exc or ""))
+
+
+def _is_transient_image_api_error(exc: Exception) -> bool:
+    return _is_transient_api_error_text(str(exc or ""))
 
 
 def generate_content_bundle(
@@ -1713,30 +1754,53 @@ def call_image_model(api_preset: dict, prompt: str) -> dict[str, Any]:
     if not base_url or not api_key or not model:
         raise ValueError("当前图片 API 模板缺少 imageBaseUrl / imageApiKey / imageModel")
 
-    response = _post_json(
-        base_url,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
-        json_payload={
-            "model": model,
-            "modalities": ["text", "image"],
-            "messages": [{"role": "user", "content": str(prompt or "").strip()}],
-        },
-        timeout=DEFAULT_TIMEOUT_SECONDS,
-    )
-    raw = response.text
-    data = response.json()
-    if not response.ok:
-        raise RuntimeError(data.get("error", {}).get("message") or f"图片接口 HTTP {response.status_code}")
-    content = data.get("choices", [{}])[0].get("message", {}).get("content")
-    data_url = _extract_data_url(content) or _extract_data_url(data)
-    return {
-        "data_url": data_url,
-        "text": content if isinstance(content, str) else json.dumps(content or "", ensure_ascii=False),
-        "raw": raw,
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
     }
+    payload = {
+        "model": model,
+        "modalities": ["text", "image"],
+        "messages": [{"role": "user", "content": str(prompt or "").strip()}],
+    }
+    last_error = "图片接口未返回结果"
+    for attempt in range(1, 4):
+        try:
+            response = _post_json(
+                base_url,
+                headers=headers,
+                json_payload=payload,
+                timeout=DEFAULT_TIMEOUT_SECONDS,
+            )
+            raw = response.text
+            try:
+                data = response.json()
+            except Exception:
+                data = {"raw_text": raw}
+            if not response.ok:
+                last_error = _extract_api_error_message(data, response.status_code)
+                if attempt >= 3 or not (
+                    _is_retryable_http_status(response.status_code) or _is_transient_api_error_text(last_error)
+                ):
+                    raise RuntimeError(last_error)
+                time.sleep(_retry_delay_seconds(attempt))
+                continue
+
+            content = data.get("choices", [{}])[0].get("message", {}).get("content")
+            data_url = _extract_data_url(content) or _extract_data_url(data)
+            if data_url:
+                return {
+                    "data_url": data_url,
+                    "text": content if isinstance(content, str) else json.dumps(content or "", ensure_ascii=False),
+                    "raw": raw,
+                }
+            raise RuntimeError("图片接口未返回可用图片数据")
+        except Exception as exc:
+            last_error = str(exc)
+            if attempt >= 3 or not _is_transient_image_api_error(exc):
+                raise RuntimeError(last_error) from exc
+            time.sleep(_retry_delay_seconds(attempt))
+    raise RuntimeError(last_error)
 
 
 def save_data_url_image(data_url: str, target_path: Path) -> Path:
