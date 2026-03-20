@@ -288,35 +288,37 @@ def _windows_has_nvenc_runtime() -> bool:
 # ============ FFmpeg 编码参数 (平台自适应) ============
 if IS_MAC:
     VIDEO_CODEC = "h264_videotoolbox"
-    VIDEO_BITRATE = "5000k"
+    VIDEO_BITRATE = "8000k"
     VIDEO_SPATIAL_AQ = True
     _CODEC_EXTRA_ARGS = ['-spatial_aq', '1']
 elif IS_WINDOWS and _windows_has_nvenc_runtime():
     VIDEO_CODEC = "h264_nvenc"
-    VIDEO_BITRATE = "5000k"
+    VIDEO_BITRATE = "8000k"
     VIDEO_SPATIAL_AQ = False
     _CODEC_EXTRA_ARGS = [
         "-preset", "p4",
         "-tune", "hq",
         "-rc", "vbr",
+        "-maxrate", "8000k",
+        "-bufsize", "16000k",
     ]
 elif IS_WINDOWS and _ffmpeg_has_encoder("h264_amf") and _windows_has_amf_runtime():
     VIDEO_CODEC = "h264_amf"
-    VIDEO_BITRATE = "5000k"
+    VIDEO_BITRATE = "8000k"
     VIDEO_SPATIAL_AQ = False
     _CODEC_EXTRA_ARGS = [
         "-usage", "transcoding",
         "-quality", "balanced",
         "-profile:v", "high",
         "-rc", "cbr",
-        "-maxrate", "6500k",
-        "-bufsize", "12000k",
+        "-maxrate", "8000k",
+        "-bufsize", "16000k",
     ]
 else:
     VIDEO_CODEC = "libx264"           # CPU 编码 (最大兼容性)
-    VIDEO_BITRATE = "5000k"
+    VIDEO_BITRATE = "8000k"
     VIDEO_SPATIAL_AQ = False
-    _CODEC_EXTRA_ARGS = ['-preset', 'veryfast']
+    _CODEC_EXTRA_ARGS = ['-preset', 'veryfast', '-maxrate', '8000k', '-bufsize', '16000k']
 AUDIO_BITRATE = "320k"
 AUDIO_SAMPLERATE = "44100"
 
@@ -894,14 +896,16 @@ def parse_arguments() -> RenderOptions:
     return opts
 
 
-def build_effect_kwargs(opts: RenderOptions) -> dict:
+def build_effect_kwargs(opts: RenderOptions, *, rng=None) -> dict:
+    rng = rng or random
+
     def choose_value(value, *, default=None, choices: list | None = None):
         raw = value
         if isinstance(raw, str):
             raw = raw.strip()
             if raw.lower() == "random":
-                if opts.fx_randomize and choices:
-                    return random.choice(list(choices))
+                if choices:
+                    return rng.choice(list(choices))
                 return default
         return raw if raw not in (None, "") else default
 
@@ -910,21 +914,18 @@ def build_effect_kwargs(opts: RenderOptions) -> dict:
         if isinstance(raw, str):
             text = raw.strip()
             matched = re.fullmatch(r"\s*(-?\d+)\s*[-,~]\s*(-?\d+)\s*", text)
-            if matched and not opts.fx_randomize:
-                text = matched.group(1)
-            if opts.fx_randomize:
-                if matched:
-                    left = int(matched.group(1))
-                    right = int(matched.group(2))
-                    low, high = sorted((left, right))
-                    picked = random.randint(low, high)
-                    if minimum is not None:
-                        picked = max(minimum, picked)
-                    if maximum is not None:
-                        picked = min(maximum, picked)
-                    return picked
-                if text.lower() == "random" and minimum is not None and maximum is not None:
-                    return random.randint(minimum, maximum)
+            if matched:
+                left = int(matched.group(1))
+                right = int(matched.group(2))
+                low, high = sorted((left, right))
+                picked = rng.randint(low, high)
+                if minimum is not None:
+                    picked = max(minimum, picked)
+                if maximum is not None:
+                    picked = min(maximum, picked)
+                return picked
+            if text.lower() == "random" and minimum is not None and maximum is not None:
+                return rng.randint(minimum, maximum)
             try:
                 picked = int(text)
             except Exception:
@@ -945,21 +946,18 @@ def build_effect_kwargs(opts: RenderOptions) -> dict:
         if isinstance(raw, str):
             text = raw.strip()
             matched = re.fullmatch(r"\s*(-?\d+(?:\.\d+)?)\s*[-,~]\s*(-?\d+(?:\.\d+)?)\s*", text)
-            if matched and not opts.fx_randomize:
-                text = matched.group(1)
-            if opts.fx_randomize:
-                if matched:
-                    left = float(matched.group(1))
-                    right = float(matched.group(2))
-                    low, high = sorted((left, right))
-                    picked = round(random.uniform(low, high), precision)
-                    if minimum is not None:
-                        picked = max(minimum, picked)
-                    if maximum is not None:
-                        picked = min(maximum, picked)
-                    return picked
-                if text.lower() == "random" and minimum is not None and maximum is not None:
-                    return round(random.uniform(minimum, maximum), precision)
+            if matched:
+                left = float(matched.group(1))
+                right = float(matched.group(2))
+                low, high = sorted((left, right))
+                picked = round(rng.uniform(low, high), precision)
+                if minimum is not None:
+                    picked = max(minimum, picked)
+                if maximum is not None:
+                    picked = min(maximum, picked)
+                return picked
+            if text.lower() == "random" and minimum is not None and maximum is not None:
+                return round(rng.uniform(minimum, maximum), precision)
             try:
                 picked = float(text)
             except Exception:
@@ -996,7 +994,11 @@ def build_effect_kwargs(opts: RenderOptions) -> dict:
         "color_tint": choose_value(opts.fx_color_tint, default="none", choices=list_tint_names()),
         "soft_focus": opts.fx_soft_focus,
         "soft_focus_sigma": choose_float(opts.fx_soft_focus_sigma, default=1.5, minimum=0.3, maximum=6.0),
-        "particle": choose_value(opts.fx_particle, default="none", choices=list_particle_effects()),
+        "particle": choose_value(
+            opts.fx_particle,
+            default="none",
+            choices=[item for item in list_particle_effects() if item not in {"none", "random"}],
+        ),
         "particle_opacity": choose_float(opts.fx_particle_opacity, default=0.6, minimum=0.0, maximum=1.0),
         "particle_speed": choose_float(opts.fx_particle_speed, default=1.0, minimum=0.2, maximum=3.0),
         "text_font": choose_value(opts.fx_text_font, default="default", choices=list_font_names()),
@@ -1184,9 +1186,19 @@ def phase3_render_and_upload(active_projects: list, master_map: dict, opts: Rend
             
             chosen_master = random.choice(valid_masters)
             master_dur = get_audio_duration(chosen_master)
-            
-            effect_kwargs = build_effect_kwargs(opts)
-            filter_str, effect_desc, extra_inputs = get_effect(master_dur, **effect_kwargs)
+
+            effect_seed = "|".join(
+                [
+                    str(opts.target_date),
+                    str(tag),
+                    str(container if not opts.simple_mode else idx),
+                    img.stem,
+                    chosen_master.stem,
+                ]
+            )
+            effect_rng = random.Random(effect_seed)
+            effect_kwargs = build_effect_kwargs(opts, rng=effect_rng)
+            filter_str, effect_desc, extra_inputs = get_effect(master_dur, rng=effect_rng, **effect_kwargs)
             
             tag_video_jobs.append({
                 "tag": tag,
@@ -1195,6 +1207,7 @@ def phase3_render_and_upload(active_projects: list, master_map: dict, opts: Rend
                 "out": out_file,
                 "filter": filter_str,
                 "desc": effect_desc,
+                "effect_kwargs": effect_kwargs,
                 "extra_inputs": extra_inputs
             })
         
@@ -1241,7 +1254,12 @@ def phase3_render_and_upload(active_projects: list, master_map: dict, opts: Rend
                     if res['success']:
                         tag_success += 1
                         total_success += 1
-                        print(f"  {prefix} ✅ {tag}/{container} | {task['desc']} | {res['time']:.0f}s")
+                        fx = task.get('effect_kwargs', {})
+                        print(
+                            f"  {prefix} ✅ {tag}/{container} | {task['desc']} | "
+                            f"particle={fx.get('particle')} opacity={fx.get('particle_opacity')} "
+                            f"speed={fx.get('particle_speed')} | {res['time']:.0f}s"
+                        )
                     else:
                         print(f"  {prefix} ❌ {tag}/{container}: {res.get('error')}")
                 progress_stop.set()
@@ -1570,12 +1588,10 @@ def main():
     
     # 显示当前设置
     print(f"🎛️  效果设置:")
-    if opts.fx_randomize:
-        print("   视觉策略: 🎲 全随机（频谱 / 时间轴 / 黑边 / 缩放 / 颜色 / 粒子 / 增强效果按视频随机）")
-    else:
-        print(f"   频谱: {'✅ 开' if opts.fx_spectrum else '❌ 关'}  |  时间轴: {'✅ 开' if opts.fx_timeline else '❌ 关'}  |  黑边: {'✅ 开' if opts.fx_letterbox else '❌ 关'}")
-        print(f"   缩放: {opts.fx_zoom}  |  频谱色: {opts.fx_color_spectrum}  |  时间轴色: {opts.fx_color_timeline}")
-        print(f"   样式: {opts.fx_style}  |  频谱Y: {opts.fx_spectrum_y}")
+    print("   视觉策略: 🎛️ 高级视觉配置（只有选成 random 的字段会按每个视频单独随机）")
+    print(f"   频谱: {'✅ 开' if opts.fx_spectrum else '❌ 关'}  |  时间轴: {'✅ 开' if opts.fx_timeline else '❌ 关'}  |  黑边: {'✅ 开' if opts.fx_letterbox else '❌ 关'}")
+    print(f"   缩放: {opts.fx_zoom}  |  频谱色: {opts.fx_color_spectrum}  |  时间轴色: {opts.fx_color_timeline}")
+    print(f"   样式: {opts.fx_style}  |  频谱Y: {opts.fx_spectrum_y}")
     print(f"   可选: --color=X (同时设置两种颜色)  --color-spectrum=X  --color-timeline=X  --style=bar/wave/circular  --spectrum-y=530")
     if opts.selected_tags:
         print(f"🏷️  指定标签: {', '.join(all_tags)}")

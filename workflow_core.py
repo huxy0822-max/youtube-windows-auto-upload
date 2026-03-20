@@ -1551,6 +1551,22 @@ def _build_upload_options(task: WindowTask) -> dict[str, Any]:
     return values
 
 
+def _describe_effect_kwargs(effect_kwargs: dict[str, Any]) -> str:
+    parts = [
+        f"style={effect_kwargs.get('style')}",
+        f"spectrum={effect_kwargs.get('color_spectrum')}",
+        f"timeline={effect_kwargs.get('color_timeline')}",
+        f"particle={effect_kwargs.get('particle')}",
+        f"opacity={effect_kwargs.get('particle_opacity')}",
+        f"speed={effect_kwargs.get('particle_speed')}",
+        f"text_pos={effect_kwargs.get('text_pos')}",
+        f"text_size={effect_kwargs.get('text_size')}",
+        f"text_style={effect_kwargs.get('text_style')}",
+        f"font={effect_kwargs.get('text_font')}",
+    ]
+    return " | ".join(parts)
+
+
 def _render_with_progress(
     *,
     image_path: Path,
@@ -2320,17 +2336,26 @@ def execute_direct_media_workflow(
             if control:
                 control.check_cancelled()
                 control.wait_if_paused(log=log, label=f"{tag}/{task.serial}")
+            unique_seed = _build_unique_seed(
+                defaults.date_mmdd,
+                tag,
+                task.serial,
+                source_audio.stem,
+                source_image.stem,
+            )
             output_video = Path(state["output_dir"]) / f"{defaults.date_mmdd}_{task.serial}.mp4"
             clean_incomplete(output_video)
             output_video.unlink(missing_ok=True)
             Path(str(output_video) + ".done").unlink(missing_ok=True)
 
             render_options = _build_render_options_from_defaults(defaults)
-            effect_kwargs = build_effect_kwargs(render_options)
+            effect_rng = random.Random(f"{unique_seed}|visual")
+            effect_kwargs = build_effect_kwargs(render_options, rng=effect_rng)
             duration = get_audio_duration(source_audio)
-            filter_complex, effect_desc, extra_inputs = get_effect(duration, **effect_kwargs)
+            filter_complex, effect_desc, extra_inputs = get_effect(duration, rng=effect_rng, **effect_kwargs)
             log(f"[任务] {tag}/{task.serial}: {source_image.name} + {source_audio.name} -> {output_video.name}")
             log(f"[渲染] 编码器={VIDEO_CODEC} | 码率 {VIDEO_BITRATE} | 特效 {effect_desc}")
+            log(f"[视觉] {tag}/{task.serial}: {_describe_effect_kwargs(effect_kwargs)}")
             _render_with_progress(
                 image_path=source_image,
                 audio_path=source_audio,
@@ -2358,13 +2383,6 @@ def execute_direct_media_workflow(
                 cover_source = "source_image"
             thumbnail_prompts: list[str] = []
             history_scope = get_used_metadata_scope(tag, config=config)
-            unique_seed = _build_unique_seed(
-                defaults.date_mmdd,
-                tag,
-                task.serial,
-                source_audio.stem,
-                source_image.stem,
-            )
             metadata_failed = False
             metadata_error = ""
             try:
