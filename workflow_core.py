@@ -1578,6 +1578,7 @@ def refresh_existing_output_metadata(
                     date_mmdd=defaults.date_mmdd,
                     thumbnails=cover_paths,
                     source="metadata_refresh",
+                    log=log,
                 )
                 current_titles.append(title)
                 if description:
@@ -2224,6 +2225,7 @@ def execute_metadata_only_workflow(
                 date_mmdd=defaults.date_mmdd,
                 thumbnails=cover_paths,
                 source="metadata_only",
+                log=log,
             )
             state["titles"].append(title)
             if description:
@@ -2511,6 +2513,7 @@ def execute_direct_media_workflow(
                 date_mmdd=defaults.date_mmdd,
                 thumbnails=cover_paths,
                 source="render",
+                log=log,
             )
             state["titles"].append(title)
             if description:

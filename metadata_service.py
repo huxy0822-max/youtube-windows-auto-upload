@@ -49,16 +49,72 @@ def _thumbnail_prompt_values(value: Any) -> list[str]:
     return []
 
 
+def _default_used_metadata_root() -> Path:
+    return SCRIPT_DIR / "workspace" / "AutoTask" / "_used_media" / "metadata"
+
+
 def get_used_metadata_root(config: dict[str, Any] | None = None) -> Path:
     cfg = config or {}
     raw_root = str(cfg.get("used_media_root") or "").strip()
     if raw_root:
         return Path(raw_root) / "metadata"
-    return SCRIPT_DIR / "workspace" / "AutoTask" / "_used_media" / "metadata"
+    return _default_used_metadata_root()
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    return left.resolve(strict=False) == right.resolve(strict=False)
+
+
+def _used_metadata_root_candidates(config: dict[str, Any] | None = None) -> list[Path]:
+    preferred = get_used_metadata_root(config)
+    fallback = _default_used_metadata_root()
+    if _same_path(preferred, fallback):
+        return [preferred]
+    return [preferred, fallback]
+
+
+def _ensure_writable_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    probe = path / ".write_probe.tmp"
+    probe.write_text("ok", encoding="utf-8")
+    probe.unlink(missing_ok=True)
+
+
+def _resolve_used_metadata_root_for_read(config: dict[str, Any] | None = None) -> Path:
+    candidates = _used_metadata_root_candidates(config)
+    for candidate in candidates:
+        if (candidate / "used_metadata_history.json").exists():
+            return candidate
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+def _resolve_used_metadata_root_for_write(
+    config: dict[str, Any] | None = None,
+    *,
+    log: LogFunc = _noop_log,
+) -> Path:
+    candidates = _used_metadata_root_candidates(config)
+    fallback = _default_used_metadata_root()
+    last_error: Exception | None = None
+    for index, candidate in enumerate(candidates):
+        try:
+            _ensure_writable_directory(candidate)
+            return candidate
+        except Exception as exc:
+            last_error = exc
+            if index == 0 and len(candidates) > 1:
+                log(
+                    f"[Metadata] 历史目录不可写，已回退到本地: {candidate} -> {fallback} | 原因: {exc}"
+                )
+    assert last_error is not None
+    raise last_error
 
 
 def get_used_metadata_history_path(config: dict[str, Any] | None = None) -> Path:
-    return get_used_metadata_root(config) / "used_metadata_history.json"
+    return _resolve_used_metadata_root_for_read(config) / "used_metadata_history.json"
 
 
 def load_used_metadata_history(config: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -171,6 +227,7 @@ def record_used_metadata(
     thumbnails: list[Path] | None = None,
     source: str = "",
     keep_per_tag: int = 20000,
+    log: LogFunc = _noop_log,
 ) -> None:
     data = load_used_metadata_history(config)
     tags = data.setdefault("tags", {})
@@ -192,12 +249,13 @@ def record_used_metadata(
     )
     signature = _record_signature(record)
     all_rows = _iter_metadata_rows(data)
+    history_path = _resolve_used_metadata_root_for_write(config, log=log) / "used_metadata_history.json"
     if signature and any(_record_signature(item) == signature for item in all_rows):
-        _write_json(get_used_metadata_history_path(config), data)
+        _write_json(history_path, data)
         return
     rows.append(record)
     tags[tag_key] = rows[-max(1000, keep_per_tag):]
-    _write_json(get_used_metadata_history_path(config), data)
+    _write_json(history_path, data)
 
 
 def archive_uploaded_metadata(
@@ -214,7 +272,7 @@ def archive_uploaded_metadata(
     move_files: bool = True,
     log: LogFunc = _noop_log,
 ) -> Path:
-    root = get_used_metadata_root(config)
+    root = _resolve_used_metadata_root_for_write(config, log=log)
     archive_dir = root / _metadata_key(tag) / f"{date_mmdd}_{serial}"
     archive_dir.mkdir(parents=True, exist_ok=True)
 
@@ -258,6 +316,7 @@ def archive_uploaded_metadata(
         date_mmdd=date_mmdd,
         thumbnails=[Path(item) for item in archived_thumbnail_paths],
         source="uploaded",
+        log=log,
     )
     log(f"[Metadata] 已归档文案记录: {bundle_path}")
     return bundle_path
