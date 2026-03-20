@@ -124,62 +124,69 @@ def _overlay_needs_colorkey(path: Path) -> bool:
     return path.suffix.lower() in {".mp4", ".mkv"}
 
 
-def _particle_overlay_plan(name: str) -> dict[str, float]:
+def _particle_overlay_plan(name: str, *, rng=None) -> dict[str, float]:
+    rng = rng or random
     lower = name.lower()
     if any(token in lower for token in ("snow", "glitter", "dust", "spark", "magic", "fairy", "bokeh")):
-        scale = random.uniform(1.55, 2.30)
+        scale = rng.uniform(1.70, 2.45)
     elif any(token in lower for token in ("smoke", "rain", "fireflies", "light", "flare")):
-        scale = random.uniform(1.30, 1.95)
+        scale = rng.uniform(1.35, 2.00)
     else:
-        scale = random.uniform(1.40, 2.10)
+        scale = rng.uniform(1.50, 2.20)
     return {
         "scale": scale,
-        "base_x": random.uniform(0.0, 1.0),
-        "base_y": random.uniform(0.0, 1.0),
-        "sway_px": random.uniform(18.0, 80.0),
-        "sway_speed": random.uniform(0.12, 0.56),
-        "drift_px": random.uniform(12.0, 64.0),
-        "drift_speed": random.uniform(0.10, 0.40),
-        "flip_h": 1.0 if random.random() < 0.5 else 0.0,
-        "flip_v": 1.0 if random.random() < 0.18 else 0.0,
+        "base_x": rng.uniform(0.0, 1.0),
+        "base_y": rng.uniform(0.0, 1.0),
+        "sway_px": rng.uniform(18.0, 80.0),
+        "sway_speed": rng.uniform(0.12, 0.56),
+        "drift_px": rng.uniform(12.0, 64.0),
+        "drift_speed": rng.uniform(0.10, 0.40),
+        "flip_h": 1.0 if rng.random() < 0.5 else 0.0,
+        "flip_v": 1.0 if rng.random() < 0.18 else 0.0,
     }
 
 
-def _pick_palette(name: str) -> dict:
+def _pick_palette(name: str, *, rng=None) -> dict:
+    rng = rng or random
     if name == "random":
-        name = random.choice(list(PALETTES.keys()))
+        name = rng.choice(list(PALETTES.keys()))
     return PALETTES.get(name, PALETTES["WhiteGold"])
 
 
-def _pick_flag(value, *, probability_true: float = 0.5) -> bool:
+def _pick_flag(value, *, probability_true: float = 0.5, rng=None) -> bool:
+    rng = rng or random
     if value == "random":
-        return random.random() < probability_true
+        return rng.random() < probability_true
     return bool(value)
 
 
-def _pick_style(name: str) -> str:
+def _pick_style(name: str, *, rng=None) -> str:
+    rng = rng or random
     if name == "random":
-        return random.choice(["bar", "wave", "circular", "bar_mirror"])
+        return rng.choice(["bar", "wave", "circular", "bar_mirror"])
     return name
 
 
-def _pick_particle(name: str) -> str:
+def _pick_particle(name: str, *, rng=None) -> str:
+    rng = rng or random
     particle_files = discover_particle_files()
     if name == "random":
         choices = list(particle_files.keys())
-        return random.choice(choices) if choices else "none"
+        return rng.choice(choices) if choices else "none"
     return name if name in particle_files or name == "none" else "none"
 
 
-def _pick_tint(name: str) -> str:
+def _pick_tint(name: str, *, rng=None) -> str:
+    rng = rng or random
     if name == "random":
-        return random.choice(list(TINT_FILTERS.keys()))
+        return rng.choice(list(TINT_FILTERS.keys()))
     return name
 
 
-def _pick_text_style(name: str) -> str:
+def _pick_text_style(name: str, *, rng=None) -> str:
+    rng = rng or random
     if name == "random":
-        return random.choice(["Classic", "Glow", "Neon", "Bold", "Box"])
+        return rng.choice(["Classic", "Glow", "Neon", "Bold", "Box"])
     return name
 
 
@@ -277,6 +284,7 @@ def get_effect(
     particle_opacity: float = 0.6,
     particle_speed: float = 1.0,
     text_font: str = "default",
+    rng=None,
     **_,
 ):
     """
@@ -287,6 +295,7 @@ def get_effect(
     - effect_desc: 给日志/UI 展示的简短说明
     - extra_inputs: 例如粒子覆盖层需要追加的 `-i`
     """
+    rng = rng or random
     duration = max(_coerce_float(duration, 5.0), 1.0)
     text_size = max(_coerce_int(text_size, 42), 18)
     spectrum_y = _coerce_int(spectrum_y, 530)
@@ -296,23 +305,23 @@ def get_effect(
     particle_opacity = max(0.0, min(_coerce_float(particle_opacity, 0.6), 1.0))
     particle_speed = max(_coerce_float(particle_speed, 1.0), 0.2)
 
-    spectrum = _pick_flag(spectrum, probability_true=0.85)
-    timeline = _pick_flag(timeline, probability_true=0.85)
-    letterbox = _pick_flag(letterbox, probability_true=0.5)
-    film_grain = _pick_flag(film_grain, probability_true=0.6)
-    vignette = _pick_flag(vignette, probability_true=0.45)
-    soft_focus = _pick_flag(soft_focus, probability_true=0.35)
-    style = _pick_style(style)
+    spectrum = _pick_flag(spectrum, probability_true=0.85, rng=rng)
+    timeline = _pick_flag(timeline, probability_true=0.85, rng=rng)
+    letterbox = _pick_flag(letterbox, probability_true=0.5, rng=rng)
+    film_grain = _pick_flag(film_grain, probability_true=0.6, rng=rng)
+    vignette = _pick_flag(vignette, probability_true=0.45, rng=rng)
+    soft_focus = _pick_flag(soft_focus, probability_true=0.35, rng=rng)
+    style = _pick_style(style, rng=rng)
     if zoom == "random":
-        zoom = random.choice(list(ZOOM_SPEEDS.keys()))
-    text_style = _pick_text_style(text_style)
+        zoom = rng.choice(list(ZOOM_SPEEDS.keys()))
+    text_style = _pick_text_style(text_style, rng=rng)
     if text_style not in {"Classic", "Glow", "Neon", "Bold", "Box"}:
         text_style = "Classic"
 
-    spectrum_palette = _pick_palette(color_spectrum)
-    timeline_palette = _pick_palette(color_timeline)
-    tint_name = _pick_tint(color_tint)
-    particle_name = _pick_particle(particle)
+    spectrum_palette = _pick_palette(color_spectrum, rng=rng)
+    timeline_palette = _pick_palette(color_timeline, rng=rng)
+    tint_name = _pick_tint(color_tint, rng=rng)
+    particle_name = _pick_particle(particle, rng=rng)
     zoom_speed = ZOOM_SPEEDS.get(zoom, ZOOM_SPEEDS["normal"])
 
     chains = []
@@ -364,7 +373,7 @@ def get_effect(
     if particle_name != "none":
         overlay_file = OVERLAY_DIR / particle_files.get(particle_name, "")
         if overlay_file.exists():
-            overlay_plan = _particle_overlay_plan(particle_name)
+            overlay_plan = _particle_overlay_plan(particle_name, rng=rng)
             overlay_scale = max(float(overlay_plan.get("scale", 1.0)), 1.0)
             overlay_w = max(1920, int(round((1920 * overlay_scale) / 2.0) * 2))
             overlay_h = max(1080, int(round((1080 * overlay_scale) / 2.0) * 2))

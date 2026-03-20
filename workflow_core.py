@@ -229,7 +229,7 @@ class WorkflowDefaults:
     generate_text: bool = True
     generate_thumbnails: bool = True
     sync_daily_content: bool = True
-    randomize_effects: bool = True
+    randomize_effects: bool = False
     visual_settings: dict[str, Any] = field(default_factory=dict)
 
     def upload_defaults(self) -> dict[str, Any]:
@@ -275,9 +275,7 @@ def _coerce_visual_numeric(value: Any, default: Any) -> Any:
 def _build_render_options_from_defaults(defaults: WorkflowDefaults) -> RenderOptions:
     settings = defaults.visual_settings or {}
     opts = RenderOptions()
-    opts.fx_randomize = bool(defaults.randomize_effects)
-    if opts.fx_randomize:
-        return opts
+    opts.fx_randomize = False
 
     opts.fx_spectrum = bool(settings.get("spectrum", True))
     opts.fx_timeline = bool(settings.get("timeline", True))
@@ -286,9 +284,9 @@ def _build_render_options_from_defaults(defaults: WorkflowDefaults) -> RenderOpt
     opts.fx_style = str(settings.get("style", "bar") or "bar")
     opts.fx_color_spectrum = str(settings.get("color_spectrum", "WhiteGold") or "WhiteGold")
     opts.fx_color_timeline = str(settings.get("color_timeline", "WhiteGold") or "WhiteGold")
-    opts.fx_spectrum_y = _coerce_int(settings.get("spectrum_y", 530), 530)
-    opts.fx_spectrum_x = _coerce_int(settings.get("spectrum_x", -1), -1)
-    opts.fx_spectrum_w = _coerce_visual_numeric(settings.get("spectrum_w", 1200), 1200)
+    opts.fx_spectrum_y = settings.get("spectrum_y", 530)
+    opts.fx_spectrum_x = settings.get("spectrum_x", -1)
+    opts.fx_spectrum_w = settings.get("spectrum_w", 1200)
     opts.fx_film_grain = bool(settings.get("film_grain", False))
     opts.fx_grain_strength = _coerce_visual_numeric(settings.get("grain_strength", 15), 15)
     opts.fx_vignette = bool(settings.get("vignette", False))
@@ -1077,6 +1075,22 @@ def _build_unique_seed(date_mmdd: str, tag: str, serial: int, *parts: str) -> st
     core.append(str(time.time_ns()))
     core.append(str(random.randint(1000, 9999)))
     return "|".join(item for item in core if item)
+
+
+def _describe_effect_kwargs(effect_kwargs: dict[str, Any]) -> str:
+    parts = [
+        f"style={effect_kwargs.get('style')}",
+        f"spectrum={effect_kwargs.get('spectrum')}",
+        f"timeline={effect_kwargs.get('timeline')}",
+        f"particle={effect_kwargs.get('particle')}",
+        f"opacity={effect_kwargs.get('particle_opacity')}",
+        f"speed={effect_kwargs.get('particle_speed')}",
+        f"text_pos={effect_kwargs.get('text_pos')}",
+        f"text_size={effect_kwargs.get('text_size')}",
+        f"text_style={effect_kwargs.get('text_style')}",
+        f"font={effect_kwargs.get('text_font')}",
+    ]
+    return " | ".join(parts)
 
 
 def _resolve_manifest_media_path(folder: Path, value: Any) -> Path | None:
@@ -2344,17 +2358,26 @@ def execute_direct_media_workflow(
             if control:
                 control.check_cancelled()
                 control.wait_if_paused(log=log, label=f"{tag}/{task.serial}")
+            unique_seed = _build_unique_seed(
+                defaults.date_mmdd,
+                tag,
+                task.serial,
+                source_audio.stem,
+                source_image.stem,
+            )
             output_video = Path(state["output_dir"]) / f"{defaults.date_mmdd}_{task.serial}.mp4"
             clean_incomplete(output_video)
             output_video.unlink(missing_ok=True)
             Path(str(output_video) + ".done").unlink(missing_ok=True)
 
             render_options = _build_render_options_from_defaults(defaults)
-            effect_kwargs = build_effect_kwargs(render_options)
+            effect_rng = random.Random(f"{unique_seed}|visual")
+            effect_kwargs = build_effect_kwargs(render_options, rng=effect_rng)
             duration = get_audio_duration(source_audio)
-            filter_complex, effect_desc, extra_inputs = get_effect(duration, **effect_kwargs)
+            filter_complex, effect_desc, extra_inputs = get_effect(duration, rng=effect_rng, **effect_kwargs)
             log(f"[任务] {tag}/{task.serial}: {source_image.name} + {source_audio.name} -> {output_video.name}")
-            log(f"[渲染] 编码器 {VIDEO_CODEC} | 码率 {VIDEO_BITRATE} | 特效 {effect_desc}")
+            log(f"[渲染] 编码器={VIDEO_CODEC} | 码率 {VIDEO_BITRATE} | 特效 {effect_desc}")
+            log(f"[视觉] {tag}/{task.serial}: {_describe_effect_kwargs(effect_kwargs)}")
             _render_with_progress(
                 image_path=source_image,
                 audio_path=source_audio,
@@ -2382,13 +2405,6 @@ def execute_direct_media_workflow(
                 cover_source = "source_image"
             thumbnail_prompts: list[str] = []
             history_scope = get_used_metadata_scope(tag, config=config)
-            unique_seed = _build_unique_seed(
-                defaults.date_mmdd,
-                tag,
-                task.serial,
-                source_audio.stem,
-                source_image.stem,
-            )
 
             if defaults.metadata_mode == "prompt_api" and (defaults.generate_text or defaults.generate_thumbnails):
                 if control:
