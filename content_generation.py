@@ -518,34 +518,32 @@ def _build_compact_generation_prompt(
     genre_text = str(content_template.get("musicGenre") or "").strip()
     title_library = str(content_template.get("titleLibrary") or "").strip()
     master_prompt = str(render_master_prompt(content_template) or "").strip()
-    payload = {
-        "musicGenre": genre_text,
-        "angle": angle_text,
-        "audience": audience_text,
-        "masterPrompt": master_prompt,
-        "titleLibrary": title_library,
-        "seed": str(unique_seed or "").strip(),
-        "titleCount": title_count,
-        "descriptionCount": desc_count,
-        "thumbnailCount": thumb_count,
-        "tagCountMin": tag_range[0],
-        "tagCountMax": tag_range[1],
-        "language": language_ui,
-        "thumbnailTextLanguage": language_english,
-        "imageProvided": bool(image_data_url),
-    }
+    seed_text = str(unique_seed or "").strip()
+    image_hint = "这次有参考图片，可参考画面信息。" if image_data_url else "这次没有参考图片，请只根据文字内容构思。"
     return (
-        "Return strict JSON only.\n"
-        "Task: create the full YouTube metadata bundle for one music video in a single response.\n"
-        "All titles, descriptions and tags must be Traditional Chinese.\n"
-        f"Every thumbnail prompt must end with: Use {language_english} text in the image.\n"
-        "Use the provided musicGenre, angle, and audience exactly as given. Do not rewrite, replace, soften, or auto-create them.\n"
-        "Treat masterPrompt as the highest-priority instruction.\n"
-        "Use titleLibrary as a style reference and flavor guide, but do not copy it verbatim.\n"
-        "Keep titles clearly different from each other.\n"
-        "Return the whole result in one valid JSON object.\n\n"
-        f"Input:\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
-        "Need exact JSON schema:\n"
+        "请一次性完成这个 YouTube 音乐视频的完整文案包。\n\n"
+        "请严格遵守以下固定输入，不要改写、不要弱化、不要自动重命名：\n"
+        f"- 音乐类型：{genre_text}\n"
+        f"- 受众人群：{audience_text}\n"
+        f"- 切入角度：{angle_text}\n"
+        f"- 输出语言：{language_ui}\n"
+        f"- 唯一 seed：{seed_text}\n"
+        f"- 标题数量：{title_count}\n"
+        f"- 简介数量：{desc_count}\n"
+        f"- 缩略图提示词数量：{thumb_count}\n"
+        f"- 标签数量：{tag_range[0]} 到 {tag_range[1]} 个\n"
+        f"- {image_hint}\n\n"
+        "这是最高优先级主提示词，你必须严格执行：\n"
+        f"{master_prompt}\n\n"
+        "这是标题库，只允许学习风格、结构、切入维度和语气，不允许照抄：\n"
+        f"{title_library}\n\n"
+        "输出要求：\n"
+        "1. 标题、简介、标签必须全部使用繁体中文。\n"
+        "2. 同一批标题必须明显不同，不能只是换个近义词。\n"
+        "3. 缩略图提示词是写给生图模型看的，可以用英文描述画面，但最后一句必须包含："
+        f"Use {language_english} text in the image.\n"
+        "4. 只允许输出一个合法 JSON 对象，不要输出解释、不要输出 markdown、不要输出代码块。\n\n"
+        "返回 JSON schema：\n"
         '{"usedAngle":"string","titles":["string"],"descriptions":["string"],"seoHashtags":["#tag"],"tagList":["keyword"],"thumbnails":[{"forTitle":"string","prompt":"string"}]}'
     )
 
