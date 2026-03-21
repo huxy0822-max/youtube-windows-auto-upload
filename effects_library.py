@@ -37,6 +37,8 @@ PALETTES = {
     "MegaBassPurple": {"spectrum": "#F5D7FF|#A855F7", "timeline": "#A855F7", "text": "#FFF0FF"},
     "MegaBassGreen": {"spectrum": "#D6FFE6|#22C55E", "timeline": "#22C55E", "text": "#F1FFF6"},
     "MegaBassAmber": {"spectrum": "#FFE5BF|#F59E0B", "timeline": "#F59E0B", "text": "#FFF7E6"},
+    "MegaBassCyan": {"spectrum": "#D8F8FF|#22D3EE", "timeline": "#22D3EE", "text": "#ECFEFF"},
+    "MegaBassMagenta": {"spectrum": "#FFD6F6|#EC4899", "timeline": "#EC4899", "text": "#FFF1FA"},
 }
 
 ZOOM_SPEEDS = {
@@ -59,14 +61,33 @@ MEGA_BASS_PRIMARY_PARTICLES = [
     "mega_white_particles_4407",
     "mega_light_waves_particles_18063",
     "spark_burst_loop",
+    "mega_gold_glitters_2866",
+    "mega_black_sparkles_14865",
+    "gold_glitter_fall_02_dense_b",
 ]
 
 MEGA_BASS_ACCENT_PARTICLES = [
-    "mega_gold_glitters_2866",
-    "mega_black_sparkles_14865",
     "gold_glitter_fall_01_dense_a",
+    "gold_glitter_fall_02_dense_a",
     "silver_glitter_fall_01_dense_a",
     "amber_spark_fall_01_dense_a",
+    "snow_magic_fall_01_dense_a",
+]
+
+MEGA_BASS_STYLE_VARIANTS = [
+    "mega_neon_line",
+    "mega_dense_wave",
+    "mega_pulse_scope",
+    "mega_laser",
+    "mega_glow_band",
+]
+
+MEGA_BASS_PALETTE_NAMES = [
+    "MegaBassPurple",
+    "MegaBassGreen",
+    "MegaBassAmber",
+    "MegaBassCyan",
+    "MegaBassMagenta",
 ]
 
 FONT_FILES = {
@@ -76,6 +97,14 @@ FONT_FILES = {
     "handwrite": "honglei_banshu_ft.ttf",
     "edu_kaishu": "edu_kaishu.ttf",
     "edu_songti": "edu_songti.ttf",
+    "anton": "Anton-Regular.ttf",
+    "bebas_neue": "BebasNeue-Regular.ttf",
+    "teko_bold": "Teko-wght.ttf",
+    "russo_one": "RussoOne-Regular.ttf",
+    "orbitron": "Orbitron-wght.ttf",
+    "agency_bold": "AGENCYB.TTF",
+    "impact": "impact.ttf",
+    "din_bold": "DINNextLTPro-Bold.ttf",
 }
 
 TEXT_POSITIONS = {
@@ -139,6 +168,32 @@ def list_font_names() -> list[str]:
     return list(FONT_FILES.keys())
 
 
+def list_mega_bass_font_names() -> list[str]:
+    return [
+        "anton",
+        "bebas_neue",
+        "teko_bold",
+        "russo_one",
+        "orbitron",
+        "agency_bold",
+        "impact",
+        "din_bold",
+    ]
+
+
+def list_mega_bass_particle_effects() -> list[str]:
+    particle_files = discover_particle_files()
+    return [item for item in MEGA_BASS_PRIMARY_PARTICLES if item in particle_files]
+
+
+def list_mega_bass_palette_names() -> list[str]:
+    return list(MEGA_BASS_PALETTE_NAMES)
+
+
+def list_mega_bass_style_variants() -> list[str]:
+    return list(MEGA_BASS_STYLE_VARIANTS)
+
+
 def _overlay_needs_colorkey(path: Path) -> bool:
     return path.suffix.lower() in {".mp4", ".mkv"}
 
@@ -174,7 +229,7 @@ def _particle_overlay_plan(name: str, *, visual_preset: str = "none", rng=None) 
 def _pick_palette(name: str, *, rng=None) -> dict:
     rng = rng or random
     if name == "MegaBassNeon":
-        name = rng.choice(["MegaBassPurple", "MegaBassGreen", "MegaBassAmber"])
+        name = rng.choice(MEGA_BASS_PALETTE_NAMES)
     if name == "random":
         name = rng.choice(list(PALETTES.keys()))
     return PALETTES.get(name, PALETTES["WhiteGold"])
@@ -518,28 +573,58 @@ def get_effect(
         x_expr = str(spectrum_x) if spectrum_x is not None else "(W-w)/2"
         next_label = "base7"
         if visual_preset == "mega_bass":
+            mega_variant = style if style in MEGA_BASS_STYLE_VARIANTS else rng.choice(MEGA_BASS_STYLE_VARIANTS)
+            if mega_variant == "mega_neon_line":
+                mode = "cline"
+                glow_sigma = 12
+                glow_alpha = 0.60
+                core_alpha = 0.98
+                spec_height = 220
+                core_y = spectrum_y
+            elif mega_variant == "mega_dense_wave":
+                mode = "line"
+                glow_sigma = 14
+                glow_alpha = 0.64
+                core_alpha = 0.94
+                spec_height = 250
+                core_y = spectrum_y - 8
+            elif mega_variant == "mega_pulse_scope":
+                mode = "p2p"
+                glow_sigma = 9
+                glow_alpha = 0.56
+                core_alpha = 0.90
+                spec_height = 180
+                core_y = spectrum_y + 6
+            elif mega_variant == "mega_laser":
+                mode = "point"
+                glow_sigma = 16
+                glow_alpha = 0.52
+                core_alpha = 0.88
+                spec_height = 150
+                core_y = spectrum_y + 18
+            else:
+                mode = "cline"
+                glow_sigma = 18
+                glow_alpha = 0.68
+                core_alpha = 0.92
+                spec_height = 190
+                core_y = spectrum_y + 12
             spec_core = "spectrum_core"
             spec_glow = "spectrum_glow"
-            spec_reflect = "spectrum_reflect"
             chains.append(
-                f"[1:a]showwaves=s={spec_width}x{spec_height}:mode=cline:colors={spectrum_palette['spectrum']},"
-                f"format=rgba,colorkey=0x000000:0.08:0.02,gblur=sigma=10,eq=brightness='0.04+0.08*{pulse_expr}',"
-                f"colorchannelmixer=aa=0.60[{spec_glow}]"
+                f"[1:a]showwaves=s={spec_width}x{spec_height}:mode={mode}:colors={spectrum_palette['spectrum']},"
+                f"format=rgba,colorkey=0x000000:0.08:0.02,gblur=sigma={glow_sigma},"
+                f"eq=brightness='0.04+0.08*{pulse_expr}':contrast=1.05:saturation=1.18,"
+                f"colorchannelmixer=aa={glow_alpha:.2f}[{spec_glow}]"
             )
             chains.append(
-                f"[1:a]showwaves=s={spec_width}x{spec_height}:mode=cline:colors={spectrum_palette['spectrum']},"
-                f"format=rgba,colorkey=0x000000:0.08:0.02,eq=brightness='0.02+0.06*{pulse_expr}',"
-                f"colorchannelmixer=aa=0.98[{spec_core}]"
-            )
-            chains.append(
-                f"[{spec_core}]vflip,scale={spec_width}:{max(48, int(spec_height * 0.50))},"
-                f"format=rgba,colorchannelmixer=aa=0.22[{spec_reflect}]"
+                f"[1:a]showwaves=s={spec_width}x{spec_height}:mode={mode}:colors={spectrum_palette['spectrum']},"
+                f"format=rgba,colorkey=0x000000:0.08:0.02,"
+                f"eq=brightness='0.02+0.06*{pulse_expr}':contrast=1.03:saturation=1.10,"
+                f"colorchannelmixer=aa={core_alpha:.2f}[{spec_core}]"
             )
             chains.append(f"[{current}][{spec_glow}]overlay=x={x_expr}:y={spectrum_y}[base7_glow]")
-            chains.append(f"[base7_glow][{spec_core}]overlay=x={x_expr}:y={spectrum_y}[base7_core]")
-            chains.append(
-                f"[base7_core][{spec_reflect}]overlay=x={x_expr}:y={spectrum_y + spec_height - 8}[{next_label}]"
-            )
+            chains.append(f"[base7_glow][{spec_core}]overlay=x={x_expr}:y={core_y}[{next_label}]")
         else:
             mode = "line" if style in {"wave", "circular"} else "cline"
             chains.append(

@@ -332,6 +332,10 @@ from effects_library import (
     get_effect,
     list_effects,
     list_font_names,
+    list_mega_bass_font_names,
+    list_mega_bass_palette_names,
+    list_mega_bass_particle_effects,
+    list_mega_bass_style_variants,
     list_palette_names,
     list_particle_effects,
     list_text_positions,
@@ -1017,6 +1021,27 @@ def build_effect_kwargs(opts: RenderOptions, *, rng=None) -> dict:
         "bass_pulse_scale": choose_float(getattr(opts, "fx_bass_pulse_scale", 0.03), default=0.03, minimum=0.0, maximum=0.12, precision=3),
         "bass_pulse_brightness": choose_float(getattr(opts, "fx_bass_pulse_brightness", 0.04), default=0.04, minimum=0.0, maximum=0.12, precision=3),
     }
+    if kwargs["visual_preset"] == "mega_bass":
+        mega_palettes = list_mega_bass_palette_names() or ["MegaBassPurple", "MegaBassGreen", "MegaBassAmber"]
+        mega_styles = list_mega_bass_style_variants() or ["mega_neon_line"]
+        mega_particles = list_mega_bass_particle_effects() or [item for item in list_particle_effects() if item not in {"none", "random"}]
+        latin_text = all(ord(ch) < 128 for ch in str(kwargs.get("text") or "")) and bool(str(kwargs.get("text") or "").strip())
+        mega_fonts = list_mega_bass_font_names() if latin_text else [item for item in list_font_names() if item in {"default", "heiti", "songti"}]
+        kwargs["style"] = rng.choice(mega_styles)
+        palette_name = rng.choice(mega_palettes)
+        kwargs["color_spectrum"] = palette_name
+        kwargs["color_timeline"] = palette_name
+        kwargs["zoom"] = rng.choice(["slow", "normal", "fast"])
+        kwargs["particle"] = rng.choice(mega_particles)
+        kwargs["particle_opacity"] = choose_float(opts.fx_particle_opacity, default=0.34, minimum=0.12, maximum=0.65)
+        kwargs["particle_speed"] = choose_float(opts.fx_particle_speed, default=1.15, minimum=0.45, maximum=1.85)
+        kwargs["text_style"] = rng.choice(["Glow", "Neon", "Bold"])
+        kwargs["text_pos"] = rng.choice(["center", "bottom_center", "top_center"])
+        kwargs["text_font"] = rng.choice(mega_fonts) if mega_fonts else kwargs["text_font"]
+        kwargs["text_size"] = choose_int(opts.fx_text_size, default=96, minimum=62, maximum=144)
+        kwargs["spectrum_w"] = rng.randint(980, 1620)
+        kwargs["spectrum_y"] = rng.randint(470, 620)
+        kwargs["color_tint"] = rng.choice(["none", "blue_night", "cool", "golden"])
     return kwargs
 
 
