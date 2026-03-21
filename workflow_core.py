@@ -888,68 +888,110 @@ def _derive_cover_genre_text(tag: str, bundle: dict[str, Any] | None) -> str:
     return "純音樂"
 
 
-def _render_cover_fallback(source_image: Path, target: Path, headline: str, genre_text: str) -> Path:
-    image = _fit_cover_background(source_image).filter(ImageFilter.GaussianBlur(radius=1.6))
+_FALLBACK_COVER_TEMPLATE_IDS = (1, 5, 7, 8, 9, 10)
+
+
+def _cover_draw_text_shadow(
+    draw: ImageDraw.ImageDraw,
+    pos: tuple[float, float],
+    text: str,
+    font: ImageFont.FreeTypeFont,
+    fill: tuple[int, int, int, int],
+    *,
+    shadow: tuple[int, int, int, int] = (0, 0, 0, 150),
+    offset: tuple[int, int] = (6, 8),
+    anchor: str = "mm",
+) -> None:
+    x, y = pos
+    ox, oy = offset
+    draw.text((x + ox, y + oy), text, font=font, fill=shadow, anchor=anchor)
+    draw.text((x, y), text, font=font, fill=fill, anchor=anchor)
+
+
+def _cover_draw_pill(
+    draw: ImageDraw.ImageDraw,
+    center: tuple[int, int],
+    text: str,
+    font: ImageFont.FreeTypeFont,
+    *,
+    fill: tuple[int, int, int, int],
+    text_fill: tuple[int, int, int, int],
+    pad_x: int = 42,
+    pad_y: int = 20,
+    radius: int = 26,
+    outline: tuple[int, int, int, int] | None = None,
+) -> None:
+    bbox = draw.textbbox((0, 0), text, font=font, anchor="lt")
+    width = bbox[2] - bbox[0]
+    height = bbox[3] - bbox[1]
+    cx, cy = center
+    box = (
+        cx - width // 2 - pad_x,
+        cy - height // 2 - pad_y,
+        cx + width // 2 + pad_x,
+        cy + height // 2 + pad_y,
+    )
+    draw.rounded_rectangle(box, radius=radius, fill=fill, outline=outline, width=2 if outline else 0)
+    draw.text((cx, cy), text, font=font, fill=text_fill, anchor="mm")
+
+
+def _render_cover_fallback_variant(source_image: Path, target: Path, genre_text: str, template_id: int) -> Path:
+    image = _fit_cover_background(source_image).filter(ImageFilter.GaussianBlur(radius=1.8))
     draw = ImageDraw.Draw(image, "RGBA")
     canvas_w, canvas_h = image.size
-
-    # Soft center spotlight + darker edges for a cleaner premium look.
-    draw.rectangle((0, 0, canvas_w, canvas_h), fill=(12, 10, 10, 70))
-    draw.rounded_rectangle(
-        (
-            int(canvas_w * 0.08),
-            int(canvas_h * 0.18),
-            int(canvas_w * 0.92),
-            int(canvas_h * 0.84),
-        ),
-        radius=42,
-        fill=(20, 14, 10, 86),
-        outline=(255, 235, 210, 34),
-        width=2,
-    )
+    draw.rectangle((0, 0, canvas_w, canvas_h), fill=(18, 12, 10, 88))
 
     primary = "超好聽的"
-    secondary = _normalize_cover_genre_text(genre_text or headline or source_image.stem)
+    secondary = _normalize_cover_genre_text(genre_text or source_image.stem)
+    warm_white = (252, 245, 236, 255)
+    gold = (225, 198, 146, 255)
 
-    title_font = _load_cover_font(214)
-    sub_font = _load_cover_font(82)
-    title_bbox = draw.textbbox((0, 0), primary, font=title_font)
-    title_w = title_bbox[2] - title_bbox[0]
-    title_h = title_bbox[3] - title_bbox[1]
-    title_x = (canvas_w - title_w) // 2
-    title_y = int(canvas_h * 0.28)
+    if template_id == 1:
+        draw.rounded_rectangle((70, 95, 1210, 635), radius=44, fill=(28, 19, 17, 110), outline=(255, 255, 255, 42), width=2)
+        _cover_draw_text_shadow(draw, (640, 340), primary, _load_cover_font(212), warm_white)
+        _cover_draw_pill(draw, (640, 520), secondary, _load_cover_font(84), fill=(35, 22, 19, 180), text_fill=warm_white, outline=(255, 255, 255, 24))
+    elif template_id == 5:
+        draw.ellipse((245, 80, 1035, 670), fill=(28, 18, 15, 120), outline=(255, 255, 255, 28), width=3)
+        _cover_draw_text_shadow(draw, (640, 330), primary, _load_cover_font(188), warm_white)
+        _cover_draw_pill(draw, (640, 500), secondary, _load_cover_font(70), fill=(22, 13, 11, 182), text_fill=gold)
+    elif template_id == 7:
+        _cover_draw_pill(draw, (245, 120), "MUSIC COVER", _load_cover_font(28), fill=(35, 23, 19, 160), text_fill=(242, 223, 198, 255), pad_x=24, pad_y=12, radius=20)
+        draw.rounded_rectangle((60, 170, 920, 610), radius=36, fill=(19, 11, 10, 132), outline=(255, 255, 255, 28), width=2)
+        _cover_draw_text_shadow(draw, (152, 345), primary, _load_cover_font(176), warm_white, anchor="lm")
+        _cover_draw_pill(draw, (285, 505), secondary, _load_cover_font(62), fill=(58, 37, 28, 204), text_fill=warm_white)
+    elif template_id == 8:
+        draw.rounded_rectangle((140, 115, 1140, 605), radius=18, fill=(34, 21, 18, 118), outline=(215, 186, 145, 88), width=2)
+        draw.rounded_rectangle((175, 150, 1105, 570), radius=10, fill=(255, 248, 241, 20))
+        _cover_draw_text_shadow(draw, (640, 332), primary, _load_cover_font(192), warm_white)
+        _cover_draw_pill(draw, (640, 505), secondary, _load_cover_font(68), fill=(34, 24, 18, 202), text_fill=gold, outline=(210, 174, 120, 82))
+    elif template_id == 9:
+        draw.polygon([(0, 520), (1280, 360), (1280, 720), (0, 720)], fill=(17, 11, 9, 165))
+        draw.polygon([(0, 570), (1280, 410), (1280, 720), (0, 720)], fill=(255, 255, 255, 16))
+        _cover_draw_text_shadow(draw, (640, 430), primary, _load_cover_font(176), warm_white)
+        _cover_draw_pill(draw, (640, 585), secondary, _load_cover_font(66), fill=(30, 18, 14, 195), text_fill=warm_white)
+    elif template_id == 10:
+        draw.rounded_rectangle((180, 95, 1100, 625), radius=58, fill=(16, 11, 10, 142), outline=(255, 255, 255, 24), width=2)
+        draw.rounded_rectangle((280, 420, 1000, 568), radius=42, fill=(255, 248, 241, 18))
+        _cover_draw_text_shadow(draw, (640, 298), primary, _load_cover_font(204), warm_white)
+        draw.text((640, 495), secondary, font=_load_cover_font(86), fill=gold, anchor="mm")
+    else:
+        raise ValueError(f"Unsupported fallback cover template: {template_id}")
 
-    # Soft glow and crisp foreground text.
-    for blur_offset, alpha in ((10, 45), (6, 70), (3, 110)):
-        draw.text((title_x, title_y + blur_offset), primary, font=title_font, fill=(70, 40, 18, alpha))
-    draw.text((title_x + 4, title_y + 4), primary, font=title_font, fill=(0, 0, 0, 145))
-    draw.text((title_x, title_y), primary, font=title_font, fill=(255, 247, 233, 255))
-
-    pill_bbox = draw.textbbox((0, 0), secondary, font=sub_font)
-    pill_w = pill_bbox[2] - pill_bbox[0]
-    pill_h = pill_bbox[3] - pill_bbox[1]
-    pill_padding_x = 34
-    pill_padding_y = 18
-    pill_x1 = (canvas_w - (pill_w + pill_padding_x * 2)) // 2
-    pill_y1 = int(canvas_h * 0.66)
-    pill_x2 = pill_x1 + pill_w + pill_padding_x * 2
-    pill_y2 = pill_y1 + pill_h + pill_padding_y * 2
-
-    draw.rounded_rectangle(
-        (pill_x1, pill_y1, pill_x2, pill_y2),
-        radius=28,
-        fill=(20, 14, 12, 168),
-        outline=(255, 240, 220, 44),
-        width=2,
-    )
-    text_x = pill_x1 + pill_padding_x
-    text_y = pill_y1 + pill_padding_y - 4
-    draw.text((text_x + 2, text_y + 2), secondary, font=sub_font, fill=(0, 0, 0, 130))
-    draw.text((text_x, text_y), secondary, font=sub_font, fill=(255, 236, 208, 255))
-
+    vignette = Image.new("L", image.size, 0)
+    vdraw = ImageDraw.Draw(vignette)
+    vdraw.ellipse((-140, -90, canvas_w + 140, canvas_h + 90), fill=175)
+    vignette = vignette.filter(ImageFilter.GaussianBlur(50))
+    dark = Image.new("RGBA", image.size, (0, 0, 0, 68))
+    dark.putalpha(vignette.point(lambda value: max(0, 190 - value)))
+    final_image = Image.alpha_composite(image.convert("RGBA"), dark)
     target.parent.mkdir(parents=True, exist_ok=True)
-    image.save(target, quality=95)
+    final_image.convert("RGB").save(target, quality=95)
     return target
+
+
+def _render_cover_fallback(source_image: Path, target: Path, headline: str, genre_text: str) -> Path:
+    template_id = random.choice(_FALLBACK_COVER_TEMPLATE_IDS)
+    return _render_cover_fallback_variant(source_image, target, genre_text or headline, template_id)
 
 
 def _thumbnail_error_needs_balance_hint(exc: Exception | None) -> bool:
