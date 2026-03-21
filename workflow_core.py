@@ -14,7 +14,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from content_generation import (
     call_image_model,
@@ -856,39 +856,96 @@ def _fit_cover_background(source_image: Path) -> Image.Image:
     return resized.crop((left, top, left + canvas_w, top + canvas_h))
 
 
-def _render_cover_fallback(source_image: Path, target: Path, headline: str) -> Path:
-    image = _fit_cover_background(source_image)
+def _normalize_cover_genre_text(text: str) -> str:
+    value = re.sub(r"\s+", "", str(text or "").strip())
+    value = re.sub(r"^[0-9_+\-]+", "", value)
+    value = value.strip("-_+ ")
+    if not value:
+        return "純音樂"
+    if value.lower() == "disco":
+        return "DISCO MUSIC"
+    if any(ord(ch) > 127 for ch in value):
+        if "音樂" not in value and "音乐" not in value:
+            return f"{value}音樂"
+        return value.replace("音乐", "音樂")
+    upper_value = value.upper()
+    if "MUSIC" not in upper_value:
+        upper_value = f"{upper_value} MUSIC"
+    return upper_value
+
+
+def _derive_cover_genre_text(tag: str, bundle: dict[str, Any] | None) -> str:
+    content_template = (bundle or {}).get("content_template") if isinstance(bundle, dict) else {}
+    candidates = [
+        str((content_template or {}).get("musicGenre") or "").strip(),
+        str((content_template or {}).get("name") or "").strip(),
+        str(tag or "").strip(),
+    ]
+    for candidate in candidates:
+        normalized = _normalize_cover_genre_text(candidate)
+        if normalized and normalized != "純音樂":
+            return normalized
+    return "純音樂"
+
+
+def _render_cover_fallback(source_image: Path, target: Path, headline: str, genre_text: str) -> Path:
+    image = _fit_cover_background(source_image).filter(ImageFilter.GaussianBlur(radius=1.6))
     draw = ImageDraw.Draw(image, "RGBA")
     canvas_w, canvas_h = image.size
 
-    # Bottom gradient panel improves legibility without destroying the base image.
-    draw.rectangle((0, int(canvas_h * 0.60), canvas_w, canvas_h), fill=(0, 0, 0, 118))
-    draw.rectangle((0, int(canvas_h * 0.72), canvas_w, canvas_h), fill=(0, 0, 0, 156))
+    # Soft center spotlight + darker edges for a cleaner premium look.
+    draw.rectangle((0, 0, canvas_w, canvas_h), fill=(12, 10, 10, 70))
+    draw.rounded_rectangle(
+        (
+            int(canvas_w * 0.08),
+            int(canvas_h * 0.18),
+            int(canvas_w * 0.92),
+            int(canvas_h * 0.84),
+        ),
+        radius=42,
+        fill=(20, 14, 10, 86),
+        outline=(255, 235, 210, 34),
+        width=2,
+    )
 
-    primary = re.sub(r"\s+", " ", (headline or "").strip())
-    if not primary:
-        primary = source_image.stem
-    primary = primary.replace("|", "｜")
-    primary = primary[:40]
+    primary = "超好聽的"
+    secondary = _normalize_cover_genre_text(genre_text or headline or source_image.stem)
 
-    subhead = "纯音乐放松聆听"
-    title_font = _load_cover_font(72)
-    sub_font = _load_cover_font(34)
-    max_text_width = int(canvas_w * 0.84)
-    lines = _wrap_cover_text(draw, primary, title_font, max_text_width)[:2]
-    if not lines:
-        lines = [primary]
+    title_font = _load_cover_font(214)
+    sub_font = _load_cover_font(82)
+    title_bbox = draw.textbbox((0, 0), primary, font=title_font)
+    title_w = title_bbox[2] - title_bbox[0]
+    title_h = title_bbox[3] - title_bbox[1]
+    title_x = (canvas_w - title_w) // 2
+    title_y = int(canvas_h * 0.28)
 
-    x = int(canvas_w * 0.08)
-    y = int(canvas_h * 0.68)
-    for line in lines:
-        draw.text((x + 4, y + 4), line, font=title_font, fill=(0, 0, 0, 185))
-        draw.text((x, y), line, font=title_font, fill=(255, 245, 230, 255))
-        bbox = draw.textbbox((x, y), line, font=title_font)
-        y = bbox[3] + 10
+    # Soft glow and crisp foreground text.
+    for blur_offset, alpha in ((10, 45), (6, 70), (3, 110)):
+        draw.text((title_x, title_y + blur_offset), primary, font=title_font, fill=(70, 40, 18, alpha))
+    draw.text((title_x + 4, title_y + 4), primary, font=title_font, fill=(0, 0, 0, 145))
+    draw.text((title_x, title_y), primary, font=title_font, fill=(255, 247, 233, 255))
 
-    draw.text((x + 3, y + 3), subhead, font=sub_font, fill=(0, 0, 0, 170))
-    draw.text((x, y), subhead, font=sub_font, fill=(255, 234, 198, 255))
+    pill_bbox = draw.textbbox((0, 0), secondary, font=sub_font)
+    pill_w = pill_bbox[2] - pill_bbox[0]
+    pill_h = pill_bbox[3] - pill_bbox[1]
+    pill_padding_x = 34
+    pill_padding_y = 18
+    pill_x1 = (canvas_w - (pill_w + pill_padding_x * 2)) // 2
+    pill_y1 = int(canvas_h * 0.66)
+    pill_x2 = pill_x1 + pill_w + pill_padding_x * 2
+    pill_y2 = pill_y1 + pill_h + pill_padding_y * 2
+
+    draw.rounded_rectangle(
+        (pill_x1, pill_y1, pill_x2, pill_y2),
+        radius=28,
+        fill=(20, 14, 12, 168),
+        outline=(255, 240, 220, 44),
+        width=2,
+    )
+    text_x = pill_x1 + pill_padding_x
+    text_y = pill_y1 + pill_padding_y - 4
+    draw.text((text_x + 2, text_y + 2), secondary, font=sub_font, fill=(0, 0, 0, 130))
+    draw.text((text_x, text_y), secondary, font=sub_font, fill=(255, 236, 208, 255))
 
     target.parent.mkdir(parents=True, exist_ok=True)
     image.save(target, quality=95)
@@ -922,11 +979,12 @@ def _make_cover_fallbacks(
     count: int,
     *,
     headline: str = "",
+    genre_text: str = "",
 ) -> list[Path]:
     covers: list[Path] = []
     for index in range(1, count + 1):
         target = tag_dir / f"{date_mmdd}_{serial}_cover_{index:02d}.jpg"
-        covers.append(_render_cover_fallback(source_image, target, headline))
+        covers.append(_render_cover_fallback(source_image, target, headline, genre_text))
     return covers
 
 
@@ -1412,6 +1470,7 @@ def _generate_thumbnail_covers(
             serial,
             cover_count,
             headline=title_text,
+            genre_text=_derive_cover_genre_text(tag, bundle),
         )
         return fallback, "source_image_text_fallback"
 
