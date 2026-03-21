@@ -53,6 +53,22 @@ PARTICLE_FILES = {
     "rain": "rain.mp4",
 }
 
+MEGA_BASS_PRIMARY_PARTICLES = [
+    "mega_neon_sparks_18151",
+    "mega_luminous_particles_18142",
+    "mega_white_particles_4407",
+    "mega_light_waves_particles_18063",
+    "spark_burst_loop",
+]
+
+MEGA_BASS_ACCENT_PARTICLES = [
+    "mega_gold_glitters_2866",
+    "mega_black_sparkles_14865",
+    "gold_glitter_fall_01_dense_a",
+    "silver_glitter_fall_01_dense_a",
+    "amber_spark_fall_01_dense_a",
+]
+
 FONT_FILES = {
     "default": None,
     "songti": "noto_serif_tc.otf",
@@ -127,9 +143,21 @@ def _overlay_needs_colorkey(path: Path) -> bool:
     return path.suffix.lower() in {".mp4", ".mkv"}
 
 
-def _particle_overlay_plan(name: str, *, rng=None) -> dict[str, float]:
+def _particle_overlay_plan(name: str, *, visual_preset: str = "none", rng=None) -> dict[str, float]:
     rng = rng or random
     lower = name.lower()
+    if visual_preset == "mega_bass":
+        if "light_waves" in lower:
+            scale = rng.uniform(1.10, 1.45)
+        elif any(token in lower for token in ("neon", "spark_burst", "luminous", "white_particles")):
+            scale = rng.uniform(1.45, 1.95)
+        else:
+            scale = rng.uniform(1.35, 1.80)
+        return {
+            "scale": scale,
+            "flip_h": 1.0 if rng.random() < 0.18 else 0.0,
+            "flip_v": 0.0,
+        }
     if any(token in lower for token in ("snow", "glitter", "dust", "spark", "magic", "fairy", "bokeh")):
         scale = rng.uniform(1.70, 2.45)
     elif any(token in lower for token in ("smoke", "rain", "fireflies", "light", "flare")):
@@ -166,10 +194,14 @@ def _pick_style(name: str, *, rng=None) -> str:
     return name
 
 
-def _pick_particle(name: str, *, rng=None) -> str:
+def _pick_particle(name: str, *, visual_preset: str = "none", rng=None) -> str:
     rng = rng or random
     particle_files = discover_particle_files()
     if name == "random":
+        if visual_preset == "mega_bass":
+            choices = [item for item in MEGA_BASS_PRIMARY_PARTICLES if item in particle_files]
+            if choices:
+                return rng.choice(choices)
         choices = list(particle_files.keys())
         return rng.choice(choices) if choices else "none"
     return name if name in particle_files or name == "none" else "none"
@@ -330,8 +362,10 @@ def get_effect(
     spectrum_palette = _pick_palette(color_spectrum, rng=rng)
     timeline_palette = _pick_palette(color_timeline, rng=rng)
     tint_name = _pick_tint(color_tint, rng=rng)
-    particle_name = _pick_particle(particle, rng=rng)
+    particle_name = _pick_particle(particle, visual_preset=visual_preset, rng=rng)
     zoom_speed = ZOOM_SPEEDS.get(zoom, ZOOM_SPEEDS["normal"])
+    pulse_freq = bass_pulse_bpm / 60.0
+    pulse_expr = f"pow(max(0,sin(2*PI*{pulse_freq:.6f}*t+{bass_pulse_phase:.6f})),2.2)"
 
     chains = []
     extra_inputs: list[str] = []
@@ -382,7 +416,7 @@ def get_effect(
     if particle_name != "none":
         overlay_file = OVERLAY_DIR / particle_files.get(particle_name, "")
         if overlay_file.exists():
-            overlay_plan = _particle_overlay_plan(particle_name, rng=rng)
+            overlay_plan = _particle_overlay_plan(particle_name, visual_preset=visual_preset, rng=rng)
             overlay_scale = max(float(overlay_plan.get("scale", 1.0)), 1.0)
             overlay_w = max(1920, int(round((1920 * overlay_scale) / 2.0) * 2))
             overlay_h = max(1080, int(round((1080 * overlay_scale) / 2.0) * 2))
@@ -390,12 +424,27 @@ def get_effect(
             extra_inputs.extend(["-stream_loop", "-1", "-i", str(overlay_file)])
             overlay_label = "overlay0"
             next_label = "base6"
-            overlay_parts = [
-                f"scale={overlay_w}:{overlay_h}:force_original_aspect_ratio=increase",
-                "crop=1920:1080",
-                f"setpts=PTS/{particle_speed:.3f}",
-                "format=rgba",
-            ]
+            if visual_preset == "mega_bass":
+                mega_scale_expr = (
+                    f"max(1920,trunc(iw*({overlay_scale:.4f}+0.18*{pulse_expr})/2)*2)"
+                )
+                mega_h_expr = (
+                    f"max(1080,trunc(ih*({overlay_scale:.4f}+0.18*{pulse_expr})/2)*2)"
+                )
+                overlay_parts = [
+                    f"scale=w='{mega_scale_expr}':h='{mega_h_expr}':eval=frame",
+                    "crop=1920:1080",
+                    f"setpts=PTS/{particle_speed:.3f}",
+                    f"eq=brightness='0.02+0.06*{pulse_expr}':contrast=1.05:saturation=1.18",
+                    "format=rgba",
+                ]
+            else:
+                overlay_parts = [
+                    f"scale={overlay_w}:{overlay_h}:force_original_aspect_ratio=increase",
+                    "crop=1920:1080",
+                    f"setpts=PTS/{particle_speed:.3f}",
+                    "format=rgba",
+                ]
             if overlay_plan["flip_h"] > 0.5:
                 overlay_parts.append("hflip")
             if overlay_plan["flip_v"] > 0.5:
@@ -408,11 +457,37 @@ def get_effect(
                 f"[{current}][{overlay_label}]overlay=x=0:y=0:shortest=1:format=auto[{next_label}]"
             )
             current = next_label
+            if visual_preset == "mega_bass":
+                accent_choices = [item for item in MEGA_BASS_ACCENT_PARTICLES if item in particle_files]
+                if accent_choices:
+                    accent_name = rng.choice(accent_choices)
+                    accent_file = OVERLAY_DIR / particle_files.get(accent_name, "")
+                    if accent_file.exists():
+                        input_index = 3
+                        extra_inputs.extend(["-stream_loop", "-1", "-i", str(accent_file)])
+                        overlay_label = "overlay1"
+                        next_label = "base6b"
+                        accent_opacity = min(0.28, max(0.10, particle_opacity * 0.55))
+                        accent_speed = max(0.80, particle_speed * 0.92)
+                        accent_parts = [
+                            f"scale=w='max(1920,trunc(iw*(1.22+0.10*{pulse_expr})/2)*2)':"
+                            f"h='max(1080,trunc(ih*(1.22+0.10*{pulse_expr})/2)*2)':eval=frame",
+                            "crop=1920:1080",
+                            f"setpts=PTS/{accent_speed:.3f}",
+                            f"eq=brightness='0.03+0.05*{pulse_expr}':contrast=1.04:saturation=1.12",
+                            "format=rgba",
+                        ]
+                        if _overlay_needs_colorkey(accent_file):
+                            accent_parts.append("colorkey=0x000000:0.20:0.10")
+                        accent_parts.append(f"colorchannelmixer=aa={accent_opacity:.3f}")
+                        chains.append(f"[{input_index}:v]{','.join(accent_parts)}[{overlay_label}]")
+                        chains.append(
+                            f"[{current}][{overlay_label}]overlay=x=0:y=0:shortest=1:format=auto[{next_label}]"
+                        )
+                        current = next_label
 
     if bass_pulse and (bass_pulse_scale > 0 or bass_pulse_brightness > 0):
         next_label = "base_pulse"
-        pulse_freq = bass_pulse_bpm / 60.0
-        pulse_expr = f"pow(max(0,sin(2*PI*{pulse_freq:.6f}*t+{bass_pulse_phase:.6f})),2.2)"
         chains.append(
             f"[{current}]scale=w='max(1920,trunc(iw*(1+{bass_pulse_scale:.4f}*{pulse_expr})/2)*2)':"
             f"h='max(1080,trunc(ih*(1+{bass_pulse_scale:.4f}*{pulse_expr})/2)*2)':eval=frame,"
@@ -421,18 +496,57 @@ def get_effect(
         )
         current = next_label
 
+    if visual_preset == "mega_bass" and bass_pulse:
+        next_label = "base_pulse_shake"
+        shake_x = (
+            f"(iw-1920)/2 + 10*sin(2*PI*{pulse_freq:.6f}*t+{bass_pulse_phase:.6f})"
+            f" + 4*sin(4*PI*{pulse_freq:.6f}*t+{bass_pulse_phase + 0.5:.6f})"
+        )
+        shake_y = (
+            f"(ih-1080)/2 + 6*sin(2*PI*{pulse_freq:.6f}*t+{bass_pulse_phase + 1.2:.6f})"
+        )
+        chains.append(
+            f"[{current}]scale=1948:1096:force_original_aspect_ratio=increase,"
+            f"crop=1920:1080:x='{shake_x}':y='{shake_y}',setsar=1[{next_label}]"
+        )
+        current = next_label
+
     if spectrum:
         spec_label = "spectrum0"
         spec_width = min(spectrum_w, 1800)
-        spec_height = 170
+        spec_height = 220 if visual_preset == "mega_bass" else 170
         x_expr = str(spectrum_x) if spectrum_x is not None else "(W-w)/2"
-        mode = "line" if style in {"wave", "circular"} else "cline"
-        chains.append(
-            f"[1:a]showwaves=s={spec_width}x{spec_height}:mode={mode}:colors={spectrum_palette['spectrum']},"
-            f"format=rgba,colorchannelmixer=aa=0.92[{spec_label}]"
-        )
         next_label = "base7"
-        chains.append(f"[{current}][{spec_label}]overlay=x={x_expr}:y={spectrum_y}[{next_label}]")
+        if visual_preset == "mega_bass":
+            spec_core = "spectrum_core"
+            spec_glow = "spectrum_glow"
+            spec_reflect = "spectrum_reflect"
+            chains.append(
+                f"[1:a]showwaves=s={spec_width}x{spec_height}:mode=cline:colors={spectrum_palette['spectrum']},"
+                f"format=rgba,colorkey=0x000000:0.08:0.02,gblur=sigma=10,eq=brightness='0.04+0.08*{pulse_expr}',"
+                f"colorchannelmixer=aa=0.60[{spec_glow}]"
+            )
+            chains.append(
+                f"[1:a]showwaves=s={spec_width}x{spec_height}:mode=cline:colors={spectrum_palette['spectrum']},"
+                f"format=rgba,colorkey=0x000000:0.08:0.02,eq=brightness='0.02+0.06*{pulse_expr}',"
+                f"colorchannelmixer=aa=0.98[{spec_core}]"
+            )
+            chains.append(
+                f"[{spec_core}]vflip,scale={spec_width}:{max(48, int(spec_height * 0.50))},"
+                f"format=rgba,colorchannelmixer=aa=0.22[{spec_reflect}]"
+            )
+            chains.append(f"[{current}][{spec_glow}]overlay=x={x_expr}:y={spectrum_y}[base7_glow]")
+            chains.append(f"[base7_glow][{spec_core}]overlay=x={x_expr}:y={spectrum_y}[base7_core]")
+            chains.append(
+                f"[base7_core][{spec_reflect}]overlay=x={x_expr}:y={spectrum_y + spec_height - 8}[{next_label}]"
+            )
+        else:
+            mode = "line" if style in {"wave", "circular"} else "cline"
+            chains.append(
+                f"[1:a]showwaves=s={spec_width}x{spec_height}:mode={mode}:colors={spectrum_palette['spectrum']},"
+                f"format=rgba,colorkey=0x000000:0.08:0.02,colorchannelmixer=aa=0.92[{spec_label}]"
+            )
+            chains.append(f"[{current}][{spec_label}]overlay=x={x_expr}:y={spectrum_y}[{next_label}]")
         current = next_label
 
     if timeline:
