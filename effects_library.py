@@ -34,6 +34,9 @@ PALETTES = {
     "MidnightBlue": {"spectrum": "#DDE8FF|#294172", "timeline": "#294172", "text": "#EDF4FF"},
     "Burgundy": {"spectrum": "#FFDCE6|#7D243F", "timeline": "#7D243F", "text": "#FFF0F4"},
     "Sunset": {"spectrum": "#FFE3C2|#FF7A59", "timeline": "#FF7A59", "text": "#FFF2E8"},
+    "MegaBassPurple": {"spectrum": "#F5D7FF|#A855F7", "timeline": "#A855F7", "text": "#FFF0FF"},
+    "MegaBassGreen": {"spectrum": "#D6FFE6|#22C55E", "timeline": "#22C55E", "text": "#F1FFF6"},
+    "MegaBassAmber": {"spectrum": "#FFE5BF|#F59E0B", "timeline": "#F59E0B", "text": "#FFF7E6"},
 }
 
 ZOOM_SPEEDS = {
@@ -93,7 +96,7 @@ def discover_particle_files() -> dict[str, str]:
 
 
 def list_palette_names() -> list[str]:
-    return list(PALETTES.keys())
+    return ["MegaBassNeon", *PALETTES.keys()]
 
 
 def list_zoom_modes() -> list[str]:
@@ -142,6 +145,8 @@ def _particle_overlay_plan(name: str, *, rng=None) -> dict[str, float]:
 
 def _pick_palette(name: str, *, rng=None) -> dict:
     rng = rng or random
+    if name == "MegaBassNeon":
+        name = rng.choice(["MegaBassPurple", "MegaBassGreen", "MegaBassAmber"])
     if name == "random":
         name = rng.choice(list(PALETTES.keys()))
     return PALETTES.get(name, PALETTES["WhiteGold"])
@@ -278,6 +283,12 @@ def get_effect(
     particle_opacity: float = 0.6,
     particle_speed: float = 1.0,
     text_font: str = "default",
+    visual_preset: str = "none",
+    bass_pulse: bool = False,
+    bass_pulse_scale: float = 0.03,
+    bass_pulse_brightness: float = 0.04,
+    bass_pulse_bpm: float = 128.0,
+    bass_pulse_phase: float = 0.0,
     rng=None,
     **_,
 ):
@@ -298,6 +309,10 @@ def get_effect(
     soft_focus_sigma = max(_coerce_float(soft_focus_sigma, 1.5), 0.3)
     particle_opacity = max(0.0, min(_coerce_float(particle_opacity, 0.6), 1.0))
     particle_speed = max(_coerce_float(particle_speed, 1.0), 0.2)
+    bass_pulse_scale = max(0.0, min(_coerce_float(bass_pulse_scale, 0.03), 0.12))
+    bass_pulse_brightness = max(0.0, min(_coerce_float(bass_pulse_brightness, 0.04), 0.12))
+    bass_pulse_bpm = max(_coerce_float(bass_pulse_bpm, 128.0), 60.0)
+    bass_pulse_phase = _coerce_float(bass_pulse_phase, 0.0)
 
     spectrum = _pick_flag(spectrum, probability_true=0.85, rng=rng)
     timeline = _pick_flag(timeline, probability_true=0.85, rng=rng)
@@ -394,6 +409,18 @@ def get_effect(
             )
             current = next_label
 
+    if bass_pulse and (bass_pulse_scale > 0 or bass_pulse_brightness > 0):
+        next_label = "base_pulse"
+        pulse_freq = bass_pulse_bpm / 60.0
+        pulse_expr = f"pow(max(0,sin(2*PI*{pulse_freq:.6f}*t+{bass_pulse_phase:.6f})),2.2)"
+        chains.append(
+            f"[{current}]scale=w='max(1920,trunc(iw*(1+{bass_pulse_scale:.4f}*{pulse_expr})/2)*2)':"
+            f"h='max(1080,trunc(ih*(1+{bass_pulse_scale:.4f}*{pulse_expr})/2)*2)':eval=frame,"
+            f"crop=1920:1080,eq=brightness='{bass_pulse_brightness:.4f}*{pulse_expr}':"
+            f"contrast=1.03:saturation=1.05,setsar=1[{next_label}]"
+        )
+        current = next_label
+
     if spectrum:
         spec_label = "spectrum0"
         spec_width = min(spectrum_w, 1800)
@@ -448,10 +475,14 @@ def get_effect(
         enabled.append("黑边")
     if particle_name != "none":
         enabled.append(f"粒子:{particle_name}")
+    if bass_pulse:
+        enabled.append(f"低频脉冲:{round(bass_pulse_bpm)}bpm")
     if tint_name != "none":
         enabled.append(f"色调:{tint_name}")
     if text and text.strip():
         enabled.append("文字")
+    if visual_preset != "none":
+        enabled.append(f"预设:{visual_preset}")
 
     effect_desc = " / ".join(enabled) if enabled else "基础渲染"
     return ";".join(chains), effect_desc, extra_inputs

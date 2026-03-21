@@ -290,6 +290,10 @@ def _build_render_options_from_defaults(defaults: WorkflowDefaults) -> RenderOpt
     opts.fx_text_pos = str(settings.get("text_pos", "center") or "center")
     opts.fx_text_size = settings.get("text_size", 60)
     opts.fx_text_style = str(settings.get("text_style", "Classic") or "Classic")
+    opts.fx_visual_preset = str(settings.get("preset", "none") or "none")
+    opts.fx_bass_pulse = bool(settings.get("bass_pulse", False) or opts.fx_visual_preset == "mega_bass")
+    opts.fx_bass_pulse_scale = settings.get("bass_pulse_scale", 0.03)
+    opts.fx_bass_pulse_brightness = settings.get("bass_pulse_brightness", 0.04)
     return opts
 
 

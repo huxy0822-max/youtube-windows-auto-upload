@@ -21,12 +21,14 @@ import argparse
 import subprocess
 import threading
 import ctypes
+import math
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import platform
+import numpy as np
 from group_upload_workflow import prepare_window_task_upload_batch
 from path_helpers import (
     default_scheduler_config,
@@ -794,6 +796,10 @@ class RenderOptions:
     fx_text_pos: str = "center"
     fx_text_size: int = 60
     fx_text_style: str = "Classic"
+    fx_visual_preset: str = "none"
+    fx_bass_pulse: bool = False
+    fx_bass_pulse_scale: float = 0.03
+    fx_bass_pulse_brightness: float = 0.04
 
 def parse_arguments() -> RenderOptions:
     global SONG_COUNT
@@ -840,6 +846,10 @@ def parse_arguments() -> RenderOptions:
         elif arg.startswith('--text-pos='): opts.fx_text_pos = arg.split('=')[1]
         elif arg.startswith('--text-size='): opts.fx_text_size = int(arg.split('=')[1])
         elif arg.startswith('--text-style='): opts.fx_text_style = arg.split('=')[1]
+        elif arg.startswith('--visual-preset='): opts.fx_visual_preset = arg.split('=', 1)[1]
+        elif arg == '--bass-pulse': opts.fx_bass_pulse = True
+        elif arg.startswith('--bass-pulse-scale='): opts.fx_bass_pulse_scale = float(arg.split('=')[1])
+        elif arg.startswith('--bass-pulse-brightness='): opts.fx_bass_pulse_brightness = float(arg.split('=')[1])
         elif arg.startswith('--tags=') or arg.startswith('--tag='):
             raw = arg.split('=', 1)[1]
             tags = [t.strip() for t in re.split(r'[，,]', raw) if t.strip()]
@@ -977,6 +987,7 @@ def build_effect_kwargs(opts: RenderOptions, *, rng=None) -> dict:
         "spectrum": opts.fx_spectrum,
         "timeline": opts.fx_timeline,
         "letterbox": opts.fx_letterbox,
+        "visual_preset": getattr(opts, "fx_visual_preset", "none"),
         "zoom": choose_value(opts.fx_zoom, default="normal", choices=list_zoom_modes()),
         "color_spectrum": choose_value(opts.fx_color_spectrum, default="WhiteGold", choices=list_palette_names()),
         "color_timeline": choose_value(opts.fx_color_timeline, default="WhiteGold", choices=list_palette_names()),
@@ -1002,8 +1013,86 @@ def build_effect_kwargs(opts: RenderOptions, *, rng=None) -> dict:
         "particle_opacity": choose_float(opts.fx_particle_opacity, default=0.6, minimum=0.0, maximum=1.0),
         "particle_speed": choose_float(opts.fx_particle_speed, default=1.0, minimum=0.2, maximum=3.0),
         "text_font": choose_value(opts.fx_text_font, default="default", choices=list_font_names()),
+        "bass_pulse": bool(getattr(opts, "fx_bass_pulse", False) or str(getattr(opts, "fx_visual_preset", "")) == "mega_bass"),
+        "bass_pulse_scale": choose_float(getattr(opts, "fx_bass_pulse_scale", 0.03), default=0.03, minimum=0.0, maximum=0.12, precision=3),
+        "bass_pulse_brightness": choose_float(getattr(opts, "fx_bass_pulse_brightness", 0.04), default=0.04, minimum=0.0, maximum=0.12, precision=3),
     }
     return kwargs
+
+
+@lru_cache(maxsize=64)
+def detect_audio_bpm_profile(audio_path: str) -> tuple[float, float]:
+    path = str(audio_path or "").strip()
+    if not path:
+        return 128.0, 0.0
+
+    cmd = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-i",
+        path,
+        "-t",
+        "90",
+        "-ac",
+        "1",
+        "-ar",
+        "11025",
+        "-f",
+        "s16le",
+        "-",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, check=True, timeout=120)
+        pcm = proc.stdout
+        if not pcm:
+            return 128.0, 0.0
+        samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        if samples.size < 11025:
+            return 128.0, 0.0
+
+        frame_size = 1024
+        hop = 512
+        frame_count = 1 + max(0, (samples.size - frame_size) // hop)
+        if frame_count < 32:
+            return 128.0, 0.0
+
+        env = np.empty(frame_count, dtype=np.float32)
+        for idx in range(frame_count):
+            start = idx * hop
+            frame = samples[start : start + frame_size]
+            env[idx] = float(np.sqrt(np.mean(frame * frame)))
+
+        smooth = np.convolve(env, np.ones(8, dtype=np.float32) / 8.0, mode="same")
+        onset = np.maximum(env - smooth, 0.0)
+        onset -= onset.min()
+        peak = float(onset.max())
+        if peak <= 1e-6:
+            return 128.0, 0.0
+        onset /= peak
+
+        env_rate = 11025.0 / hop
+        min_bpm = 90.0
+        max_bpm = 170.0
+        min_lag = max(1, int(env_rate * 60.0 / max_bpm))
+        max_lag = max(min_lag + 1, int(env_rate * 60.0 / min_bpm))
+
+        centered = onset - float(onset.mean())
+        best_lag = min_lag
+        best_score = -1.0
+        for lag in range(min_lag, min(max_lag, centered.size - 2)):
+            score = float(np.dot(centered[:-lag], centered[lag:]))
+            if score > best_score:
+                best_score = score
+                best_lag = lag
+
+        bpm = max(min_bpm, min(max_bpm, 60.0 * env_rate / max(best_lag, 1)))
+        first_peak_idx = int(np.argmax(onset))
+        first_peak_time = first_peak_idx / env_rate
+        phase = (math.pi / 2.0) - (2.0 * math.pi * (bpm / 60.0) * first_peak_time)
+        return round(float(bpm), 2), float(phase)
+    except Exception:
+        return 128.0, 0.0
 
 def phase2_build_master_audios(active_projects: list) -> dict:
     """Phase 2: 并行母带合成"""
@@ -1198,6 +1287,10 @@ def phase3_render_and_upload(active_projects: list, master_map: dict, opts: Rend
             )
             effect_rng = random.Random(effect_seed)
             effect_kwargs = build_effect_kwargs(opts, rng=effect_rng)
+            if effect_kwargs.get("bass_pulse"):
+                bpm_value, phase_value = detect_audio_bpm_profile(str(chosen_master))
+                effect_kwargs["bass_pulse_bpm"] = bpm_value
+                effect_kwargs["bass_pulse_phase"] = phase_value
             filter_str, effect_desc, extra_inputs = get_effect(master_dur, rng=effect_rng, **effect_kwargs)
             
             tag_video_jobs.append({
@@ -1258,7 +1351,8 @@ def phase3_render_and_upload(active_projects: list, master_map: dict, opts: Rend
                         print(
                             f"  {prefix} ✅ {tag}/{container} | {task['desc']} | "
                             f"particle={fx.get('particle')} opacity={fx.get('particle_opacity')} "
-                            f"speed={fx.get('particle_speed')} | {res['time']:.0f}s"
+                            f"speed={fx.get('particle_speed')} pulse={'on' if fx.get('bass_pulse') else 'off'} "
+                            f"bpm={fx.get('bass_pulse_bpm', '-')} | {res['time']:.0f}s"
                         )
                     else:
                         print(f"  {prefix} ❌ {tag}/{container}: {res.get('error')}")

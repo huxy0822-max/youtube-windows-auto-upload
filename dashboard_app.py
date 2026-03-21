@@ -415,6 +415,24 @@ class DashboardApp(ctk.CTk):
         self.visual_text_size_min_var = ctk.StringVar(value=text_size_min)
         self.visual_text_size_max_var = ctk.StringVar(value=text_size_max)
         self.visual_text_style_var = ctk.StringVar(value=str(state.get("visual_text_style", visual_cfg.get("text_style", "Classic"))))
+        self.visual_preset_var = ctk.StringVar(value=str(state.get("visual_preset", visual_cfg.get("preset", "none"))))
+        self.visual_bass_pulse_var = ctk.StringVar(
+            value=str(state.get("visual_bass_pulse", "yes" if visual_cfg.get("bass_pulse", False) else "no"))
+        )
+        bass_scale_min, bass_scale_max = _split_range_value(
+            state.get("visual_bass_pulse_scale", visual_cfg.get("bass_pulse_scale", 0.03)),
+            0.03,
+            0.03,
+        )
+        self.visual_bass_pulse_scale_min_var = ctk.StringVar(value=bass_scale_min)
+        self.visual_bass_pulse_scale_max_var = ctk.StringVar(value=bass_scale_max)
+        bass_brightness_min, bass_brightness_max = _split_range_value(
+            state.get("visual_bass_pulse_brightness", visual_cfg.get("bass_pulse_brightness", 0.04)),
+            0.04,
+            0.04,
+        )
+        self.visual_bass_pulse_brightness_min_var = ctk.StringVar(value=bass_brightness_min)
+        self.visual_bass_pulse_brightness_max_var = ctk.StringVar(value=bass_brightness_max)
         self.generate_text_var = ctk.BooleanVar(value=bool(state.get("generate_text", True)))
         self.generate_thumbnails_var = ctk.BooleanVar(value=bool(state.get("generate_thumbnails", True)))
         metadata_mode = state.get("metadata_mode", "prompt_api")
@@ -905,11 +923,15 @@ class DashboardApp(ctk.CTk):
         intro.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
         intro.grid_columnconfigure(0, weight=1)
         intro.grid_columnconfigure(1, weight=0)
+        intro.grid_columnconfigure(2, weight=0)
         ctk.CTkLabel(intro, text="高级视觉控制", font=ctk.CTkFont(size=24, weight="bold")).grid(
             row=0, column=0, sticky="w", padx=16, pady=(14, 8)
         )
         ctk.CTkButton(intro, text="保存视觉设置", command=self._save_visual_settings).grid(
             row=0, column=1, sticky="e", padx=16, pady=(14, 8)
+        )
+        ctk.CTkButton(intro, text="套用 MEGA BASS 预设", command=self._apply_visual_preset_mega_bass).grid(
+            row=0, column=2, sticky="e", padx=(0, 16), pady=(14, 8)
         )
         ctk.CTkLabel(
             intro,
@@ -965,8 +987,32 @@ class DashboardApp(ctk.CTk):
             self.visual_soft_focus_sigma_max_var,
         )
 
+        preset = ctk.CTkFrame(tab)
+        preset.grid(row=3, column=0, sticky="ew", padx=8, pady=8)
+        for column in range(4):
+            preset.grid_columnconfigure(column, weight=1)
+        ctk.CTkLabel(preset, text="节奏联动 / 预设", font=ctk.CTkFont(size=22, weight="bold")).grid(
+            row=0, column=0, columnspan=4, sticky="w", padx=16, pady=(14, 12)
+        )
+        self._entry_row(preset, 1, "视觉预设", self.visual_preset_var, values=["none", "mega_bass"])
+        self._entry_row(preset, 2, "低频脉冲", self.visual_bass_pulse_var, values=VISUAL_TOGGLE_VALUES)
+        self._range_row(
+            preset,
+            3,
+            "脉冲缩放",
+            self.visual_bass_pulse_scale_min_var,
+            self.visual_bass_pulse_scale_max_var,
+        )
+        self._range_row(
+            preset,
+            4,
+            "脉冲亮度",
+            self.visual_bass_pulse_brightness_min_var,
+            self.visual_bass_pulse_brightness_max_var,
+        )
+
         overlay = ctk.CTkFrame(tab)
-        overlay.grid(row=3, column=0, sticky="ew", padx=8, pady=8)
+        overlay.grid(row=4, column=0, sticky="ew", padx=8, pady=8)
         for column in range(4):
             overlay.grid_columnconfigure(column, weight=1)
         ctk.CTkLabel(overlay, text="贴纸 / 粒子 / 叠字", font=ctk.CTkFont(size=22, weight="bold")).grid(
@@ -1000,7 +1046,7 @@ class DashboardApp(ctk.CTk):
         self._entry_row(overlay, 8, "文字样式", self.visual_text_style_var, values=_with_random(list_text_styles()))
 
         help_frame = ctk.CTkFrame(tab)
-        help_frame.grid(row=4, column=0, sticky="ew", padx=8, pady=(8, 16))
+        help_frame.grid(row=5, column=0, sticky="ew", padx=8, pady=(8, 16))
         help_frame.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(help_frame, text="如何添加更多贴纸 / 特效", font=ctk.CTkFont(size=22, weight="bold")).grid(
             row=0, column=0, sticky="w", padx=16, pady=(14, 8)
@@ -1234,6 +1280,7 @@ class DashboardApp(ctk.CTk):
 
     def _collect_visual_settings(self) -> dict[str, Any]:
         return {
+            "preset": self.visual_preset_var.get().strip() or "none",
             "spectrum": _bool_from_yes_no(self.visual_spectrum_var.get()),
             "timeline": _bool_from_yes_no(self.visual_timeline_var.get()),
             "letterbox": _bool_from_yes_no(self.visual_letterbox_var.get()),
@@ -1273,6 +1320,17 @@ class DashboardApp(ctk.CTk):
                 self.visual_particle_speed_max_var.get(),
                 "1.0",
             ),
+            "bass_pulse": _bool_from_yes_no(self.visual_bass_pulse_var.get()),
+            "bass_pulse_scale": _compose_range_value(
+                self.visual_bass_pulse_scale_min_var.get(),
+                self.visual_bass_pulse_scale_max_var.get(),
+                "0.03",
+            ),
+            "bass_pulse_brightness": _compose_range_value(
+                self.visual_bass_pulse_brightness_min_var.get(),
+                self.visual_bass_pulse_brightness_max_var.get(),
+                "0.04",
+            ),
             "text": self.visual_text_var.get(),
             "text_font": self.visual_text_font_var.get().strip() or "default",
             "text_pos": self.visual_text_pos_var.get().strip() or "center",
@@ -1291,6 +1349,43 @@ class DashboardApp(ctk.CTk):
         self._save_state()
         self._log("[Visual] Saved advanced visual settings")
 
+    def _apply_visual_preset_mega_bass(self) -> None:
+        self.visual_preset_var.set("mega_bass")
+        self.visual_spectrum_var.set("no")
+        self.visual_timeline_var.set("no")
+        self.visual_letterbox_var.set("no")
+        self.visual_zoom_var.set("slow")
+        self.visual_style_var.set("bar_mirror")
+        self.visual_color_spectrum_var.set("MegaBassNeon")
+        self.visual_color_timeline_var.set("MegaBassNeon")
+        self.visual_film_grain_var.set("yes")
+        self.visual_grain_strength_min_var.set("8")
+        self.visual_grain_strength_max_var.set("14")
+        self.visual_vignette_var.set("yes")
+        self.visual_tint_var.set("blue_night")
+        self.visual_soft_focus_var.set("no")
+        self.visual_soft_focus_sigma_min_var.set("1.2")
+        self.visual_soft_focus_sigma_max_var.set("1.8")
+        self.visual_particle_var.set("random")
+        self.visual_particle_opacity_min_var.set("0.14")
+        self.visual_particle_opacity_max_var.set("0.26")
+        self.visual_particle_speed_min_var.set("0.85")
+        self.visual_particle_speed_max_var.set("1.25")
+        self.visual_bass_pulse_var.set("yes")
+        self.visual_bass_pulse_scale_min_var.set("0.018")
+        self.visual_bass_pulse_scale_max_var.set("0.036")
+        self.visual_bass_pulse_brightness_min_var.set("0.02")
+        self.visual_bass_pulse_brightness_max_var.set("0.06")
+        if not self.visual_text_var.get().strip():
+            self.visual_text_var.set("MEGA BASS")
+        self.visual_text_font_var.set("default")
+        self.visual_text_pos_var.set("center")
+        self.visual_text_size_min_var.set("84")
+        self.visual_text_size_max_var.set("118")
+        self.visual_text_style_var.set("Neon")
+        self._save_visual_settings()
+        self._log("[Visual] Applied MEGA BASS preset")
+
     def _load_state(self) -> dict[str, Any]:
         if STATE_FILE.exists():
             try:
@@ -1307,6 +1402,7 @@ class DashboardApp(ctk.CTk):
             "date_mmdd": self.date_var.get(),
             "simulate_seconds": self.simulate_seconds_var.get(),
             "randomize_effects": False,
+            "visual_preset": self.visual_preset_var.get(),
             "visual_spectrum": self.visual_spectrum_var.get(),
             "visual_timeline": self.visual_timeline_var.get(),
             "visual_letterbox": self.visual_letterbox_var.get(),
@@ -1356,6 +1452,21 @@ class DashboardApp(ctk.CTk):
             ),
             "visual_particle_speed_min": self.visual_particle_speed_min_var.get(),
             "visual_particle_speed_max": self.visual_particle_speed_max_var.get(),
+            "visual_bass_pulse": self.visual_bass_pulse_var.get(),
+            "visual_bass_pulse_scale": _compose_range_value(
+                self.visual_bass_pulse_scale_min_var.get(),
+                self.visual_bass_pulse_scale_max_var.get(),
+                "0.03",
+            ),
+            "visual_bass_pulse_scale_min": self.visual_bass_pulse_scale_min_var.get(),
+            "visual_bass_pulse_scale_max": self.visual_bass_pulse_scale_max_var.get(),
+            "visual_bass_pulse_brightness": _compose_range_value(
+                self.visual_bass_pulse_brightness_min_var.get(),
+                self.visual_bass_pulse_brightness_max_var.get(),
+                "0.04",
+            ),
+            "visual_bass_pulse_brightness_min": self.visual_bass_pulse_brightness_min_var.get(),
+            "visual_bass_pulse_brightness_max": self.visual_bass_pulse_brightness_max_var.get(),
             "visual_text": self.visual_text_var.get(),
             "visual_text_font": self.visual_text_font_var.get(),
             "visual_text_pos": self.visual_text_pos_var.get(),
