@@ -14,6 +14,8 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable
 
+from PIL import Image, ImageDraw, ImageFont
+
 from content_generation import (
     call_image_model,
     generate_content_bundle,
@@ -54,6 +56,7 @@ CHANNEL_MAPPING_FILE = SCRIPT_DIR / "config" / "channel_mapping.json"
 
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
 PROGRESS_INTERVAL_SECONDS = 3.0
+THUMBNAIL_CANVAS = (1280, 720)
 
 LogFunc = Callable[[str], None]
 ArtifactReadyCallback = Callable[["WindowTask", Path, Path], None]
@@ -804,11 +807,126 @@ def _save_daily_entry(
     save_generation_map(generation_map_path, generation_map)
 
 
-def _make_cover_fallbacks(source_image: Path, tag_dir: Path, date_mmdd: str, serial: int, count: int) -> list[Path]:
+def _load_cover_font(size: int) -> ImageFont.ImageFont:
+    candidates = [
+        Path("C:/Windows/Fonts/msyhbd.ttc"),
+        Path("C:/Windows/Fonts/msyh.ttc"),
+        Path("C:/Windows/Fonts/simhei.ttf"),
+        Path("C:/Windows/Fonts/simsun.ttc"),
+        Path("C:/Windows/Fonts/arialbd.ttf"),
+        Path("C:/Windows/Fonts/arial.ttf"),
+    ]
+    for candidate in candidates:
+        try:
+            if candidate.exists():
+                return ImageFont.truetype(str(candidate), size=size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def _wrap_cover_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int) -> list[str]:
+    compact = re.sub(r"\s+", " ", text or "").strip()
+    if not compact:
+        return []
+    tokens = list(compact)
+    lines: list[str] = []
+    current = ""
+    for token in tokens:
+        candidate = f"{current}{token}"
+        bbox = draw.textbbox((0, 0), candidate, font=font)
+        width = bbox[2] - bbox[0]
+        if current and width > max_width:
+            lines.append(current)
+            current = token
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines
+
+
+def _fit_cover_background(source_image: Path) -> Image.Image:
+    canvas_w, canvas_h = THUMBNAIL_CANVAS
+    image = Image.open(source_image).convert("RGB")
+    scale = max(canvas_w / image.width, canvas_h / image.height)
+    resized = image.resize((max(1, int(image.width * scale)), max(1, int(image.height * scale))), Image.LANCZOS)
+    left = max(0, (resized.width - canvas_w) // 2)
+    top = max(0, (resized.height - canvas_h) // 2)
+    return resized.crop((left, top, left + canvas_w, top + canvas_h))
+
+
+def _render_cover_fallback(source_image: Path, target: Path, headline: str) -> Path:
+    image = _fit_cover_background(source_image)
+    draw = ImageDraw.Draw(image, "RGBA")
+    canvas_w, canvas_h = image.size
+
+    # Bottom gradient panel improves legibility without destroying the base image.
+    draw.rectangle((0, int(canvas_h * 0.60), canvas_w, canvas_h), fill=(0, 0, 0, 118))
+    draw.rectangle((0, int(canvas_h * 0.72), canvas_w, canvas_h), fill=(0, 0, 0, 156))
+
+    primary = re.sub(r"\s+", " ", (headline or "").strip())
+    if not primary:
+        primary = source_image.stem
+    primary = primary.replace("|", "｜")
+    primary = primary[:40]
+
+    subhead = "纯音乐放松聆听"
+    title_font = _load_cover_font(72)
+    sub_font = _load_cover_font(34)
+    max_text_width = int(canvas_w * 0.84)
+    lines = _wrap_cover_text(draw, primary, title_font, max_text_width)[:2]
+    if not lines:
+        lines = [primary]
+
+    x = int(canvas_w * 0.08)
+    y = int(canvas_h * 0.68)
+    for line in lines:
+        draw.text((x + 4, y + 4), line, font=title_font, fill=(0, 0, 0, 185))
+        draw.text((x, y), line, font=title_font, fill=(255, 245, 230, 255))
+        bbox = draw.textbbox((x, y), line, font=title_font)
+        y = bbox[3] + 10
+
+    draw.text((x + 3, y + 3), subhead, font=sub_font, fill=(0, 0, 0, 170))
+    draw.text((x, y), subhead, font=sub_font, fill=(255, 234, 198, 255))
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    image.save(target, quality=95)
+    return target
+
+
+def _thumbnail_error_needs_balance_hint(exc: Exception | None) -> bool:
+    if exc is None:
+        return False
+    text = str(exc).lower()
+    markers = (
+        "quota",
+        "insufficient",
+        "balance",
+        "billing",
+        "credit",
+        "payment",
+        "402",
+        "余额",
+        "额度",
+        "欠费",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _make_cover_fallbacks(
+    source_image: Path,
+    tag_dir: Path,
+    date_mmdd: str,
+    serial: int,
+    count: int,
+    *,
+    headline: str = "",
+) -> list[Path]:
     covers: list[Path] = []
     for index in range(1, count + 1):
-        target = tag_dir / f"{date_mmdd}_{serial}_cover_{index:02d}{source_image.suffix.lower()}"
-        covers.append(_copy_if_needed(source_image, target))
+        target = tag_dir / f"{date_mmdd}_{serial}_cover_{index:02d}.jpg"
+        covers.append(_render_cover_fallback(source_image, target, headline))
     return covers
 
 
@@ -1244,6 +1362,7 @@ def _generate_thumbnail_covers(
     serial: int,
     cover_count: int,
     tag: str,
+    title_text: str,
     control: ExecutionControl | None,
     log: LogFunc,
 ) -> tuple[list[Path], str]:
@@ -1283,9 +1402,18 @@ def _generate_thumbnail_covers(
 
     if source_image and source_image.exists():
         if last_error:
-            log(f"[警告] {tag}/{serial} 缩略图 API 连续失败两次，回落到源图兜底: {last_error}")
-        fallback = _make_cover_fallbacks(source_image, target_dir, date_mmdd, serial, cover_count)
-        return fallback, "source_image"
+            if _thumbnail_error_needs_balance_hint(last_error):
+                log(f"[提醒] {tag}/{serial} 图片 API 可能余额或额度不足，已自动切换到备用封面方案。")
+            log(f"[警告] {tag}/{serial} 缩略图 API 连续失败两次，回落到底图加大字兜底: {last_error}")
+        fallback = _make_cover_fallbacks(
+            source_image,
+            target_dir,
+            date_mmdd,
+            serial,
+            cover_count,
+            headline=title_text,
+        )
+        return fallback, "source_image_text_fallback"
 
     if last_error:
         raise RuntimeError(f"{tag}/{serial} thumbnail API generation failed twice: {last_error}") from last_error
@@ -1428,6 +1556,7 @@ def refresh_existing_output_metadata(
                         serial=task.serial,
                         cover_count=cover_count,
                         tag=tag,
+                        title_text=title,
                         control=control,
                         log=log,
                     )
@@ -2121,6 +2250,7 @@ def execute_metadata_only_workflow(
                         serial=task.serial,
                         cover_count=cover_count,
                         tag=tag,
+                        title_text=title,
                         control=control,
                         log=log,
                     )
@@ -2436,6 +2566,7 @@ def execute_direct_media_workflow(
                         serial=task.serial,
                         cover_count=cover_count,
                         tag=tag,
+                        title_text=title,
                         control=control,
                         log=log,
                     )

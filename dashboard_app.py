@@ -300,6 +300,10 @@ class DashboardApp(ctk.CTk):
         self.upload_monitor_threads: list[threading.Thread] = []
         self._upload_process_lock = threading.Lock()
         self._upload_failures: list[str] = []
+        self._run_result_map: dict[str, dict[str, dict[str, str]]] = {}
+        self._run_plan_for_summary: Any = None
+        self._run_execution_result: Any = None
+        self._run_report_logged = False
         self._audience_data_url: str = ""
         self._state = self._load_state()
         self.window_tasks: list[WindowTask] = []
@@ -1537,18 +1541,184 @@ class DashboardApp(ctk.CTk):
         self._run_upload_done.clear()
         with self._upload_process_lock:
             self._upload_failures = []
+        self._run_result_map = {}
+        self._run_plan_for_summary = None
+        self._run_execution_result = None
+        self._run_report_logged = False
         self.run_last_log_var.set("任务已启动，等待第一条日志")
         self._apply_run_status()
 
+    def _task_result_key(self, tag: str, serial: int) -> str:
+        return f"{str(tag or '').strip()}/{int(serial)}"
+
+    def _lookup_task_tag(self, serial: int) -> str:
+        run_plan = self._run_plan_for_summary
+        for task in getattr(run_plan, "tasks", []) or []:
+            if int(getattr(task, "serial", -1)) == int(serial):
+                return str(getattr(task, "tag", "") or "").strip()
+        return ""
+
+    def _prepare_run_result_tracking(self, run_plan: Any) -> None:
+        self._run_plan_for_summary = run_plan
+        self._run_execution_result = None
+        result_map: dict[str, dict[str, dict[str, str]]] = {}
+        modules = getattr(run_plan, "modules", None)
+        for task in getattr(run_plan, "tasks", []) or []:
+            key = self._task_result_key(task.tag, task.serial)
+            stages: dict[str, dict[str, str]] = {}
+            if getattr(modules, "render", False):
+                stages["render"] = {"status": "pending", "detail": ""}
+            if getattr(modules, "metadata", False):
+                stages["metadata"] = {"status": "pending", "detail": ""}
+            if getattr(modules, "upload", False):
+                stages["upload"] = {"status": "pending", "detail": ""}
+            result_map[key] = stages
+        self._run_result_map = result_map
+
+    def _mark_run_stage(self, tag: str, serial: int, stage: str, status: str, detail: str = "") -> None:
+        key = self._task_result_key(tag, serial)
+        entry = self._run_result_map.setdefault(key, {})
+        stage_entry = entry.setdefault(stage, {"status": "pending", "detail": ""})
+        stage_entry["status"] = status
+        stage_entry["detail"] = str(detail or "").strip()
+
+    def _ingest_execution_result(self, execution: Any) -> None:
+        self._run_execution_result = execution
+        run_plan = getattr(execution, "run_plan", None) if execution else None
+        workflow_result = getattr(execution, "workflow_result", None) if execution else None
+        if not run_plan:
+            return
+        modules = getattr(run_plan, "modules", None)
+        warning_map: dict[str, str] = {}
+        for warning in getattr(workflow_result, "warnings", []) or []:
+            match = re.search(r"([^/\s]+)/([0-9]+)\s+文案/封面阶段失败[^:：]*[:：]\s*(.+)", str(warning))
+            if match:
+                warning_map[self._task_result_key(match.group(1), int(match.group(2)))] = match.group(3).strip()
+        item_map = {self._task_result_key(item.tag, item.serial): item for item in (getattr(workflow_result, "items", []) or [])}
+        for task in getattr(run_plan, "tasks", []) or []:
+            key = self._task_result_key(task.tag, task.serial)
+            item = item_map.get(key)
+            if getattr(modules, "render", False):
+                if item and str(getattr(item, "output_video", "")).strip():
+                    self._mark_run_stage(task.tag, task.serial, "render", "success")
+                else:
+                    self._mark_run_stage(task.tag, task.serial, "render", "failed", "未生成成品视频")
+            if getattr(modules, "metadata", False):
+                metadata_error = warning_map.get(key)
+                if metadata_error:
+                    self._mark_run_stage(task.tag, task.serial, "metadata", "failed", metadata_error)
+                    if getattr(modules, "upload", False):
+                        self._mark_run_stage(task.tag, task.serial, "upload", "skipped", "文案/封面失败后已跳过上传")
+                elif item:
+                    self._mark_run_stage(task.tag, task.serial, "metadata", "success")
+            if getattr(modules, "upload", False) and key not in warning_map and key in item_map:
+                current = self._run_result_map.get(key, {}).get("upload", {})
+                if current.get("status") == "pending":
+                    self._mark_run_stage(task.tag, task.serial, "upload", "running", "等待上传结果")
+
+    def _load_upload_record_result(self, date_mmdd: str, tag: str, serial: int) -> dict[str, Any] | None:
+        record_path = SCRIPT_DIR / "upload_records" / str(date_mmdd) / str(tag) / f"channel_{int(serial)}.json"
+        if not record_path.exists():
+            return None
+        try:
+            return json.loads(record_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    def _sync_upload_results_from_records(self) -> None:
+        run_plan = self._run_plan_for_summary
+        if not run_plan or not getattr(getattr(run_plan, "modules", None), "upload", False):
+            return
+        date_mmdd = str(getattr(getattr(run_plan, "defaults", None), "date_mmdd", "")).strip()
+        for task in getattr(run_plan, "tasks", []) or []:
+            record = self._load_upload_record_result(date_mmdd, task.tag, task.serial)
+            if not record:
+                continue
+            if bool(record.get("success")):
+                self._mark_run_stage(task.tag, task.serial, "upload", "success", str(record.get("stage") or "上传成功"))
+            else:
+                detail = str(record.get("failure_reason") or record.get("stage") or "上传失败")
+                self._mark_run_stage(task.tag, task.serial, "upload", "failed", detail)
+
+    def _compose_run_completion_report(self, success: bool, summary: str, cancelled: bool = False) -> tuple[str, str]:
+        self._sync_upload_results_from_records()
+        if not self._run_result_map:
+            return summary, summary
+
+        success_lines: list[str] = []
+        failed_lines: list[str] = []
+        skipped_lines: list[str] = []
+        pending_lines: list[str] = []
+        stage_labels = {"render": "Render", "metadata": "Metadata/Cover", "upload": "Upload"}
+
+        for key, stages in self._run_result_map.items():
+            parts: list[str] = []
+            has_failed = False
+            has_skipped = False
+            has_pending = False
+
+            for stage_name in ("render", "metadata", "upload"):
+                stage = stages.get(stage_name)
+                if not stage:
+                    continue
+                status = str(stage.get("status", "pending") or "pending").strip()
+                detail = str(stage.get("detail", "") or "").strip()
+                label = stage_labels.get(stage_name, stage_name)
+
+                if status == "success":
+                    parts.append(f"{label}: success")
+                elif status == "failed":
+                    has_failed = True
+                    parts.append(f"{label}: failed ({detail or 'unknown reason'})")
+                elif status == "skipped":
+                    has_skipped = True
+                    parts.append(f"{label}: skipped ({detail or 'skipped'})")
+                else:
+                    has_pending = True
+                    parts.append(f"{label}: pending ({detail or 'waiting'})")
+
+            line = f"- {key}: " + " | ".join(parts or ["no result"])
+            if has_failed:
+                failed_lines.append(line)
+            elif has_skipped:
+                skipped_lines.append(line)
+            elif has_pending:
+                pending_lines.append(line)
+            else:
+                success_lines.append(line)
+
+        headline = "Batch cancelled" if cancelled else f"Success {len(success_lines)}, Failed {len(failed_lines)}, Skipped {len(skipped_lines)}"
+        lines = ["[Result] Batch execution summary", headline]
+        if success_lines:
+            lines.append("Success:")
+            lines.extend(success_lines)
+        if failed_lines:
+            lines.append("Failed:")
+            lines.extend(failed_lines)
+        if skipped_lines:
+            lines.append("Skipped:")
+            lines.extend(skipped_lines)
+        if pending_lines:
+            lines.append("Pending:")
+            lines.extend(pending_lines)
+        if summary and summary not in headline:
+            lines.append(f"Note: {summary}")
+        report = chr(10).join(lines)
+        return headline or summary, report
+
     def _finish_run_tracking(self, *, success: bool, summary: str, cancelled: bool = False) -> None:
         elapsed = time.time() - self._run_started_at if self._run_started_at else 0.0
-        self.run_status_var.set("已取消" if cancelled else ("已完成" if success else "失败"))
-        self.run_phase_var.set("任务结束")
-        self.run_detail_var.set(summary)
+        summary_text, full_report = self._compose_run_completion_report(success, summary, cancelled)
+        self.run_status_var.set("Cancelled" if cancelled else ("Done" if success else "Failed"))
+        self.run_phase_var.set("Finished")
+        self.run_detail_var.set(summary_text)
         self.run_progress_var.set(f"{self._run_completed_steps}/{self._run_total_steps}")
         self.run_elapsed_var.set(_format_runtime_duration(elapsed))
         self.run_eta_var.set("00:00" if success or cancelled else "--")
-        self.run_progress_bar.set(1.0 if success else self.run_progress_bar.get())
+        self.run_progress_bar.set(1.0 if success or cancelled else self.run_progress_bar.get())
+        if full_report and not self._run_report_logged:
+            self._run_report_logged = True
+            self._log(full_report)
         self._run_started_at = None
         self._run_mode_label = ""
         self._run_total_items = 0
@@ -1556,14 +1726,18 @@ class DashboardApp(ctk.CTk):
         self._run_completed_steps = 0
         self._run_current_ratio = 0.0
         self._run_current_item = ""
-        self._run_phase = "空闲"
+        self._run_phase = "Idle"
         self._run_include_upload = False
         self.execution_control = None
         self._cancel_requested = False
         self._run_paused = False
-        self.pause_button_text_var.set("暂停")
+        self.pause_button_text_var.set("Pause")
         self._run_render_done.clear()
         self._run_upload_done.clear()
+        self._run_plan_for_summary = None
+        self._run_execution_result = None
+        self._run_result_map = {}
+        self._run_report_logged = False
 
     def _tick_run_status(self) -> None:
         if self._run_started_at:
@@ -1583,11 +1757,9 @@ class DashboardApp(ctk.CTk):
         text = str(message or "").strip()
         if not text:
             return
-
         self.run_last_log_var.set(text[:120])
         if not self._run_started_at:
             return
-
         if text.startswith("[开始]"):
             self._run_phase = text[4:].strip() or "开始"
         elif text.startswith("[Control] Paused"):
@@ -1599,7 +1771,7 @@ class DashboardApp(ctk.CTk):
         elif text.startswith("[计划]"):
             self._run_phase = "生成计划"
         elif text.startswith("[任务]"):
-            match = re.search(r"\[任务\]\s+([^/]+)/(\d+):", text)
+            match = re.search(r"\[任务\]\s+([^/]+)/([0-9]+):", text)
             if match:
                 self._run_phase = "渲染"
                 self._run_current_item = f"{match.group(1)} / 窗口 {match.group(2)}"
@@ -1619,6 +1791,23 @@ class DashboardApp(ctk.CTk):
         elif text.startswith("[上传]"):
             self._run_phase = "上传"
 
+        upload_match = re.match(r"\[Upload ([^\]]+)\]\s+(.*)$", text)
+        if upload_match:
+            label = upload_match.group(1)
+            upload_text = upload_match.group(2).strip()
+            if "/" in label:
+                tag_name, serial_text = label.rsplit("/", 1)
+                try:
+                    serial_value = int(serial_text)
+                except ValueError:
+                    serial_value = None
+                if serial_value is not None:
+                    fail_match = re.search(r"上传失败\(stage=([^)]+)\)", upload_text)
+                    if fail_match:
+                        self._mark_run_stage(tag_name, serial_value, "upload", "failed", fail_match.group(1))
+                    elif "发布成功" in upload_text or "上传成功" in upload_text:
+                        self._mark_run_stage(tag_name, serial_value, "upload", "success", "上传成功")
+
         if "上传状态检查" in text:
             self._run_phase = "上传检查"
             status_match = re.search(r"\[(\d+)\]", text)
@@ -1628,11 +1817,20 @@ class DashboardApp(ctk.CTk):
             self._run_phase = "批量上传"
         serial_match = re.search(r"序号\s+(\d+)", text)
         if serial_match:
-            self._run_current_item = f"窗口 {serial_match.group(1)}"
+            serial_value = int(serial_match.group(1))
+            self._run_current_item = f"窗口 {serial_value}"
+            fail_match = re.search(r"上传失败\(stage=([^)]+)\)", text)
+            if fail_match:
+                tag_name = self._lookup_task_tag(serial_value)
+                if tag_name:
+                    self._mark_run_stage(tag_name, serial_value, "upload", "failed", fail_match.group(1))
         if "发布成功" in text and serial_match:
+            serial_value = int(serial_match.group(1))
+            tag_name = self._lookup_task_tag(serial_value)
+            if tag_name:
+                self._mark_run_stage(tag_name, serial_value, "upload", "success", "发布成功")
             self._run_phase = "上传完成"
             self._run_progress_step_done(serial_match.group(1), "upload")
-
         self._apply_run_status()
 
     def _current_run_summary(self) -> str:
@@ -1646,10 +1844,11 @@ class DashboardApp(ctk.CTk):
             f"最近日志: {self.run_last_log_var.get()}",
         ]
         if self._has_active_background_work():
-            parts.append("说明: 你可以继续切换其他页面查看或改配置；新的开始任务会等当前流程结束")
+            parts.append("说明: 你可以继续切换其他页面查看或修改配置；新的开始任务会等当前流程结束。")
         return "\n".join(parts)
 
     def _refresh_groups(self) -> None:
+
         self.group_catalog = get_group_catalog()
         groups = list(self.group_catalog.keys()) or [""]
         for menu in (
@@ -2450,6 +2649,20 @@ class DashboardApp(ctk.CTk):
                         return_code = proc.wait()
                         if return_code != 0 and not self._cancel_requested:
                             error_text = f"{label} exit {return_code}"
+                            if "/" in label:
+                                tag_name, serial_text = label.rsplit("/", 1)
+                                try:
+                                    self._mark_run_stage(tag_name, int(serial_text), "upload", "failed", f"进程退出 {return_code}")
+                                except ValueError:
+                                    pass
+                        elif not self._cancel_requested and "/" in label:
+                            tag_name, serial_text = label.rsplit("/", 1)
+                            try:
+                                current = self._run_result_map.get(label, {}).get("upload", {})
+                                if current.get("status") in {"pending", "running"}:
+                                    self._mark_run_stage(tag_name, int(serial_text), "upload", "success", "上传成功")
+                            except ValueError:
+                                pass
                     except Exception as exc:
                         if not self._cancel_requested:
                             error_text = f"{label}: {exc}"
@@ -2525,6 +2738,10 @@ class DashboardApp(ctk.CTk):
                     self._post_ui_action(lambda: self._finish_run_tracking(success=False, summary="当前批次已取消", cancelled=True))
                     return
                 if error_text:
+                    for task in getattr(run_plan, "tasks", []) or []:
+                        current = self._run_result_map.get(self._task_result_key(task.tag, task.serial), {}).get("upload", {})
+                        if current.get("status") in {"pending", "running"}:
+                            self._mark_run_stage(task.tag, task.serial, "upload", "failed", error_text)
                     self._post_ui_action(lambda: self._finish_run_tracking(success=False, summary=error_text))
                     self._post_ui_action(lambda: messagebox.showerror("上传任务失败", error_text))
                 else:
@@ -3064,6 +3281,7 @@ class DashboardApp(ctk.CTk):
         self._persist_prompt_form_for_active_tasks()
         run_plan = self._build_current_run_plan(config=saved_config)
         self._write_run_snapshot(config=saved_config, run_plan=run_plan)
+        self._prepare_run_result_tracking(run_plan)
         task_runtime_rows = [
             {
                 "tag": str(task.tag or "").strip(),
@@ -3115,6 +3333,7 @@ class DashboardApp(ctk.CTk):
                 on_item_ready=handle_item_ready if stream_upload else None,
                 log=self._log,
             )
+            self._ingest_execution_result(execution)
 
             if stream_upload:
                 if upload_dispatched:

@@ -4930,7 +4930,9 @@ def save_upload_record(
     description: str,
     is_ypp: bool,
     ab_test_titles: List[str] = None,
-    success: bool = True
+    success: bool = True,
+    stage: str = "",
+    failure_reason: str = "",
 ):
     """
     保存上传记录，方便后续对比分析
@@ -4978,7 +4980,9 @@ def save_upload_record(
                 "title": title,
                 "description": description[:500] + "..." if len(description) > 500 else description,
                 "description_full_length": len(description)
-            }
+            },
+            "stage": stage,
+            "failure_reason": failure_reason,
         }
         
         if ab_test_titles:
@@ -5015,8 +5019,11 @@ def save_upload_record(
             "thumbnails": [t.name for t in thumbnails],
             "is_ypp": is_ypp,
             "success": success,
+            "stage": stage,
             "upload_time": datetime.now().strftime("%H:%M:%S")
         }
+        if failure_reason:
+            upload_entry["failure_reason"] = failure_reason
         
         if existing:
             summary["uploads"].remove(existing)
@@ -7595,7 +7602,9 @@ async def batch_upload(
             description=description,
             is_ypp=is_ypp,
             ab_test_titles=ab_titles,
-            success=success
+            success=success,
+            stage=stage,
+            failure_reason="" if success else (stage or "upload_failed"),
         )
         
         if not success:
