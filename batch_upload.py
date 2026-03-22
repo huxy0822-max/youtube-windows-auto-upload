@@ -68,6 +68,14 @@ from utils import (
 
 # ============ 配置 ============
 CONFIG_PATH = Path(os.environ.get("UPLOAD_CONFIG_PATH", str(resolve_config_file(SCRIPT_DIR, "upload_config.json"))))
+UPLOAD_DELAY_MODE = "steady"
+UPLOAD_DELAY_PROFILES = {
+    "generic": {"min": 0, "max": 0},
+    "file": {"min": 0, "max": 0},
+    "next": {"min": 0, "max": 0},
+    "done": {"min": 0, "max": 0},
+    "publish": {"min": 0, "max": 0},
+}
 CHANNEL_MAPPING_PATH = Path(os.environ.get("CHANNEL_MAPPING_PATH", str(resolve_config_file(SCRIPT_DIR, "channel_mapping.json"))))
 # 兼容旧代码常量；实际 API 调用走 browser_api.py
 HUBSTUDIO_API = "http://127.0.0.1:6873"
@@ -496,6 +504,85 @@ async def random_delay(min_s=0.5, max_s=1.5, msg=""):
         log(f"{msg} ({delay:.1f}s)", "WAIT")
     await asyncio.sleep(delay)
 
+
+def _resolve_upload_delay_bounds(profile: str) -> tuple[int, int]:
+    config = UPLOAD_DELAY_PROFILES.get(profile) or UPLOAD_DELAY_PROFILES.get("generic") or {"min": 0, "max": 0}
+    min_ms = max(0, int(config.get("min", 0) or 0))
+    max_ms = max(min_ms, int(config.get("max", min_ms) or min_ms))
+    return min_ms, max_ms
+
+
+def _resolve_upload_click_delay_ms(profile: str = "generic", stage: str = "normal") -> int:
+    min_ms, max_ms = _resolve_upload_delay_bounds(profile)
+    if max_ms <= 0:
+        return 0
+    if UPLOAD_DELAY_MODE == "jitter":
+        if max_ms <= min_ms:
+            return min_ms
+        if stage in {"retry", "fallback"}:
+            lower = min_ms + ((max_ms - min_ms) // 2)
+            return random.randint(lower, max_ms)
+        return random.randint(min_ms, max_ms)
+    if stage == "retry":
+        return max_ms
+    if stage == "fallback":
+        if max_ms <= min_ms:
+            return max_ms
+        return int(round((min_ms + max_ms) / 2))
+    return min_ms
+
+
+async def upload_click_delay(profile: str = "generic", *, stage: str = "normal"):
+    """上传自动化专用延迟。抖动模式会在区间内随机取值。"""
+    delay_ms = _resolve_upload_click_delay_ms(profile, stage)
+    if delay_ms <= 0:
+        return
+    await asyncio.sleep(delay_ms / 1000.0)
+
+
+async def wait_until_locator_clickable(page, locator, desc: str = "", timeout_ms: int = 12000) -> bool:
+    deadline = time.monotonic() + max(1, timeout_ms) / 1000.0
+    last_error = ""
+    while time.monotonic() < deadline:
+        await clear_blocking_overlays(page, f"click-ready {desc}".strip())
+        try:
+            remain_ms = max(250, int((deadline - time.monotonic()) * 1000))
+            await locator.wait_for(state="visible", timeout=min(1500, remain_ms))
+        except Exception as exc:
+            last_error = str(exc)
+            await asyncio.sleep(0.2)
+            continue
+        try:
+            await locator.scroll_into_view_if_needed(timeout=1000)
+        except Exception:
+            pass
+        try:
+            aria_disabled = ((await locator.get_attribute("aria-disabled")) or "").strip().lower()
+            if aria_disabled == "true":
+                last_error = "aria-disabled=true"
+                await asyncio.sleep(0.2)
+                continue
+        except Exception:
+            pass
+        try:
+            enabled = await locator.is_enabled()
+            if enabled is False:
+                last_error = "disabled=true"
+                await asyncio.sleep(0.2)
+                continue
+        except Exception:
+            pass
+        try:
+            remain_ms = max(250, int((deadline - time.monotonic()) * 1000))
+            await locator.click(timeout=min(1200, remain_ms), trial=True)
+            return True
+        except Exception as exc:
+            last_error = str(exc)
+            await asyncio.sleep(0.2)
+    if desc:
+        log(f"{desc} 等待可点击超时: {last_error}", "WARN")
+    return False
+
 async def clear_blocking_overlays(page, reason: str = ""):
     """清理会拦截点击的 YouTube overlay/backdrop。"""
     try:
@@ -525,26 +612,36 @@ async def clear_blocking_overlays(page, reason: str = ""):
     except Exception:
         pass
 
-async def human_click(page, locator, desc=""):
-    """人性化点击 - 随机位置点击"""
+async def human_click(page, locator, desc="", delay_profile: str = "generic"):
+    """优先直接点击，只有常规点击失败时才回退到鼠标坐标点击。"""
     log(f"点击: {desc}", "ACT")
     try:
         await clear_blocking_overlays(page, "pre-click")
         await locator.wait_for(state="visible", timeout=15000)
-        box = await locator.bounding_box()
-        if box:
-            x = box['x'] + box['width'] * random.uniform(0.3, 0.7)
-            y = box['y'] + box['height'] * random.uniform(0.3, 0.7)
-            await page.mouse.move(x, y)
-            await asyncio.sleep(0.15)
-            await page.mouse.click(x, y)
-        else:
-            await locator.click()
+        try:
+            await locator.scroll_into_view_if_needed(timeout=3000)
+        except Exception:
+            pass
+        await wait_until_locator_clickable(page, locator, desc=desc, timeout_ms=12000)
+        try:
+            await upload_click_delay(delay_profile, stage="normal")
+            await locator.click(timeout=5000)
+            return True
+        except Exception as direct_exc:
+            box = await locator.bounding_box()
+            if box:
+                x = box["x"] + box["width"] * random.uniform(0.3, 0.7)
+                y = box["y"] + box["height"] * random.uniform(0.3, 0.7)
+                await upload_click_delay(delay_profile, stage="fallback")
+                await page.mouse.click(x, y)
+            else:
+                raise direct_exc
         return True
     except Exception as e:
         if "intercepts pointer events" in str(e) or "overlay-backdrop" in str(e):
             try:
                 await clear_blocking_overlays(page, "click-retry")
+                await upload_click_delay(delay_profile, stage="retry")
                 await locator.click(force=True, timeout=5000)
                 return True
             except Exception:
@@ -2630,6 +2727,7 @@ async def try_select_public_visibility(page) -> bool:
 async def try_click_publish_button(page) -> bool:
     """外层 host 隐藏时，直接点内部 Publish 按钮。"""
     try:
+        await upload_click_delay("publish", stage="fallback")
         result = await page.evaluate(
             """
             () => {
@@ -2780,8 +2878,9 @@ async def try_publish_from_video_edit_page(
                     top_disabled = ((await top_save.get_attribute("aria-disabled")) or "").lower() == "true"
                     if not top_disabled:
                         log("编辑页先保存详情，等待最终提交按钮可点击", "WARN")
-                        clicked = await human_click(page, top_save, "编辑页保存")
+                        clicked = await human_click(page, top_save, "编辑页保存", delay_profile="done")
                         if not clicked:
+                            await upload_click_delay("done", stage="retry")
                             await top_save.click(force=True, timeout=5000)
                         await asyncio.sleep(2.0)
             except Exception as save_exc:
@@ -2824,6 +2923,7 @@ async def try_publish_from_video_edit_page(
                 "Done / Publish / Schedule",
                 button_id="save-button",
                 text_pattern=publish_pattern,
+                delay_profile="done",
             )
             if not publish_clicked:
                 publish_clicked = await try_click_publish_button(page)
@@ -3163,12 +3263,14 @@ async def reload_with_optional_dialog(page, timeout: int = 15000) -> None:
     await page.reload(timeout=timeout)
 
 
-async def human_fill(page, locator, text, desc=""):
+async def human_fill(page, locator, text, desc="", delay_profile: str = "generic"):
     """人性化填充 - 直接填充 + 适当延迟"""
     log(f"填写: {desc} ({len(text)} 字符)", "ACT")
     try:
         await clear_blocking_overlays(page, "pre-fill")
         await locator.wait_for(state="visible", timeout=10000)
+        await wait_until_locator_clickable(page, locator, desc=desc, timeout_ms=10000)
+        await upload_click_delay(delay_profile, stage="normal")
         await locator.click()
         await asyncio.sleep(random.uniform(0.3, 0.5))
         await page.keyboard.press("Control+a" if IS_WINDOWS else "Meta+a")
@@ -3180,6 +3282,7 @@ async def human_fill(page, locator, text, desc=""):
         if "intercepts pointer events" in str(e) or "overlay-backdrop" in str(e):
             try:
                 await clear_blocking_overlays(page, "fill-retry")
+                await upload_click_delay(delay_profile, stage="retry")
                 await locator.click(force=True, timeout=5000)
                 await page.keyboard.press("Control+a" if IS_WINDOWS else "Meta+a")
                 await locator.fill(text)
@@ -3287,9 +3390,11 @@ async def click_visible_upload_dialog_button(
     desc: str,
     button_id: str = "",
     text_pattern: str = "",
+    delay_profile: str = "generic",
 ) -> bool:
     """当 Playwright 命中隐藏宿主时，直接点 visible dialog 里的真实按钮。"""
     try:
+        await upload_click_delay(delay_profile, stage="fallback")
         result = await page.evaluate(
             """
             ({ buttonId, textPattern }) => {
@@ -3466,12 +3571,13 @@ async def click_next_button(page, desc: str = "Next", timeout_ms: int = 25000) -
                 if not await _is_enabled(next_btn):
                     continue
 
-                clicked = await human_click(page, next_btn, f"{desc} (idx={idx})")
+                clicked = await human_click(page, next_btn, f"{desc} (idx={idx})", delay_profile="next")
                 if clicked:
                     return True
 
                 try:
                     await next_btn.scroll_into_view_if_needed()
+                    await upload_click_delay("next", stage="retry")
                     await next_btn.click(timeout=3000, force=True)
                     return True
                 except Exception:
@@ -3481,6 +3587,7 @@ async def click_next_button(page, desc: str = "Next", timeout_ms: int = 25000) -
                     inner = next_btn.locator("button").first
                     if await inner.count() > 0:
                         await inner.scroll_into_view_if_needed()
+                        await upload_click_delay("next", stage="retry")
                         await inner.click(timeout=3000, force=True)
                         return True
                 except Exception:
@@ -3522,6 +3629,7 @@ async def click_next_button(page, desc: str = "Next", timeout_ms: int = 25000) -
                 desc,
                 button_id="next-button",
                 text_pattern="next",
+                delay_profile="next",
             )
             if dom_clicked:
                 return True
@@ -4771,6 +4879,7 @@ async def select_file_with_playwright(page, file_path: str) -> bool:
                 continue
             for idx in range(count):
                 try:
+                    await upload_click_delay("file", stage="normal")
                     await locator.nth(idx).set_input_files(target)
                     log(f"Playwright 回退成功: {selector}[{idx}] frame={frame.url}", "OK")
                     return True
@@ -4806,6 +4915,7 @@ async def select_file_with_playwright(page, file_path: str) -> bool:
         )
         element = handle.as_element() if handle else None
         if element:
+            await upload_click_delay("file", stage="normal")
             await element.set_input_files(target)
             log("Playwright 深层 DOM 回退成功", "OK")
             try:
@@ -4920,6 +5030,7 @@ async def select_file_with_cdp(page, file_path: str) -> bool:
             return await select_file_with_playwright(page, file_path)
         
         # 设置文件路径（浏览器自己从本地磁盘读取，不经过网络传输）
+        await upload_click_delay("file", stage="normal")
         await cdp.send('DOM.setFileInputFiles', {
             'nodeId': node_id,
             'files': [str(file_path)]
@@ -6721,6 +6832,7 @@ async def upload_single(
                                     log(f"  封面输入框数量不足，等待重试 ({attempt + 1}/2)", "WARN")
                                     await asyncio.sleep(2)
                                     continue
+                                await upload_click_delay("file", stage="normal")
                                 await ab_inputs.nth(idx).set_input_files(str(thumbnails[idx]))
                                 log(f"  封面 {idx+1} 上传中...")
                                 await random_delay(1.5, 2.5)
@@ -6859,6 +6971,7 @@ async def upload_single(
                     log("上传封面图 (单张)...")
                     thumbnail_input = page.locator('.style-scope.ytcp-video-custom-still-editor input[type="file"]').first
                     if await thumbnail_input.count() > 0:
+                        await upload_click_delay("file", stage="normal")
                         await thumbnail_input.set_input_files(str(thumbnails[0]))
                         await random_delay(2, 3)
                         unreadable_error = await detect_upload_file_read_error(page)
@@ -7279,13 +7392,14 @@ async def upload_single(
                 log("点击最终提交按钮...", "ACT")
                 try:
                     done_btn = page.locator("ytcp-button#done-button").first
-                    publish_clicked = await human_click(page, done_btn, "Done / Publish / Schedule")
+                    publish_clicked = await human_click(page, done_btn, "Done / Publish / Schedule", delay_profile="done")
                     if not publish_clicked:
                         publish_clicked = await click_visible_upload_dialog_button(
                             page,
                             "Done / Publish / Schedule",
                             button_id="done-button",
                             text_pattern="done|save|publish|schedule|完成|保存|yayınla|發佈|发布|公開|定時|定时|排程",
+                            delay_profile="done",
                         )
                     if not publish_clicked:
                         publish_clicked = await try_click_publish_button(page)
@@ -8008,6 +8122,18 @@ def parse_arguments():
     parser.add_argument("--max-open-windows", type=int, default=10, help="成功发布后保留的最大窗口数 (默认: 10)")
     parser.add_argument("--window-ttl-hours", type=float, default=2.0, help="成功发布后窗口保留时长(小时) (默认: 2)")
     parser.add_argument("--retain-video-days", type=int, default=0, help="上传成功后保留视频文件的天数；0 表示立即删除")
+    parser.add_argument("--click-delay-ms", type=int, default=0, help="兼容旧版：上传自动点击前的固定等待毫秒数")
+    parser.add_argument("--click-delay-min-ms", type=int, default=None, help="上传自动点击等待下限毫秒数")
+    parser.add_argument("--click-delay-max-ms", type=int, default=None, help="上传自动点击等待上限毫秒数")
+    parser.add_argument("--click-delay-mode", type=str, default="steady", help="上传点击延迟策略: steady 或 jitter")
+    parser.add_argument("--file-delay-min-ms", type=int, default=None, help="文件上传等待下限毫秒数")
+    parser.add_argument("--file-delay-max-ms", type=int, default=None, help="文件上传等待上限毫秒数")
+    parser.add_argument("--next-delay-min-ms", type=int, default=None, help="Next 点击等待下限毫秒数")
+    parser.add_argument("--next-delay-max-ms", type=int, default=None, help="Next 点击等待上限毫秒数")
+    parser.add_argument("--done-delay-min-ms", type=int, default=None, help="Done 点击等待下限毫秒数")
+    parser.add_argument("--done-delay-max-ms", type=int, default=None, help="Done 点击等待上限毫秒数")
+    parser.add_argument("--publish-delay-min-ms", type=int, default=None, help="Publish 点击等待下限毫秒数")
+    parser.add_argument("--publish-delay-max-ms", type=int, default=None, help="Publish 点击等待上限毫秒数")
     parser.add_argument("--pair-size", type=int, default=2, help="每组配令人数 (默认: 2)")
     parser.add_argument("--wait-hours", type=float, default=2.0, help="每组之间的等待时间(小时) (默认: 2.0)")
     return parser.parse_args()
@@ -9053,10 +9179,51 @@ def resolve_containers_for_tag(tag: str, project_folder: Optional[Path]) -> tupl
 
 def main():
     args = parse_arguments()
+    global UPLOAD_DELAY_MODE
+    global UPLOAD_DELAY_PROFILES
+    legacy_delay_ms = max(0, int(args.click_delay_ms or 0))
+    generic_min_ms = args.click_delay_min_ms if args.click_delay_min_ms is not None else legacy_delay_ms
+    generic_max_ms = args.click_delay_max_ms if args.click_delay_max_ms is not None else legacy_delay_ms
+    UPLOAD_DELAY_MODE = "jitter" if str(args.click_delay_mode or "").strip().lower() == "jitter" else "steady"
+
+    def _pair(min_value, max_value):
+        min_ms = max(0, int((min_value if min_value is not None else 0) or 0))
+        max_ms = max(min_ms, int((max_value if max_value is not None else min_ms) or min_ms))
+        return {"min": min_ms, "max": max_ms}
+
+    generic_pair = _pair(generic_min_ms, generic_max_ms)
+    UPLOAD_DELAY_PROFILES = {
+        "generic": generic_pair,
+        "file": _pair(
+            args.file_delay_min_ms if args.file_delay_min_ms is not None else generic_pair["min"],
+            args.file_delay_max_ms if args.file_delay_max_ms is not None else generic_pair["max"],
+        ),
+        "next": _pair(
+            args.next_delay_min_ms if args.next_delay_min_ms is not None else generic_pair["min"],
+            args.next_delay_max_ms if args.next_delay_max_ms is not None else generic_pair["max"],
+        ),
+        "done": _pair(
+            args.done_delay_min_ms if args.done_delay_min_ms is not None else generic_pair["min"],
+            args.done_delay_max_ms if args.done_delay_max_ms is not None else generic_pair["max"],
+        ),
+        "publish": _pair(
+            args.publish_delay_min_ms if args.publish_delay_min_ms is not None else generic_pair["min"],
+            args.publish_delay_max_ms if args.publish_delay_max_ms is not None else generic_pair["max"],
+        ),
+    }
     
     print("\n" + "=" * 60)
     print("   YouTube 批量上传脚本")
     print("=" * 60 + "\n")
+    if any(profile["min"] > 0 or profile["max"] > 0 for profile in UPLOAD_DELAY_PROFILES.values()):
+        print(
+            "⏱️ 上传延迟策略: "
+            f"{UPLOAD_DELAY_MODE} | "
+            f"file={UPLOAD_DELAY_PROFILES['file']['min']}~{UPLOAD_DELAY_PROFILES['file']['max']}ms | "
+            f"next={UPLOAD_DELAY_PROFILES['next']['min']}~{UPLOAD_DELAY_PROFILES['next']['max']}ms | "
+            f"done={UPLOAD_DELAY_PROFILES['done']['min']}~{UPLOAD_DELAY_PROFILES['done']['max']}ms | "
+            f"publish={UPLOAD_DELAY_PROFILES['publish']['min']}~{UPLOAD_DELAY_PROFILES['publish']['max']}ms"
+        )
     
     config = load_config()
     window_plan = load_window_upload_plan(args.window_plan_file)

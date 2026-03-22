@@ -55,6 +55,7 @@ AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
 PROGRESS_INTERVAL_SECONDS = 3.0
 
 LogFunc = Callable[[str], None]
+ArtifactReadyCallback = Callable[["WindowTask", Path, Path], None]
 
 
 def _noop_log(_message: str) -> None:
@@ -737,6 +738,56 @@ def save_window_plan(plan: dict[str, Any], date_mmdd: str, path: Path | None = N
     return target
 
 
+def build_runtime_window_plan(
+    *,
+    tasks: list[WindowTask],
+    defaults: WorkflowDefaults,
+    config: dict[str, Any] | None = None,
+    output_dir_overrides: dict[str, str] | None = None,
+    metadata_dir_overrides: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    cfg = config or load_scheduler_settings()
+    plan = build_window_plan(tasks, defaults)
+    output_root = Path(str(cfg.get("output_root") or "").strip())
+    metadata_root = get_metadata_root(cfg)
+    unique_tags = [str(task.tag or "").strip() for task in tasks if str(task.tag or "").strip()]
+    unique_tags = list(dict.fromkeys(unique_tags))
+    single_tag_mode = len(unique_tags) == 1
+    tag_output_dirs: dict[str, str] = {}
+    tag_metadata_dirs: dict[str, str] = {}
+
+    for task in tasks:
+        clean_tag = str(task.tag or "").strip()
+        if not clean_tag:
+            continue
+
+        override_output = str((output_dir_overrides or {}).get(clean_tag) or "").strip()
+        override_metadata = str((metadata_dir_overrides or {}).get(clean_tag) or "").strip()
+
+        if override_output:
+            resolved_output = Path(override_output)
+        elif single_tag_mode:
+            resolved_output = output_root
+        else:
+            resolved_output = output_root / f"{defaults.date_mmdd}_{clean_tag}"
+
+        if override_metadata:
+            resolved_metadata = Path(override_metadata)
+        elif single_tag_mode:
+            resolved_metadata = metadata_root
+        else:
+            resolved_metadata = metadata_root / clean_tag
+
+        tag_output_dirs.setdefault(clean_tag, str(resolved_output))
+        tag_metadata_dirs.setdefault(clean_tag, str(resolved_metadata))
+
+    if tag_output_dirs:
+        plan["tag_output_dirs"] = tag_output_dirs
+    if tag_metadata_dirs:
+        plan["tag_metadata_dirs"] = tag_metadata_dirs
+    return plan
+
+
 def list_media_files(folder: Path, suffixes: set[str]) -> list[Path]:
     if not folder.exists():
         return []
@@ -1166,6 +1217,65 @@ def _find_existing_video(output_dir: Path, date_mmdd: str, serial: int, channel:
     return None
 
 
+def _list_folder_media(folder: Path, suffixes: set[str]) -> list[Path]:
+    if not folder.exists() or not folder.is_dir():
+        return []
+    return [
+        item
+        for item in sorted(folder.iterdir(), key=lambda value: value.name.lower())
+        if item.is_file() and item.suffix.lower() in suffixes
+    ]
+
+
+def _find_bootstrap_source_image(
+    *,
+    task: WindowTask,
+    output_dir: Path,
+    date_mmdd: str,
+    serial: int,
+) -> Path | None:
+    explicit = [Path(item) for item in task.thumbnails if Path(item).exists()]
+    if explicit:
+        return explicit[0]
+
+    for folder_text in [str(task.source_dir or "").strip(), str(output_dir)]:
+        if not folder_text:
+            continue
+        folder = Path(folder_text)
+        preferred = _load_source_dir_cover_paths(str(folder), date_mmdd, serial)
+        if preferred:
+            return preferred[0]
+        images = _list_folder_media(folder, IMAGE_EXTENSIONS)
+        if images:
+            return images[0]
+    return None
+
+
+def _find_bootstrap_source_audio(
+    *,
+    task: WindowTask,
+    output_dir: Path,
+    date_mmdd: str,
+    serial: int,
+) -> Path | None:
+    for folder_text in [str(task.source_dir or "").strip(), str(output_dir)]:
+        if not folder_text:
+            continue
+        folder = Path(folder_text)
+        preferred_candidates = [
+            folder / f"{date_mmdd}_{serial}.mp3",
+            folder / f"{serial}.mp3",
+        ]
+        preferred_candidates.extend(sorted(folder.glob(f"*_{serial}.mp3")))
+        for candidate in preferred_candidates:
+            if candidate.exists() and candidate.is_file():
+                return candidate
+        audio_files = _list_folder_media(folder, AUDIO_EXTENSIONS)
+        if audio_files:
+            return audio_files[0]
+    return None
+
+
 def _load_existing_cover_paths(
     metadata_dir: Path,
     date_mmdd: str,
@@ -1270,6 +1380,7 @@ def _generate_prompt_metadata(
     tag: str,
     task: WindowTask,
     defaults: WorkflowDefaults,
+    config: dict[str, Any] | None,
     unique_seed: str,
     title_fallback: str,
     description_fallback: str,
@@ -1279,122 +1390,142 @@ def _generate_prompt_metadata(
     used_tag_signatures: list[str],
     log: LogFunc,
 ) -> dict[str, Any]:
-    retry_titles = list(used_titles)
-    retry_descriptions = list(used_descriptions)
-    retry_thumbnail_prompts = list(used_thumbnail_prompts)
-    retry_tag_signatures = list(used_tag_signatures)
-    last_result: dict[str, Any] | None = None
-
-    for attempt in range(1, 5):
-        retry_seed = unique_seed if attempt == 1 else _build_unique_seed(defaults.date_mmdd, tag, task.serial, unique_seed, f"retry-{attempt}")
-        bundle = generate_content_bundle(
-            PROMPT_STUDIO_FILE,
-            tag,
-            is_ypp=task.is_ypp,
-            unique_seed=retry_seed,
-            avoid_titles=retry_titles,
-            avoid_descriptions=retry_descriptions,
-            avoid_thumbnail_prompts=retry_thumbnail_prompts,
-            avoid_tag_signatures=retry_tag_signatures,
-        )
-        title_candidates = [str(item).strip() for item in bundle.get("titles", []) if str(item).strip()]
-        description_candidates = [str(item).strip() for item in bundle.get("descriptions", []) if str(item).strip()]
-        thumbnail_prompts = [
-            str(item.get("prompt") or "").strip()
-            for item in bundle.get("thumbnail_prompts", [])
-            if str(item.get("prompt") or "").strip()
-        ]
-        if thumbnail_prompts:
-            first_prompt = _pick_fresh_candidate(
-                thumbnail_prompts,
-                retry_thumbnail_prompts,
-                thumbnail_prompts[0],
-            )
-            thumbnail_prompts = [first_prompt] + [
-                item
-                for item in thumbnail_prompts
-                if _normalized_text_key(item) != _normalized_text_key(first_prompt)
-            ]
-
-        chosen_title = title_fallback.strip() if task.title.strip() else (
-            _pick_fresh_candidate(title_candidates, retry_titles, title_fallback) or title_fallback
-        )
-        chosen_description = _pick_fresh_candidate(
-            description_candidates,
-            retry_descriptions,
-            description_fallback,
-        )
-        tag_list = [str(item).strip() for item in bundle.get("tag_list", []) if str(item).strip()]
-        tag_signature = " | ".join(tag_list)
-        ab_titles = (
-            [str(item).strip() for item in title_candidates[:3] if str(item).strip()]
-            if task.is_ypp
-            else []
-        )
-
-        fresh_title = task.title.strip() or _is_fresh_value(chosen_title, used_titles)
-        fresh_description = _is_fresh_value(chosen_description, used_descriptions)
-        fresh_prompt = not thumbnail_prompts or _is_fresh_value(thumbnail_prompts[0], used_thumbnail_prompts)
-        fresh_tags = not tag_signature or _is_fresh_value(tag_signature, used_tag_signatures)
-
-        last_result = {
-            "bundle": bundle,
-            "title": chosen_title,
-            "description": chosen_description,
-            "tag_list": tag_list,
-            "ab_titles": ab_titles,
-            "thumbnail_prompts": thumbnail_prompts,
-            "attempts": attempt,
-        }
-        if fresh_title and fresh_description and fresh_prompt and fresh_tags:
-            if attempt > 1:
-                log(f"[文案] {tag}/{task.serial}: 第 {attempt} 次重试后拿到去重结果")
-            return last_result
-
-        retry_titles.append(chosen_title)
-        if chosen_description:
-            retry_descriptions.append(chosen_description)
-        retry_thumbnail_prompts.extend(thumbnail_prompts)
-        if tag_signature:
-            retry_tag_signatures.append(tag_signature)
-
-    assert last_result is not None
-    last_result["title"] = _force_unique_text(
-        last_result.get("title", ""),
-        used_titles,
-        ["今夜慢聽版", "安靜陪伴版", "耐聽夜晚版", f"窗口{task.serial}版"],
-        max_len=95,
+    del config, title_fallback, description_fallback, used_titles, used_descriptions, used_thumbnail_prompts, used_tag_signatures
+    prompt_config = load_prompt_studio_config(PROMPT_STUDIO_FILE)
+    resolved_api_name = get_bound_api_preset_name(prompt_config, tag)
+    resolved_content_name = get_bound_content_template_name(prompt_config, tag)
+    if not resolved_api_name:
+        raise RuntimeError(f"{tag}/{task.serial} 未绑定 API 模板；当前文案链只允许走 API，不允许回退默认模板。")
+    if not resolved_content_name:
+        raise RuntimeError(f"{tag}/{task.serial} 未绑定内容模板；当前文案链只允许走 API，不允许回退默认模板。")
+    log(f"[文案] {tag}/{task.serial}: API={resolved_api_name} | 模板={resolved_content_name} | seed={unique_seed}")
+    bundle = generate_content_bundle(
+        PROMPT_STUDIO_FILE,
+        tag,
+        is_ypp=task.is_ypp,
+        api_preset_name=resolved_api_name,
+        content_template_name=resolved_content_name,
+        unique_seed=unique_seed,
+        avoid_titles=None,
+        avoid_descriptions=None,
+        avoid_thumbnail_prompts=None,
+        avoid_tag_signatures=None,
+        log=log,
     )
-    last_result["description"] = _force_unique_text(
-        last_result.get("description", ""),
-        used_descriptions,
-        [
-            "這一版更偏向安靜、陪伴與長時間播放。",
-            "這一版更適合夜晚閱讀、整理房間與放空時慢慢聽。",
-            "這一版把情緒放得更穩，適合耐聽型受眾。",
-        ],
-    )
-    prompt_list = [str(item).strip() for item in last_result.get("thumbnail_prompts", []) if str(item).strip()]
-    if prompt_list:
-        prompt_list[0] = _force_unique_text(
-            prompt_list[0],
-            used_thumbnail_prompts,
-            [
-                "Use a noticeably different composition and color palette.",
-                "Use a different room setting and warmer lighting.",
-                f"Use a distinct layout variation for window {task.serial}.",
-            ],
+    if str(bundle.get("generation_source") or "").strip().lower() != "api":
+        raise RuntimeError(f"{tag}/{task.serial} 文案链路未返回 API 来源标记，已拒绝继续。")
+    if str((bundle.get("api_preset") or {}).get("name") or "") != str(resolved_api_name):
+        raise RuntimeError(
+            f"{tag}/{task.serial} API 模板不匹配: expected={resolved_api_name} "
+            f"actual={str((bundle.get('api_preset') or {}).get('name') or '')}"
         )
-        last_result["thumbnail_prompts"] = prompt_list
-    tag_signature = " | ".join(str(item).strip() for item in last_result.get("tag_list", []) if str(item).strip())
-    if tag_signature and not _is_fresh_value(tag_signature, used_tag_signatures):
-        existing_keys = {_normalized_text_key(entry) for entry in last_result.get("tag_list", [])}
-        for extra_tag in [f"{tag}推薦", f"{tag}夜晚版", f"{tag}耐聽版", f"窗口{task.serial}"]:
-            if _normalized_text_key(extra_tag) not in existing_keys:
-                last_result.setdefault("tag_list", []).append(extra_tag)
+    if str((bundle.get("content_template") or {}).get("name") or "") != str(resolved_content_name):
+        raise RuntimeError(
+            f"{tag}/{task.serial} 内容模板不匹配: expected={resolved_content_name} "
+            f"actual={str((bundle.get('content_template') or {}).get('name') or '')}"
+        )
+
+    title_candidates = [str(item).strip() for item in bundle.get("titles", []) if str(item).strip()]
+    description_candidates = [str(item).strip() for item in bundle.get("descriptions", []) if str(item).strip()]
+    thumbnail_prompts = [
+        str(item.get("prompt") or "").strip()
+        for item in bundle.get("thumbnail_prompts", [])
+        if str(item.get("prompt") or "").strip()
+    ]
+    chosen_title = title_candidates[0] if title_candidates else ""
+    chosen_description = description_candidates[0] if description_candidates else ""
+    tag_list = [str(item).strip() for item in bundle.get("tag_list", []) if str(item).strip()]
+    ab_titles = [str(item).strip() for item in title_candidates[:3] if str(item).strip()] if task.is_ypp else []
+
+    if not chosen_title:
+        raise RuntimeError(f"{tag}/{task.serial} API 未返回标题。")
+    if not chosen_description:
+        raise RuntimeError(f"{tag}/{task.serial} API 未返回简介。")
+    if not tag_list:
+        raise RuntimeError(f"{tag}/{task.serial} API 未返回标签。")
+    if defaults.generate_thumbnails and not thumbnail_prompts:
+        raise RuntimeError(f"{tag}/{task.serial} API 未返回缩略图提示词。")
+
+    return {
+        "bundle": bundle,
+        "title": chosen_title,
+        "description": chosen_description,
+        "tag_list": tag_list,
+        "ab_titles": ab_titles,
+        "thumbnail_prompts": thumbnail_prompts,
+        "attempts": 1,
+    }
+
+
+def _build_api_debug_payload(bundle: dict[str, Any] | None, *, unique_seed: str) -> dict[str, str]:
+    api_preset = (bundle or {}).get("api_preset") or {}
+    return {
+        "generation_source": str((bundle or {}).get("generation_source") or ""),
+        "api_preset_name": str(api_preset.get("name") or ""),
+        "api_provider": str(api_preset.get("provider") or ""),
+        "api_base_url": str(api_preset.get("baseUrl") or ""),
+        "api_model": str(api_preset.get("model") or ""),
+        "image_base_url": str(api_preset.get("imageBaseUrl") or ""),
+        "image_model": str(api_preset.get("imageModel") or ""),
+        "unique_seed": str(unique_seed or ""),
+    }
+
+
+def _generate_thumbnail_covers(
+    *,
+    bundle: dict[str, Any] | None,
+    thumbnail_prompts: list[str],
+    source_image: Path | None,
+    target_dir: Path,
+    date_mmdd: str,
+    serial: int,
+    cover_count: int,
+    tag: str,
+    control: ExecutionControl | None,
+    log: LogFunc,
+) -> tuple[list[Path], str]:
+    prompts = [str(item).strip() for item in thumbnail_prompts if str(item).strip()][:cover_count]
+    last_error: Exception | None = None
+    generated: list[Path] = []
+    api_preset = bundle.get("api_preset") if isinstance(bundle, dict) else {}
+    api_enabled = bool(bundle) and str((api_preset or {}).get("autoImageEnabled") or "0") == "1"
+    if not prompts:
+        raise RuntimeError(f"{tag}/{serial} 缩略图提示词缺失。")
+    if not api_enabled:
+        raise RuntimeError(f"{tag}/{serial} 缩略图图片 API 未启用。")
+
+    for cover_index, prompt in enumerate(prompts, 1):
+        target = target_dir / f"{date_mmdd}_{serial}_cover_{cover_index:02d}.png"
+        success = False
+        for image_attempt in range(1, 3):
+            if control:
+                control.check_cancelled()
+                control.wait_if_paused(log=log, label=f"{tag}/{serial} 缩略图生成")
+            try:
+                image_result = call_image_model(api_preset, prompt)
+                if not image_result.get("data_url"):
+                    raise RuntimeError("thumbnail API returned no image data")
+                generated.append(save_data_url_image(image_result["data_url"], target))
+                success = True
                 break
-    log(f"[警告] {tag}/{task.serial}: 多次重试后仍存在重复倾向，将使用最后一组结果")
-    return last_result
+            except Exception as exc:
+                last_error = exc
+                if image_attempt >= 2:
+                    break
+        if not success:
+            generated = []
+            break
+    if len(generated) == cover_count:
+        return generated, "generated"
+
+    if source_image and source_image.exists():
+        if last_error:
+            log(f"[警告] {tag}/{serial} 缩略图 API 连续失败两次，回落到源图兜底: {last_error}")
+        return _make_cover_fallbacks(source_image, target_dir, date_mmdd, serial, cover_count), "source_image"
+
+    if last_error:
+        raise RuntimeError(f"{tag}/{serial} thumbnail API generation failed twice: {last_error}") from last_error
+    raise RuntimeError(f"{tag}/{serial} thumbnail generation requires API image output, but prompts or source image are unavailable.")
 
 
 def refresh_existing_output_metadata(
@@ -1496,6 +1627,7 @@ def refresh_existing_output_metadata(
                     tag=tag,
                     task=task,
                     defaults=defaults,
+                    config=cfg,
                     unique_seed=unique_seed,
                     title_fallback=title or video_path.stem,
                     description_fallback=description,
@@ -2060,6 +2192,7 @@ def execute_metadata_only_workflow(
     output_dir_overrides: dict[str, str] | None = None,
     metadata_dir_overrides: dict[str, str] | None = None,
     control: ExecutionControl | None = None,
+    on_item_ready: ArtifactReadyCallback | None = None,
     log: LogFunc = _noop_log,
 ) -> WorkflowResult:
     if not tasks:
@@ -2068,22 +2201,41 @@ def execute_metadata_only_workflow(
     config = config or load_scheduler_settings()
     metadata_root = get_metadata_root(config)
     output_root = Path(config["output_root"])
-    plan = build_window_plan(tasks, defaults)
+    plan = build_runtime_window_plan(
+        tasks=tasks,
+        defaults=defaults,
+        config=config,
+        output_dir_overrides=output_dir_overrides,
+        metadata_dir_overrides=metadata_dir_overrides,
+    )
     plan_path = save_window_plan(plan, defaults.date_mmdd)
     result = WorkflowResult(date_mmdd=defaults.date_mmdd, plan_path=str(plan_path))
     log(f"[计划] 已写入窗口计划: {plan_path}")
 
     tag_states: dict[str, dict[str, Any]] = {}
+    unique_tags = [str(task.tag or "").strip() for task in tasks if str(task.tag or "").strip()]
+    unique_tags = list(dict.fromkeys(unique_tags))
+    single_tag_mode = len(unique_tags) == 1
 
     def state_for(tag: str) -> dict[str, Any]:
         state = tag_states.get(tag)
         if state:
             return state
         override_metadata = str((metadata_dir_overrides or {}).get(tag) or "").strip()
-        tag_metadata_dir = Path(override_metadata) if override_metadata else get_tag_metadata_dir(tag, root=metadata_root)
+        if override_metadata:
+            tag_metadata_dir = Path(override_metadata)
+        elif single_tag_mode:
+            tag_metadata_dir = metadata_root
+        else:
+            tag_metadata_dir = get_tag_metadata_dir(tag, root=metadata_root)
         tag_metadata_dir.mkdir(parents=True, exist_ok=True)
         override_output = str((output_dir_overrides or {}).get(tag) or "").strip()
-        output_dir = Path(override_output) if override_output else (output_root / f"{defaults.date_mmdd}_{tag}")
+        if override_output:
+            output_dir = Path(override_output)
+        elif single_tag_mode:
+            output_dir = output_root
+        else:
+            output_dir = output_root / f"{defaults.date_mmdd}_{tag}"
         existing_channels: dict[str, Any] = {}
         if output_dir.exists():
             manifest_data = _read_json(output_dir / "upload_manifest.json", {})
@@ -2102,150 +2254,184 @@ def execute_metadata_only_workflow(
             "tag_signatures": [],
         }
         tag_states[tag] = state
-        result.output_dirs.append(str(tag_metadata_dir))
+        result.output_dirs.append(str(output_dir))
         return state
 
-    for scope in _group_tasks_by_media_scope(tasks, config):
-        tag = str(scope["tag"])
+    grouped_tasks: dict[str, list[WindowTask]] = {}
+    for task in tasks:
+        grouped_tasks.setdefault(str(task.tag or "").strip(), []).append(task)
+
+    for tag, tag_tasks in grouped_tasks.items():
         if control:
             control.check_cancelled()
             control.wait_if_paused(log=log, label=f"{tag}/metadata")
         state = state_for(tag)
-        image_dir = Path(scope["image_dir"])
-        audio_dir = Path(scope["audio_dir"])
-        scope_tasks = list(scope["tasks"])
-        if not image_dir.exists():
-            raise ValueError(f"{tag} 的底图目录不存在: {image_dir}")
-        if not audio_dir.exists():
-            raise ValueError(f"{tag} 的音乐目录不存在: {audio_dir}")
-        paired = _pair_media(scope_tasks, image_dir, audio_dir, shuffle=False)
-        if not paired:
-            raise ValueError(f"{tag} 的图/音目录没有可用的图音组合")
-        if len(paired) < len(scope_tasks):
-            warning = f"{tag} 只够生成 {len(paired)} 组文案，剩余窗口会跳过"
-            result.warnings.append(warning)
-            log(f"[警告] {warning}")
+        output_dir = Path(state["output_dir"])
+        if not output_dir.exists():
+            raise ValueError(f"{tag} 当前任务的现成视频目录不存在: {output_dir}")
 
-        for task, source_image, source_audio in paired:
+        for task in tag_tasks:
             if control:
                 control.check_cancelled()
                 control.wait_if_paused(log=log, label=f"{tag}/{task.serial}")
+            channel = state["channels"].get(str(task.serial), {})
+            existing_video = _find_existing_video(output_dir, defaults.date_mmdd, task.serial, channel)
+            if not existing_video:
+                raise ValueError(f"{tag}/{task.serial} 缺少现成视频文件: {output_dir}")
+
+            source_image = _resolve_manifest_media_path(output_dir, channel.get("source_image"))
+            if not source_image or not source_image.exists():
+                source_image = _find_bootstrap_source_image(
+                    task=task,
+                    output_dir=output_dir,
+                    date_mmdd=defaults.date_mmdd,
+                    serial=task.serial,
+                )
+
+            source_audio = _resolve_manifest_media_path(output_dir, channel.get("source_audio"))
+            if not source_audio or not source_audio.exists():
+                source_audio = _find_bootstrap_source_audio(
+                    task=task,
+                    output_dir=output_dir,
+                    date_mmdd=defaults.date_mmdd,
+                    serial=task.serial,
+                )
+
             history_scope = get_used_metadata_scope(tag, config=config)
             unique_seed = _build_unique_seed(
                 defaults.date_mmdd,
                 tag,
                 task.serial,
-                source_audio.stem,
-                source_image.stem,
-                "metadata_only",
+                source_audio.stem if source_audio else existing_video.stem,
+                source_image.stem if source_image else existing_video.stem,
+                "metadata_only_existing_video",
             )
-            channel = state["channels"].get(str(task.serial), {})
             title = task.title.strip() or f"{defaults.date_mmdd}_{task.serial}"
             description = task.description.strip()
             tag_list = [item for item in task.tag_list if str(item).strip()]
             ab_titles = [item for item in task.ab_titles if str(item).strip()]
-            cover_paths = _load_existing_cover_paths(
-                state["metadata_dir"],
-                defaults.date_mmdd,
-                task.serial,
+            cover_paths, cover_source = _pick_preferred_cover_paths(
+                task=task,
+                metadata_dir=Path(state["metadata_dir"]),
+                date_mmdd=defaults.date_mmdd,
+                serial=task.serial,
                 channel=channel,
                 legacy={},
             )
+            if not defaults.generate_thumbnails and source_image and source_image.exists():
+                cover_paths = _make_cover_fallbacks(
+                    source_image,
+                    Path(state["metadata_dir"]),
+                    defaults.date_mmdd,
+                    task.serial,
+                    3 if task.is_ypp else 1,
+                )
+                cover_source = "source_image"
             thumbnail_prompts: list[str] = []
             bundle = None
+            item_failed = False
+            try:
+                if defaults.metadata_mode == "prompt_api" and (defaults.generate_text or defaults.generate_thumbnails):
+                    if control:
+                        control.check_cancelled()
+                        control.wait_if_paused(log=log, label=f"{tag}/{task.serial} 文案生成")
+                    generated = _generate_prompt_metadata(
+                        tag=tag,
+                        task=task,
+                        defaults=defaults,
+                        config=config,
+                        unique_seed=unique_seed,
+                        title_fallback=title or existing_video.stem,
+                        description_fallback=description,
+                        used_titles=[*(history_scope.get("titles") or []), *state["titles"]],
+                        used_descriptions=[*(history_scope.get("descriptions") or []), *state["descriptions"]],
+                        used_thumbnail_prompts=[*(history_scope.get("thumbnail_prompts") or []), *state["thumbnail_prompts"]],
+                        used_tag_signatures=[*(history_scope.get("tag_signatures") or []), *state["tag_signatures"]],
+                        log=log,
+                    )
+                    bundle = generated["bundle"]
+                    log(
+                        f"[文案] {tag}/{task.serial}: API={bundle['api_preset'].get('name', '')} | "
+                        f"模板={bundle['content_template'].get('name', '')} | "
+                        f"来源={bundle.get('generation_source', 'unknown')} | 重试={generated['attempts']}"
+                    )
+                    if defaults.generate_text:
+                        title = generated["title"]
+                        description = generated["description"]
+                        if not tag_list:
+                            tag_list = list(generated["tag_list"])
+                        if task.is_ypp and not ab_titles:
+                            ab_titles = list(generated["ab_titles"])
+                    thumbnail_prompts = list(generated["thumbnail_prompts"])
 
-            if defaults.metadata_mode == "prompt_api" and (defaults.generate_text or defaults.generate_thumbnails):
-                if control:
-                    control.check_cancelled()
-                    control.wait_if_paused(log=log, label=f"{tag}/{task.serial} 文案生成")
-                generated = _generate_prompt_metadata(
+                if defaults.generate_text and not bundle:
+                    raise RuntimeError(f"{tag}/{task.serial} text generation requires API result, but no API bundle is available.")
+
+                if defaults.generate_thumbnails:
+                    cover_count = 3 if task.is_ypp else 1
+                    cover_paths, cover_source = _generate_thumbnail_covers(
+                        bundle=bundle,
+                        thumbnail_prompts=thumbnail_prompts,
+                        source_image=source_image,
+                        target_dir=Path(state["metadata_dir"]),
+                        date_mmdd=defaults.date_mmdd,
+                        serial=task.serial,
+                        cover_count=cover_count,
+                        tag=tag,
+                        control=control,
+                        log=log,
+                    )
+
+                if cover_paths:
+                    thumb_preview = ", ".join(str(path) for path in cover_paths[:3])
+                    log(f"[thumb] {tag}/{task.serial}: source={cover_source or 'existing'} | {thumb_preview}")
+
+                if defaults.generate_text or defaults.generate_thumbnails:
+                    _save_daily_entry(
+                        state["generation_map_path"],
+                        date_mmdd=defaults.date_mmdd,
+                        serial=task.serial,
+                        is_ypp=task.is_ypp,
+                        title=title,
+                        description=description,
+                        covers=[path.name for path in cover_paths],
+                        ab_titles=ab_titles,
+                    )
+                record_used_metadata(
                     tag=tag,
-                    task=task,
-                    defaults=defaults,
-                    unique_seed=unique_seed,
-                    title_fallback=title,
-                    description_fallback=description,
-                    used_titles=[*(history_scope.get("titles") or []), *state["titles"]],
-                    used_descriptions=[*(history_scope.get("descriptions") or []), *state["descriptions"]],
-                    used_thumbnail_prompts=[*(history_scope.get("thumbnail_prompts") or []), *state["thumbnail_prompts"]],
-                    used_tag_signatures=[*(history_scope.get("tag_signatures") or []), *state["tag_signatures"]],
+                    title=title,
+                    description=description,
+                    tag_list=tag_list,
+                    thumbnail_prompts=thumbnail_prompts,
+                    config=config,
+                    serial=task.serial,
+                    date_mmdd=defaults.date_mmdd,
+                    thumbnails=cover_paths,
+                    source="metadata_only",
                     log=log,
                 )
-                bundle = generated["bundle"]
-                log(
-                    f"[文案] {tag}/{task.serial}: API={bundle['api_preset'].get('name', '')} | 模板={bundle['content_template'].get('name', '')} | 重试={generated['attempts']}"
-                )
-                if defaults.generate_text:
-                    if not task.title.strip():
-                        title = generated["title"] or title
-                    description = generated["description"]
-                    if not tag_list:
-                        tag_list = list(generated["tag_list"])
-                    if task.is_ypp and not ab_titles:
-                        ab_titles = list(generated["ab_titles"])
-                thumbnail_prompts = list(generated["thumbnail_prompts"])
+                state["titles"].append(title)
+                if description:
+                    state["descriptions"].append(description)
+                state["thumbnail_prompts"].extend(thumbnail_prompts)
+                if tag_list:
+                    state["tag_signatures"].append(" | ".join(tag_list))
 
-            if defaults.generate_thumbnails:
-                cover_count = 3 if task.is_ypp else 1
-                if bundle and str(bundle["api_preset"].get("autoImageEnabled") or "0") == "1":
-                    cover_paths = []
-                    for cover_index, prompt in enumerate(thumbnail_prompts[:cover_count], 1):
-                        if control:
-                            control.check_cancelled()
-                            control.wait_if_paused(log=log, label=f"{tag}/{task.serial} 缩略图生成")
-                        target = state["metadata_dir"] / f"{defaults.date_mmdd}_{task.serial}_cover_{cover_index:02d}.png"
-                        try:
-                            image_result = call_image_model(bundle["api_preset"], prompt)
-                            if image_result.get("data_url"):
-                                cover_paths.append(save_data_url_image(image_result["data_url"], target))
-                        except Exception as exc:
-                            result.warnings.append(f"{tag}/{task.serial} 缩略图生成失败: {exc}")
-                            log(f"[警告] {tag}/{task.serial} 缩略图生成失败: {exc}")
-                if not cover_paths:
-                    cover_paths = _make_cover_fallbacks(source_image, state["metadata_dir"], defaults.date_mmdd, task.serial, cover_count)
-
-            _save_daily_entry(
-                state["generation_map_path"],
-                date_mmdd=defaults.date_mmdd,
-                serial=task.serial,
-                is_ypp=task.is_ypp,
-                title=title,
-                description=description,
-                covers=[path.name for path in cover_paths],
-                ab_titles=ab_titles,
-            )
-            record_used_metadata(
-                tag=tag,
-                title=title,
-                description=description,
-                tag_list=tag_list,
-                thumbnail_prompts=thumbnail_prompts,
-                config=config,
-                serial=task.serial,
-                date_mmdd=defaults.date_mmdd,
-                thumbnails=cover_paths,
-                source="metadata_only",
-                log=log,
-            )
-            state["titles"].append(title)
-            if description:
-                state["descriptions"].append(description)
-            state["thumbnail_prompts"].extend(thumbnail_prompts)
-            if tag_list:
-                state["tag_signatures"].append(" | ".join(tag_list))
-
-            existing_video = _find_existing_video(state["output_dir"], defaults.date_mmdd, task.serial, channel) if state["output_dir"].exists() else None
-            if existing_video:
-                state["channels"][str(task.serial)] = {
+                updated_channel = {
                     "video": str(existing_video),
-                    "source_image": str(source_image),
-                    "source_audio": str(source_audio),
                     "effect_desc": str(channel.get("effect_desc") or ""),
-                    "channel_name": task.channel_name.strip(),
+                    "channel_name": task.channel_name.strip() or str(channel.get("channel_name") or "").strip(),
                     "container_code": _resolve_task_container_code(task, channel),
                     "title": title,
                     "description": description,
+                    **_build_api_debug_payload(
+                        bundle or ({"generation_source": "api"} if (defaults.generate_text or defaults.generate_thumbnails) else {}),
+                        unique_seed=unique_seed,
+                    ),
+                    "content_template_name": str((((bundle or {}).get("content_template") or {}).get("name")) or ""),
                     "thumbnails": [str(path) for path in cover_paths],
+                    "thumbnail_source": cover_source or "existing",
+                    "thumbnail_prompt_source": "api_text" if thumbnail_prompts else "",
                     "thumbnail_prompts": thumbnail_prompts,
                     "tag_list": tag_list,
                     "is_ypp": bool(task.is_ypp),
@@ -2253,14 +2439,37 @@ def execute_metadata_only_workflow(
                     "set": 1,
                     "upload_options": _build_upload_options(task),
                 }
+                if source_image:
+                    updated_channel["source_image"] = str(source_image)
+                if source_audio:
+                    updated_channel["source_audio"] = str(source_audio)
+                state["channels"][str(task.serial)] = updated_channel
+                manifest_path = _write_manifest(
+                    output_dir=Path(state["output_dir"]),
+                    date_mmdd=defaults.date_mmdd,
+                    tag=str(state["tag"]),
+                    channels=dict(state["channels"]),
+                    source_label="metadata_only",
+                )
+                manifest_path_text = str(manifest_path)
+                if manifest_path_text not in result.manifest_paths:
+                    result.manifest_paths.append(manifest_path_text)
+                log(f"[清单] {state['tag']} metadata manifest 已更新: {manifest_path}")
+                if on_item_ready:
+                    on_item_ready(task, Path(state["output_dir"]), manifest_path)
+            except Exception as exc:
+                item_failed = True
+                warning = f"{tag}/{task.serial} 文案/封面阶段失败，已跳过当前视频，其它视频继续处理: {exc}"
+                result.warnings.append(warning)
+                log(f"[错误] {warning}")
 
             result.items.append(
                 RenderedItem(
                     tag=tag,
                     serial=task.serial,
                     output_video=str(existing_video or ""),
-                    source_image=str(source_image),
-                    source_audio=str(source_audio),
+                    source_image=str(source_image or ""),
+                    source_audio=str(source_audio or ""),
                     title=title,
                     description=description,
                     thumbnails=[str(path) for path in cover_paths],
@@ -2269,6 +2478,9 @@ def execute_metadata_only_workflow(
                     effect_desc="metadata_only",
                 )
             )
+
+            if item_failed:
+                continue
 
     for state in tag_states.values():
         output_dir = Path(state["output_dir"])
@@ -2281,7 +2493,9 @@ def execute_metadata_only_workflow(
                 channels=channels,
                 source_label="metadata_only",
             )
-            result.manifest_paths.append(str(manifest_path))
+            manifest_path_text = str(manifest_path)
+            if manifest_path_text not in result.manifest_paths:
+                result.manifest_paths.append(manifest_path_text)
             log(f"[清单] {state['tag']} metadata manifest 已更新: {manifest_path}")
 
     return result
@@ -2293,7 +2507,10 @@ def execute_direct_media_workflow(
     defaults: WorkflowDefaults,
     simulation: SimulationOptions | None = None,
     config: dict[str, Any] | None = None,
+    output_dir_overrides: dict[str, str] | None = None,
+    metadata_dir_overrides: dict[str, str] | None = None,
     control: ExecutionControl | None = None,
+    on_item_ready: ArtifactReadyCallback | None = None,
     log: LogFunc = _noop_log,
 ) -> WorkflowResult:
     if not tasks:
@@ -2305,20 +2522,37 @@ def execute_direct_media_workflow(
     used_media_root = Path(config.get("used_media_root") or (SCRIPT_DIR / "workspace" / "AutoTask" / "_used_media"))
     cleanup_old_uploaded_videos(output_root, int(config.get("render_cleanup_days", 5)), log=log)
 
-    plan = build_window_plan(tasks, defaults)
+    plan = build_runtime_window_plan(
+        tasks=tasks,
+        defaults=defaults,
+        config=config,
+        output_dir_overrides=output_dir_overrides,
+        metadata_dir_overrides=metadata_dir_overrides,
+    )
     plan_path = save_window_plan(plan, defaults.date_mmdd)
     result = WorkflowResult(date_mmdd=defaults.date_mmdd, plan_path=str(plan_path))
     log(f"[计划] 已写入窗口计划: {plan_path}")
 
     tag_states: dict[str, dict[str, Any]] = {}
+    unique_tags = [str(task.tag or "").strip() for task in tasks if str(task.tag or "").strip()]
+    unique_tags = list(dict.fromkeys(unique_tags))
+    single_tag_mode = len(unique_tags) == 1
 
     def state_for(tag: str) -> dict[str, Any]:
         state = tag_states.get(tag)
         if state:
             return state
-        output_dir = output_root / f"{defaults.date_mmdd}_{tag}"
+        override_output = str((output_dir_overrides or {}).get(tag) or "").strip()
+        if single_tag_mode:
+            output_dir = output_root
+        else:
+            output_dir = Path(override_output) if override_output else (output_root / f"{defaults.date_mmdd}_{tag}")
         output_dir.mkdir(parents=True, exist_ok=True)
-        metadata_dir = get_tag_metadata_dir(tag, root=metadata_root)
+        override_metadata = str((metadata_dir_overrides or {}).get(tag) or "").strip()
+        if single_tag_mode:
+            metadata_dir = metadata_root
+        else:
+            metadata_dir = Path(override_metadata) if override_metadata else get_tag_metadata_dir(tag, root=metadata_root)
         metadata_dir.mkdir(parents=True, exist_ok=True)
         state = {
             "tag": tag,
@@ -2396,13 +2630,13 @@ def execute_direct_media_workflow(
             description = task.description.strip()
             tag_list = [item for item in task.tag_list if str(item).strip()]
             ab_titles = [item for item in task.ab_titles if str(item).strip()]
-            cover_count = 3 if task.is_ypp else 1
             cover_paths, cover_source = _pick_preferred_cover_paths(
                 task=task,
                 metadata_dir=Path(state["metadata_dir"]),
                 date_mmdd=defaults.date_mmdd,
                 serial=task.serial,
             )
+            cover_count = 3 if task.is_ypp else 1
             if not defaults.generate_thumbnails and source_image.exists():
                 cover_paths = _make_cover_fallbacks(
                     source_image,
@@ -2414,132 +2648,149 @@ def execute_direct_media_workflow(
                 cover_source = "source_image"
             thumbnail_prompts: list[str] = []
             history_scope = get_used_metadata_scope(tag, config=config)
+            metadata_failed = False
 
-            if defaults.metadata_mode == "prompt_api" and (defaults.generate_text or defaults.generate_thumbnails):
-                if control:
-                    control.check_cancelled()
-                    control.wait_if_paused(log=log, label=f"{tag}/{task.serial} 文案生成")
-                generated = _generate_prompt_metadata(
-                    tag=tag,
-                    task=task,
-                    defaults=defaults,
-                    unique_seed=unique_seed,
-                    title_fallback=title or output_video.stem,
-                    description_fallback=description,
-                    used_titles=[*(history_scope.get("titles") or []), *state["titles"]],
-                    used_descriptions=[*(history_scope.get("descriptions") or []), *state["descriptions"]],
-                    used_thumbnail_prompts=[*(history_scope.get("thumbnail_prompts") or []), *state["thumbnail_prompts"]],
-                    used_tag_signatures=[*(history_scope.get("tag_signatures") or []), *state["tag_signatures"]],
-                    log=log,
-                )
-                bundle = generated["bundle"]
-                log(
-                    f"[文案] {tag}/{task.serial}: API={bundle['api_preset'].get('name', '')} | 模板={bundle['content_template'].get('name', '')} | 重试={generated['attempts']}"
-                )
-                thumbnail_prompts = list(generated["thumbnail_prompts"])
-                if defaults.generate_text:
-                    if not task.title.strip():
-                        title = generated["title"] or title or output_video.stem
-                    description = generated["description"]
-                    if not tag_list:
-                        tag_list = list(generated["tag_list"])
-                    if task.is_ypp and not ab_titles:
-                        ab_titles = list(generated["ab_titles"])
-
-            if defaults.generate_text:
-                if not bundle:
-                    if not title:
-                        title = output_video.stem
-                    if not description:
-                        description = ""
-            elif not title:
-                title = output_video.stem
-
-            if defaults.generate_thumbnails:
-                if bundle and str(bundle["api_preset"].get("autoImageEnabled") or "0") == "1" and not cover_paths:
-                    for cover_index, prompt in enumerate(thumbnail_prompts[:cover_count], 1):
-                        if control:
-                            control.check_cancelled()
-                            control.wait_if_paused(log=log, label=f"{tag}/{task.serial} 缩略图生成")
-                        target = Path(state["metadata_dir"]) / f"{defaults.date_mmdd}_{task.serial}_cover_{cover_index:02d}.png"
-                        try:
-                            image_result = call_image_model(bundle["api_preset"], prompt)
-                            if image_result.get("data_url"):
-                                cover_paths.append(save_data_url_image(image_result["data_url"], target))
-                                cover_source = "generated"
-                        except Exception as exc:
-                            result.warnings.append(f"{tag}/{task.serial} 缩略图生成失败: {exc}")
-                            log(f"[警告] {tag}/{task.serial} 缩略图生成失败: {exc}")
-                if not cover_paths:
-                    cover_paths = _make_cover_fallbacks(
-                        source_image,
-                        Path(state["metadata_dir"]),
-                        defaults.date_mmdd,
-                        task.serial,
-                        cover_count,
+            try:
+                if defaults.metadata_mode == "prompt_api" and (defaults.generate_text or defaults.generate_thumbnails):
+                    if control:
+                        control.check_cancelled()
+                        control.wait_if_paused(log=log, label=f"{tag}/{task.serial} 文案生成")
+                    generated = _generate_prompt_metadata(
+                        tag=tag,
+                        task=task,
+                        defaults=defaults,
+                        config=config,
+                        unique_seed=unique_seed,
+                        title_fallback=title or output_video.stem,
+                        description_fallback=description,
+                        used_titles=[*(history_scope.get("titles") or []), *state["titles"]],
+                        used_descriptions=[*(history_scope.get("descriptions") or []), *state["descriptions"]],
+                        used_thumbnail_prompts=[*(history_scope.get("thumbnail_prompts") or []), *state["thumbnail_prompts"]],
+                        used_tag_signatures=[*(history_scope.get("tag_signatures") or []), *state["tag_signatures"]],
+                        log=log,
                     )
-                    cover_source = "source_image"
+                    bundle = generated["bundle"]
+                    log(
+                        f"[文案] {tag}/{task.serial}: API={bundle['api_preset'].get('name', '')} | "
+                        f"模板={bundle['content_template'].get('name', '')} | "
+                        f"来源={bundle.get('generation_source', 'unknown')} | 重试={generated['attempts']}"
+                    )
+                    thumbnail_prompts = list(generated["thumbnail_prompts"])
+                    if defaults.generate_text:
+                        title = generated["title"]
+                        description = generated["description"]
+                        if not tag_list:
+                            tag_list = list(generated["tag_list"])
+                        if task.is_ypp and not ab_titles:
+                            ab_titles = list(generated["ab_titles"])
 
-            if cover_paths:
-                log(
-                    f"[缂╃暐鍥?] {tag}/{task.serial}: 鏉ユ簮={cover_source or 'existing'} | "
-                    f"{', '.join(str(path) for path in cover_paths[:3])}"
-                )
+                if defaults.generate_text:
+                    if not bundle:
+                        raise RuntimeError(f"{tag}/{task.serial} text generation requires API result, but no API bundle is available.")
+                elif not title:
+                    title = output_video.stem
 
-            thumb_preview = ", ".join(str(path) for path in cover_paths[:3]) if cover_paths else ""
-            if thumb_preview:
-                log(f"[thumb] {tag}/{task.serial}: source={cover_source or 'existing'} | {thumb_preview}")
+                if defaults.generate_thumbnails:
+                    cover_paths, cover_source = _generate_thumbnail_covers(
+                        bundle=bundle,
+                        thumbnail_prompts=thumbnail_prompts,
+                        source_image=source_image,
+                        target_dir=Path(state["metadata_dir"]),
+                        date_mmdd=defaults.date_mmdd,
+                        serial=task.serial,
+                        cover_count=cover_count,
+                        tag=tag,
+                        control=control,
+                        log=log,
+                    )
 
-            if defaults.generate_text or defaults.generate_thumbnails:
-                _save_daily_entry(
-                    Path(state["generation_map_path"]),
-                    date_mmdd=defaults.date_mmdd,
-                    serial=task.serial,
-                    is_ypp=task.is_ypp,
+                if cover_paths:
+                    log(
+                        f"[封面] {tag}/{task.serial}: 来源={cover_source or 'existing'} | "
+                        f"{', '.join(str(path) for path in cover_paths[:3])}"
+                    )
+
+                thumb_preview = ", ".join(str(path) for path in cover_paths[:3]) if cover_paths else ""
+                if thumb_preview:
+                    log(f"[thumb] {tag}/{task.serial}: source={cover_source or 'existing'} | {thumb_preview}")
+
+                if defaults.generate_text or defaults.generate_thumbnails:
+                    _save_daily_entry(
+                        Path(state["generation_map_path"]),
+                        date_mmdd=defaults.date_mmdd,
+                        serial=task.serial,
+                        is_ypp=task.is_ypp,
+                        title=title,
+                        description=description,
+                        covers=[path.name for path in cover_paths],
+                        ab_titles=ab_titles,
+                    )
+
+                record_used_metadata(
+                    tag=tag,
                     title=title,
                     description=description,
-                    covers=[path.name for path in cover_paths],
-                    ab_titles=ab_titles,
+                    tag_list=tag_list,
+                    thumbnail_prompts=thumbnail_prompts,
+                    config=config,
+                    serial=task.serial,
+                    date_mmdd=defaults.date_mmdd,
+                    thumbnails=cover_paths,
+                    source="render",
+                    log=log,
                 )
+                state["titles"].append(title)
+                if description:
+                    state["descriptions"].append(description)
+                state["thumbnail_prompts"].extend(thumbnail_prompts)
+                if tag_list:
+                    state["tag_signatures"].append(" | ".join(tag_list))
 
-            record_used_metadata(
-                tag=tag,
-                title=title,
-                description=description,
-                tag_list=tag_list,
-                thumbnail_prompts=thumbnail_prompts,
-                config=config,
-                serial=task.serial,
-                date_mmdd=defaults.date_mmdd,
-                thumbnails=cover_paths,
-                source="render",
-                log=log,
-            )
-            state["titles"].append(title)
-            if description:
-                state["descriptions"].append(description)
-            state["thumbnail_prompts"].extend(thumbnail_prompts)
-            if tag_list:
-                state["tag_signatures"].append(" | ".join(tag_list))
-
-            state["manifest_channels"][str(task.serial)] = {
-                "video": output_video.name,
-                "source_image": str(source_image),
-                "source_audio": str(source_audio),
-                "effect_desc": effect_desc,
-                "channel_name": task.channel_name.strip(),
-                "container_code": _resolve_task_container_code(task),
-                "title": title,
-                "description": description,
-                "thumbnails": [str(path) for path in cover_paths],
-                "thumbnail_source": cover_source or "existing",
-                "thumbnail_prompts": thumbnail_prompts,
-                "tag_list": tag_list,
-                "is_ypp": bool(task.is_ypp),
-                "ab_titles": ab_titles,
-                "set": 1,
-                "upload_options": _build_upload_options(task),
-            }
+                state["manifest_channels"][str(task.serial)] = {
+                    "video": output_video.name,
+                    "source_image": str(source_image),
+                    "source_audio": str(source_audio),
+                    "effect_desc": effect_desc,
+                    "channel_name": task.channel_name.strip(),
+                    "container_code": _resolve_task_container_code(task),
+                    "title": title,
+                    "description": description,
+                    **_build_api_debug_payload(
+                        bundle or ({"generation_source": "api"} if (defaults.generate_text or defaults.generate_thumbnails) else {}),
+                        unique_seed=unique_seed,
+                    ),
+                    "content_template_name": str((((bundle or {}).get("content_template") or {}).get("name")) or ""),
+                    "thumbnails": [str(path) for path in cover_paths],
+                    "thumbnail_source": cover_source or "existing",
+                    "thumbnail_prompt_source": "api_text" if thumbnail_prompts else "",
+                    "thumbnail_prompts": thumbnail_prompts,
+                    "tag_list": tag_list,
+                    "is_ypp": bool(task.is_ypp),
+                    "ab_titles": ab_titles,
+                    "set": 1,
+                    "upload_options": _build_upload_options(task),
+                }
+                if simulation is None or simulation.save_manifest:
+                    manifest_path = _write_manifest(
+                        output_dir=Path(state["output_dir"]),
+                        date_mmdd=defaults.date_mmdd,
+                        tag=str(state["tag"]),
+                        channels=dict(state["manifest_channels"]),
+                        source_label="group_bound_media",
+                    )
+                    manifest_path_text = str(manifest_path)
+                    if manifest_path_text not in result.manifest_paths:
+                        result.manifest_paths.append(manifest_path_text)
+                    log(f"[清单] {state['tag']} manifest 已写入: {manifest_path}")
+                    if on_item_ready:
+                        on_item_ready(task, Path(state["output_dir"]), manifest_path)
+            except Exception as exc:
+                metadata_failed = True
+                warning = f"{tag}/{task.serial} 文案/封面阶段失败，已保留渲染成品并跳过该视频上传: {exc}"
+                result.warnings.append(warning)
+                log(f"[错误] {warning}")
+                if not title:
+                    title = output_video.stem
             result.items.append(
                 RenderedItem(
                     tag=tag,
@@ -2556,6 +2807,12 @@ def execute_direct_media_workflow(
                 )
             )
 
+            if metadata_failed:
+                if simulation and simulation.consume_sources:
+                    _move_to_used(source_image, used_media_root, tag=tag, kind="images")
+                    _move_to_used(source_audio, used_media_root, tag=tag, kind="audio")
+                continue
+
             if simulation and simulation.consume_sources:
                 _move_to_used(source_image, used_media_root, tag=tag, kind="images")
                 _move_to_used(source_audio, used_media_root, tag=tag, kind="audio")
@@ -2569,7 +2826,9 @@ def execute_direct_media_workflow(
                 channels=dict(state["manifest_channels"]),
                 source_label="group_bound_media",
             )
-            result.manifest_paths.append(str(manifest_path))
+            manifest_path_text = str(manifest_path)
+            if manifest_path_text not in result.manifest_paths:
+                result.manifest_paths.append(manifest_path_text)
             log(f"[清单] {state['tag']} manifest 已写入: {manifest_path}")
 
     return result
