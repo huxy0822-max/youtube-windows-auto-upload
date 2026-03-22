@@ -18,6 +18,8 @@ from workflow_core import (
     build_window_plan,
     execute_direct_media_workflow,
     execute_metadata_only_workflow,
+    _find_existing_video,
+    _output_dir_matches_tasks,
     get_metadata_root,
     load_scheduler_settings,
     resolve_task_audio_dir,
@@ -122,7 +124,9 @@ def _resolve_task_plan_dirs(
     clean_tag = str(task.tag or "").strip()
     source_override = str(task.source_dir or "").strip()
 
-    # 只上传 / metadata+upload 时，当前任务手动指定的现成目录必须优先。
+    # In metadata/upload flows that operate on existing videos, the user-selected
+    # folder on the upload page must win. We should create/read manifests directly
+    # in that folder instead of silently drifting back to stale global roots.
     if source_override and not modules.render and (modules.metadata or modules.upload):
         source_root = Path(source_override)
         return source_root, source_root
@@ -139,9 +143,9 @@ def reconcile_run_plan_directories(run_plan: RunPlan) -> RunPlan:
     music_root_text = str(cfg.get("music_dir") or run_plan.music_root or "").strip()
     image_root_text = str(cfg.get("base_image_dir") or run_plan.image_root or "").strip()
     if not output_root_text:
-        raise ValueError("RunPlan 缺少 output_root。")
+        raise ValueError("RunPlan is missing output_root.")
     if not metadata_root_text:
-        raise ValueError("RunPlan 缺少 metadata_root。")
+        raise ValueError("RunPlan is missing metadata_root.")
 
     unique_tags = [str(task.tag or "").strip() for task in run_plan.tasks if str(task.tag or "").strip()]
     unique_tags = list(dict.fromkeys(unique_tags))
@@ -310,10 +314,10 @@ def validate_run_plan(run_plan: RunPlan, *, log: LogFunc = _noop_log) -> Validat
         return report
 
     if modules.metadata and run_plan.defaults.metadata_mode != "prompt_api":
-        report.errors.append("生成标题/简介/标签/缩略图模块只支持 prompt_api 模式。")
+        report.errors.append("Metadata generation requires prompt_api mode.")
         return report
 
-    if modules.render or (modules.metadata and not modules.upload):
+    if modules.render:
         errors, warnings = validate_group_sources(run_plan.tasks, config=run_plan.config, log=log)
         report.errors.extend(errors)
         report.warnings.extend(warnings)
@@ -361,7 +365,7 @@ def _validate_explicit_output_dirs(
         if str(tag or "").strip() and str(path or "").strip()
     }
     if not explicit_dirs:
-        return ["RunPlan 缺少上传所需的明确输出目录。"], warnings, resolved_dirs
+        return ["RunPlan is missing explicit output folders for upload-only mode."], warnings, resolved_dirs
 
     grouped: dict[str, list[WindowTask]] = {}
     for task in run_plan.tasks:

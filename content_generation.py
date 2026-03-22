@@ -146,27 +146,13 @@ def _post_json(
     with requests.Session() as session:
         # 某些第三方网关在系统代理环境下会随机断开，这里统一直连。
         session.trust_env = False
-        try:
-            return session.post(
-                url,
-                headers=headers,
-                json=json_payload,
-                timeout=timeout,
-                params=params,
-            )
-        except Exception as exc:
-            if not shutil.which("curl"):
-                raise
-            try:
-                return _post_json_with_curl(
-                    url,
-                    headers=headers,
-                    json_payload=json_payload,
-                    timeout=max(float(timeout or DEFAULT_TIMEOUT_SECONDS), 60),
-                    params=params,
-                )
-            except Exception as curl_exc:
-                raise RuntimeError(f"{exc} | curl fallback failed: {curl_exc}") from exc
+        return session.post(
+            url,
+            headers=headers,
+            json=json_payload,
+            timeout=timeout,
+            params=params,
+        )
 
 
 def load_metadata_history(path: Path = METADATA_HISTORY_FILE) -> dict[str, Any]:
@@ -250,9 +236,14 @@ def _build_openai_chat_urls(base_url: str) -> list[str]:
             ordered.append(url)
 
     parsed = urllib.parse.urlparse(clean)
+    host = str(parsed.netloc or "").strip().lower()
     path = str(parsed.path or "").strip("/")
 
-    if clean.endswith("/v1/chat/completions") or clean.endswith("/chat/completions"):
+    if host.endswith("right.codes") and clean.endswith("/chat/completions") and not clean.endswith("/v1/chat/completions"):
+        root = clean.removesuffix("/chat/completions")
+        add(f"{root}/v1/chat/completions")
+        add(clean)
+    elif clean.endswith("/v1/chat/completions") or clean.endswith("/chat/completions"):
         add(clean)
     elif clean.endswith("/v1"):
         add(f"{clean}/chat/completions")
@@ -269,6 +260,65 @@ def _build_openai_chat_urls(base_url: str) -> list[str]:
         add(f"{clean}/chat/completions")
         add(clean)
     return ordered
+
+
+def _extract_openai_response_text(data: Any) -> str:
+    if not isinstance(data, dict):
+        return ""
+
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0] if isinstance(choices[0], dict) else {}
+        message = first.get("message") if isinstance(first, dict) else {}
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, str) and content.strip():
+            return content
+        if isinstance(content, list):
+            text_parts: list[str] = []
+            for item in content:
+                if isinstance(item, str) and item.strip():
+                    text_parts.append(item.strip())
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                candidate = str(item.get("text") or item.get("content") or "").strip()
+                if candidate:
+                    text_parts.append(candidate)
+            if text_parts:
+                return "\n".join(text_parts)
+        direct_text = str(first.get("text") or "").strip()
+        if direct_text:
+            return direct_text
+
+    output_text = str(data.get("output_text") or "").strip()
+    if output_text:
+        return output_text
+
+    response_payload = data.get("response")
+    if isinstance(response_payload, dict):
+        response_text = str(response_payload.get("output_text") or "").strip()
+        if response_text:
+            return response_text
+
+    return ""
+
+
+def _describe_openai_error(*, status_code: int, data: Any, url: str) -> str:
+    if isinstance(data, dict):
+        error_payload = data.get("error")
+        if isinstance(error_payload, dict):
+            message = str(error_payload.get("message") or "").strip()
+            if message:
+                return f"{message} | url={url} | status={status_code}"
+        if error_payload:
+            return f"{error_payload} | url={url} | status={status_code}"
+        message = str(data.get("message") or "").strip()
+        if message:
+            return f"{message} | url={url} | status={status_code}"
+        raw_text = str(data.get("raw_text") or "").strip()
+        if raw_text:
+            return f"{raw_text[:240]} | url={url} | status={status_code}"
+    return f"HTTP {status_code} | url={url}"
 
 
 def _extract_data_url(value: Any) -> str | None:
@@ -313,6 +363,14 @@ def _parse_json_like(raw: str) -> dict[str, Any]:
         parsed = json.loads(cleaned[first : last + 1])
     except Exception as exc:
         raise ValueError("模型返回的 JSON 无法解析") from exc
+
+    if isinstance(parsed, dict) and isinstance(parsed.get("data"), dict):
+        wrapped = parsed.get("data") or {}
+        if any(key in wrapped for key in ("titles", "descriptions", "seoHashtags", "tagList", "thumbnails", "usedAngle")):
+            parsed = wrapped
+
+    if not isinstance(parsed, dict):
+        raise ValueError("模型返回的 JSON 不是对象")
 
     parsed["titles"] = parsed["titles"] if isinstance(parsed.get("titles"), list) else []
     parsed["descriptions"] = parsed["descriptions"] if isinstance(parsed.get("descriptions"), list) else []
@@ -518,46 +576,265 @@ def _build_compact_generation_prompt(
     title_count = _int_value(content_template.get("titleCount"), 1)
     desc_count = _int_value(content_template.get("descCount"), 1)
     thumb_count = _int_value(content_template.get("thumbCount"), 1)
-    avoid_titles_text = " | ".join(
-        [str(item).strip() for item in (avoid_titles or []) if str(item).strip()][:2]
+    angle_text = str(content_template.get("angle") or "").strip()
+    audience_text = str(content_template.get("audience") or "").strip()
+    genre_text = str(content_template.get("musicGenre") or "").strip()
+    title_library = str(content_template.get("titleLibrary") or "").strip()
+    master_prompt = str(render_master_prompt(content_template) or "").strip()
+    seed_text = str(unique_seed or "").strip()
+    image_hint = "这次有参考图片，可参考画面信息。" if image_data_url else "这次没有参考图片，请只根据文字内容构思。"
+    return (
+        "请一次性完成这个 YouTube 音乐视频的完整文案包。\n\n"
+        "请严格遵守以下固定输入，不要改写、不要弱化、不要自动重命名：\n"
+        f"- 音乐类型：{genre_text}\n"
+        f"- 受众人群：{audience_text}\n"
+        f"- 切入角度：{angle_text}\n"
+        f"- 输出语言：{language_ui}\n"
+        f"- 唯一 seed：{seed_text}\n"
+        f"- 标题数量：{title_count}\n"
+        f"- 简介数量：{desc_count}\n"
+        f"- 缩略图提示词数量：{thumb_count}\n"
+        f"- 标签数量：{tag_range[0]} 到 {tag_range[1]} 个\n"
+        f"- {image_hint}\n\n"
+        "这是最高优先级主提示词，你必须严格执行：\n"
+        f"{master_prompt}\n\n"
+        "这是标题库，只允许学习风格、结构、切入维度和语气，不允许照抄：\n"
+        f"{title_library}\n\n"
+        "输出要求：\n"
+        "1. 标题、简介、标签必须全部使用繁体中文。\n"
+        "2. 同一批标题必须明显不同，不能只是换个近义词。\n"
+        "3. 缩略图提示词是写给生图模型看的，可以用英文描述画面，但最后一句必须包含："
+        f"Use {language_english} text in the image.\n"
+        "4. 只允许输出一个合法 JSON 对象，不要输出解释、不要输出 markdown、不要输出代码块。\n\n"
+        "返回 JSON schema：\n"
+        '{"usedAngle":"string","titles":["string"],"descriptions":["string"],"seoHashtags":["#tag"],"tagList":["keyword"],"thumbnails":[{"forTitle":"string","prompt":"string"}]}'
     )
-    avoid_tag_text = " | ".join(
-        [str(item).strip() for item in (avoid_tag_signatures or []) if str(item).strip()][:1]
-    )
-    angle_text = str(content_template.get("angle") or "").strip() or "auto-create one strong angle"
-    audience_text = str(content_template.get("audience") or "").strip() or "music listeners"
-    genre_text = str(content_template.get("musicGenre") or "").strip() or "music"
-    title_hint = re.sub(r"\s+", " ", str(content_template.get("titleLibrary") or "").strip())[:80]
-    core_rules = re.sub(r"\s+", " ", str(render_master_prompt(content_template) or "").strip())[:120]
+
+
+def _trim_avoid_values(values: list[str] | None, *, limit: int = 12) -> list[str]:
+    cleaned = [str(item or "").strip() for item in (values or []) if str(item or "").strip()]
+    return cleaned[-max(1, limit):]
+
+
+def _compact_master_rules(content_template: dict, *, limit: int = 480) -> str:
+    raw = str(render_master_prompt(content_template) or "").strip()
+    if not raw:
+        return ""
+    cut_markers = [
+        "CASE PATCH LOCK",
+        "案例补丁",
+        "案例補丁",
+        "案例补丁来了",
+        "案例補丁來啦",
+        "【案例补丁",
+        "【案例補丁",
+    ]
+    lowered = raw.lower()
+    cut_positions = [lowered.find(marker.lower()) for marker in cut_markers if lowered.find(marker.lower()) >= 0]
+    if cut_positions:
+        raw = raw[: min(cut_positions)]
+    compact = re.sub(r"\s+", " ", raw).strip()
+    return compact[:limit]
+
+
+def _metadata_style_summary(content_template: dict) -> str:
+    summary_parts = [
+        f"musicGenre={str(content_template.get('musicGenre') or '').strip()}",
+        f"angle={str(content_template.get('angle') or '').strip()}",
+        f"audience={str(content_template.get('audience') or '').strip()}",
+        f"language={str(content_template.get('outputLanguage') or 'zh-TW').strip()}",
+    ]
+    compact_rules = _compact_master_rules(content_template)
+    if compact_rules:
+        summary_parts.append(f"rules={compact_rules}")
+    return " | ".join(part for part in summary_parts if part and not part.endswith("="))
+
+
+def _compact_title_library(content_template: dict, *, limit: int = 480) -> str:
+    raw = str(content_template.get("titleLibrary") or "").strip()
+    if not raw:
+        return ""
+    compact = re.sub(r"\s+", " ", raw).strip()
+    return compact[:limit]
+
+
+def _extract_opening_fragments(values: list[str] | None, *, limit: int = 8) -> list[str]:
+    fragments: list[str] = []
+    seen: set[str] = set()
+    for item in values or []:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        opening = re.split(r"[｜|:：，,。.!！？；;、]", text, maxsplit=1)[0].strip()
+        if len(opening) > 24:
+            opening = opening[:24].rstrip()
+        normalized = _normalize_generation_text(opening)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        fragments.append(opening)
+        if len(fragments) >= max(1, limit):
+            break
+    return fragments
+
+
+def _call_json_stage(
+    *,
+    api_preset: dict,
+    prompt: str,
+    stage: str,
+    image_data_url: str | None = None,
+    max_tokens_cap: int = 900,
+) -> tuple[str, dict[str, Any]]:
+    provider = str(api_preset.get("provider") or "").strip().lower()
+    request_preset = clone_json(api_preset)
+    request_preset["maxTokens"] = str(min(_int_value(api_preset.get("maxTokens"), 16000), max_tokens_cap))
+    stage_presets: list[dict[str, Any]] = [request_preset]
+
+    last_exc: Exception | None = None
+    raw = ""
+    for preset_index, active_preset in enumerate(stage_presets, 1):
+        active_base_url = str(active_preset.get("baseUrl") or "").strip().lower()
+        active_model = str(active_preset.get("model") or "").strip().lower()
+        if (
+            stage == "metadata_bundle"
+            and provider == "openai_compatible"
+            and "right.codes" in active_base_url
+            and active_model == "gpt-5.4-xhigh"
+        ):
+            max_attempts = 1
+        else:
+            max_attempts = 3
+        for api_attempt in range(1, max_attempts + 1):
+            try:
+                raw = call_text_model(active_preset, prompt, image_data_url=image_data_url)
+                parsed = _parse_json_like(raw)
+                if not isinstance(parsed, dict):
+                    raise RuntimeError(f"{stage} did not return a JSON object")
+                return raw, parsed
+            except Exception as exc:
+                last_exc = exc
+                if api_attempt < max_attempts and _is_transient_text_api_error(exc):
+                    time.sleep(2 * api_attempt)
+                    continue
+                break
+        if preset_index < len(stage_presets):
+            continue
+    raise RuntimeError(
+        f"文案生成失败: stage={stage} provider={provider or 'unknown'} error={last_exc}"
+    ) from last_exc
+
+
+def _build_title_stage_prompt(
+    content_template: dict,
+    *,
+    unique_seed: str,
+    avoid_titles: list[str] | None,
+    count: int,
+) -> str:
+    title_min = _int_value(content_template.get("titleMin"), 80)
+    title_max = _int_value(content_template.get("titleMax"), 95)
+    language_ui, _ = language_meta(str(content_template.get("outputLanguage") or "zh-TW"))
+    master_prompt = str(render_master_prompt(content_template) or "").strip()
+    title_library = str(content_template.get("titleLibrary") or "").strip()
     payload = {
-        "genre": genre_text,
-        "angle": angle_text,
-        "audience": audience_text,
-        "uniqueSeed": str(unique_seed or "").strip(),
-        "titleCount": title_count,
-        "descriptionCount": desc_count,
-        "thumbnailCount": thumb_count,
-        "tagCountMin": tag_range[0],
-        "tagCountMax": tag_range[1],
+        "seed": str(unique_seed or "").strip(),
+        "count": int(max(1, count)),
+        "musicGenre": str(content_template.get("musicGenre") or "").strip(),
+        "angle": str(content_template.get("angle") or "").strip(),
+        "audience": str(content_template.get("audience") or "").strip(),
         "language": language_ui,
-        "thumbnailTextLanguage": language_english,
-        "avoidTitles": avoid_titles_text,
-        "avoidTagSignatures": avoid_tag_text,
-        "titleStyleHint": title_hint,
-        "coreRules": core_rules,
-        "imageProvided": bool(image_data_url),
+        "titleLength": {"min": title_min, "max": title_max},
+        "masterPrompt": master_prompt,
+        "titleLibrary": title_library,
+        "styleSummary": _metadata_style_summary(content_template),
     }
     return (
         "Return strict JSON only.\n"
-        "Task: create YouTube metadata for one music video.\n"
-        "All titles, descriptions and tags must be Traditional Chinese.\n"
-        f"Every thumbnail prompt must end with: Use {language_english} text in the image.\n"
-        "Never reuse or closely paraphrase avoidTitles or avoidTagSignatures.\n"
-        "If angle is empty, create one.\n"
-        "Keep titles clearly different from each other.\n\n"
+        "You are generating YouTube music video titles.\n"
+        "All titles must be Traditional Chinese.\n"
+        "Every title must feel genuinely different in angle, not just paraphrased.\n"
+        "Treat masterPrompt as the hard creative constraint.\n"
+        "Use titleLibrary as a style reference and inspiration source, but do not copy it verbatim.\n"
+        "Do not output the same opening clause across multiple titles.\n"
+        "Treat the seed as a hard uniqueness constraint: produce a fresh hook and a fresh opening clause.\n"
+        "Make the titles emotionally vivid, specific, and mature.\n\n"
         f"Input:\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
-        "Need exact JSON schema:\n"
-        '{"usedAngle":"string","titles":["string"],"descriptions":["string"],"seoHashtags":["#tag"],"tagList":["keyword"],"thumbnails":[{"forTitle":"string","prompt":"string"}]}'
+        'Return JSON schema: {"usedAngle":"string","titles":["string"]}'
+    )
+
+
+def _build_description_stage_prompt(
+    content_template: dict,
+    *,
+    unique_seed: str,
+    title: str,
+    avoid_descriptions: list[str] | None,
+    avoid_tag_signatures: list[str] | None,
+) -> str:
+    tag_range = parse_tag_range(str(content_template.get("tagRange") or "10-20"))
+    language_ui, _ = language_meta(str(content_template.get("outputLanguage") or "zh-TW"))
+    master_prompt = str(render_master_prompt(content_template) or "").strip()
+    title_library = str(content_template.get("titleLibrary") or "").strip()
+    payload = {
+        "seed": str(unique_seed or "").strip(),
+        "title": str(title or "").strip(),
+        "musicGenre": str(content_template.get("musicGenre") or "").strip(),
+        "angle": str(content_template.get("angle") or "").strip(),
+        "audience": str(content_template.get("audience") or "").strip(),
+        "language": language_ui,
+        "descriptionLength": _int_value(content_template.get("descLen"), 300),
+        "tagCount": {"min": tag_range[0], "max": tag_range[1]},
+        "masterPrompt": master_prompt,
+        "titleLibrary": title_library,
+        "styleSummary": _metadata_style_summary(content_template),
+    }
+    return (
+        "Return strict JSON only.\n"
+        "You are generating one YouTube description and one SEO tag list for a music video.\n"
+        "Description and tags must be Traditional Chinese.\n"
+        "Treat masterPrompt as the hard content constraint.\n"
+        "Use titleLibrary to stay aligned with the intended channel tone and headline flavor.\n"
+        "Make the wording natural, emotionally coherent, and clearly matched to the title.\n\n"
+        f"Input:\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
+        'Return JSON schema: {"descriptions":["string"],"seoHashtags":["#tag"],"tagList":["keyword"]}'
+    )
+
+
+def _build_thumbnail_prompt_stage(
+    content_template: dict,
+    *,
+    unique_seed: str,
+    titles: list[str],
+    description: str,
+    avoid_thumbnail_prompts: list[str] | None,
+    count: int,
+) -> str:
+    _, language_english = language_meta(str(content_template.get("outputLanguage") or "zh-TW"))
+    master_prompt = str(render_master_prompt(content_template) or "").strip()
+    title_library = str(content_template.get("titleLibrary") or "").strip()
+    payload = {
+        "seed": str(unique_seed or "").strip(),
+        "titles": [str(item or "").strip() for item in titles if str(item or "").strip()][: max(1, count)],
+        "description": str(description or "").strip(),
+        "musicGenre": str(content_template.get("musicGenre") or "").strip(),
+        "angle": str(content_template.get("angle") or "").strip(),
+        "audience": str(content_template.get("audience") or "").strip(),
+        "thumbnailTextLanguage": language_english,
+        "masterPrompt": master_prompt,
+        "titleLibrary": title_library,
+        "styleSummary": _metadata_style_summary(content_template),
+    }
+    return (
+        "Return strict JSON only.\n"
+        "Generate thumbnail image prompts for a music video.\n"
+        "Each prompt must describe a clear image concept and must end with "
+        f"'Use {language_english} text in the image.'\n"
+        "Treat masterPrompt as the hard creative constraint.\n"
+        "Use titleLibrary to inherit the channel's proven title/thumbnail flavor, but do not copy it literally.\n"
+        "Make each prompt visually clear, elegant, and directly usable by an image model.\n\n"
+        f"Input:\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
+        'Return JSON schema: {"thumbnails":[{"forTitle":"string","prompt":"string"}]}'
     )
 
 
@@ -1223,9 +1500,24 @@ def _call_openai_compatible(api_preset: dict, user_prompt: str, image_data_url: 
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_preset.get('apiKey', '')}",
     }
-    timeout_seconds = DEFAULT_TIMEOUT_SECONDS
+    prompt_chars = len(str(user_prompt or ""))
+    token_budget = _int_value(api_preset.get("maxTokens"), 16000)
+    timeout_seconds = 105
+    if prompt_chars > 4000:
+        timeout_seconds += 30
+    if prompt_chars > 9000:
+        timeout_seconds += 30
+    if token_budget > 8000:
+        timeout_seconds += 30
+    base_url = str(api_preset.get("baseUrl") or "").strip().lower()
+    model_name = str(api_preset.get("model") or "").strip().lower()
+    if "right.codes" in base_url and model_name == "gpt-5.4-xhigh":
+        timeout_seconds = max(timeout_seconds, 420)
+    timeout_seconds = max(timeout_seconds, DEFAULT_TIMEOUT_SECONDS)
+    timeout_seconds = min(timeout_seconds, 420)
+    retryable_codes = {408, 429, 500, 502, 503, 504}
     for url in _build_openai_chat_urls(str(api_preset.get("baseUrl") or "")):
-        for attempt in range(1, 3):
+        for attempt in range(2):
             try:
                 response = _post_json(
                     url,
@@ -1238,20 +1530,26 @@ def _call_openai_compatible(api_preset: dict, user_prompt: str, image_data_url: 
                 except Exception:
                     data = {"raw_text": response.text}
                 if response.ok:
-                    text = _extract_openai_compatible_text(data)
+                    text = _extract_openai_response_text(data)
                     if text:
                         return text
-                    last_error = "API 未返回文本内容"
+                    last_error = _describe_openai_error(
+                        status_code=response.status_code,
+                        data=data,
+                        url=url,
+                    )
                 else:
-                    last_error = _extract_api_error_message(data, response.status_code)
-                if not (_is_retryable_http_status(response.status_code) or _is_transient_api_error_text(last_error)):
+                    last_error = _describe_openai_error(
+                        status_code=response.status_code,
+                        data=data,
+                        url=url,
+                    )
+                if response.status_code not in retryable_codes:
                     break
             except Exception as exc:
                 last_error = str(exc)
-                if not _is_transient_api_error_text(last_error):
-                    break
-            if attempt < 2:
-                time.sleep(_retry_delay_seconds(attempt))
+            if attempt < 1:
+                time.sleep(2 + attempt)
     raise RuntimeError(f"OpenAI-compatible 调用失败: {last_error}")
 
 
@@ -1451,33 +1749,9 @@ def load_generation_context(
     return prompt_cfg, clone_json(api_presets[chosen_api_name]), clone_json(content_templates[chosen_content_name])
 
 
-def _retry_delay_seconds(attempt: int) -> float:
-    return float(min(8, max(1, attempt) * 2))
-
-
-def _is_retryable_http_status(status_code: int) -> bool:
-    return int(status_code) in {408, 409, 425, 429, 500, 502, 503, 504}
-
-
-def _extract_api_error_message(payload: Any, status_code: int) -> str:
-    if isinstance(payload, dict):
-        error_payload = payload.get("error")
-        if isinstance(error_payload, dict):
-            message = str(error_payload.get("message") or "").strip()
-            if message:
-                return message
-        if error_payload:
-            return str(error_payload).strip()
-        for key in ("message", "detail", "raw_text"):
-            value = str(payload.get(key) or "").strip()
-            if value:
-                return value
-    return f"HTTP {status_code}"
-
-
-def _is_transient_api_error_text(text: str) -> bool:
-    lowered = str(text or "").strip().lower()
-    if not lowered:
+def _is_transient_text_api_error(exc: Exception) -> bool:
+    text = str(exc or "").strip().lower()
+    if not text:
         return False
     hints = (
         "remote end closed connection",
@@ -1485,47 +1759,16 @@ def _is_transient_api_error_text(text: str) -> bool:
         "connection aborted",
         "connection reset",
         "connectionreseterror",
-        "ssleoferror",
-        "unexpected eof while reading",
-        "eof occurred in violation of protocol",
         "timed out",
         "timeout",
         "temporarily unavailable",
-        "server busy",
-        "service unavailable",
-        "overloaded",
-        "upstream saturated",
-        "rate limit",
-        "too many requests",
-        "try again later",
-        "please retry",
-        "bad gateway",
-        "gateway timeout",
         "502",
         "503",
         "504",
         "408",
-        "409",
-        "425",
         "429",
-        "负载已饱和",
-        "稍后再试",
-        "服务繁忙",
-        "请求过于频繁",
-        "限流",
-        "超时",
-        "连接被重置",
-        "连接已关闭",
     )
-    return any(hint in lowered for hint in hints)
-
-
-def _is_transient_text_api_error(exc: Exception) -> bool:
-    return _is_transient_api_error_text(str(exc or ""))
-
-
-def _is_transient_image_api_error(exc: Exception) -> bool:
-    return _is_transient_api_error_text(str(exc or ""))
+    return any(hint in text for hint in hints)
 
 
 def generate_content_bundle(
@@ -1566,174 +1809,179 @@ def generate_content_bundle(
     content_template["descCount"] = "1"
     content_template["thumbCount"] = str(thumb_count)
 
-    titles: list[str] = []
-    raw_title_parts: list[str] = []
-    used_angle = str(content_template.get("angle") or "").strip()
-    blocked_titles = [str(item).strip() for item in (avoid_titles or []) if str(item).strip()]
-    for index in range(title_count):
-        title_prompt = _build_title_stage_prompt(
-            content_template,
-            unique_seed=f"{unique_seed}|title|{index + 1}",
-            avoid_titles=[*blocked_titles, *titles],
-            count=1,
-        )
-        emit(
-            f"[API] {tag}: stage=title_{index + 1} -> provider={api_preset.get('provider', '')} "
-            f"model={api_preset.get('model', '')} chars={len(title_prompt)}"
-        )
-        raw_title, title_payload = _call_json_stage(
-            api_preset=api_preset,
-            prompt=title_prompt,
-            stage=f"title_{index + 1}",
-            image_data_url=image_data_url,
-            max_tokens_cap=220,
-        )
-        emit(f"[API] {tag}: stage=title_{index + 1} <- ok chars={len(raw_title)}")
-        raw_title_parts.append(raw_title)
-        candidate_titles = [str(item).strip() for item in title_payload.get("titles", []) if str(item).strip()]
-        if not candidate_titles:
-            raise RuntimeError(f"文案生成失败: stage=title_{index + 1} provider=api error=API 未返回标题")
-        _ensure_unique_generated_values(
-            label="title",
-            values=[candidate_titles[0]],
-            blocked_values=[*blocked_titles, *titles],
-        )
-        chosen_title = candidate_titles[0]
-        titles.append(chosen_title)
-        used_angle = str(title_payload.get("usedAngle") or used_angle or "").strip()
+    bundle_prompt = _build_compact_generation_prompt(
+        content_template,
+        image_data_url=image_data_url,
+        unique_seed=unique_seed,
+        avoid_titles=None,
+        avoid_descriptions=None,
+        avoid_thumbnail_prompts=None,
+        avoid_tag_signatures=None,
+    )
+    emit(
+        f"[API] {tag}: stage=metadata_bundle -> provider={api_preset.get('provider', '')} "
+        f"model={api_preset.get('model', '')} chars={len(bundle_prompt)}"
+    )
+    raw_bundle, bundle_payload = _call_json_stage(
+        api_preset=api_preset,
+        prompt=bundle_prompt,
+        stage="metadata_bundle",
+        image_data_url=image_data_url,
+        max_tokens_cap=2200,
+    )
+    emit(f"[API] {tag}: stage=metadata_bundle <- ok chars={len(raw_bundle)}")
+    bundle_payload = _repair_output_if_needed(
+        bundle_payload,
+        api_preset,
+        content_template,
+        image_data_url=image_data_url,
+    )
+    used_angle = str(bundle_payload.get("usedAngle") or content_template.get("angle") or "").strip()
+    titles = [str(item).strip() for item in bundle_payload.get("titles", []) if str(item).strip()]
+    descriptions = [
+        str(item).strip()
+        for item in bundle_payload.get("descriptions", [])
+        if str(item).strip()
+    ]
+    seo_hashtags = [
+        str(item).strip()
+        for item in bundle_payload.get("seoHashtags", [])
+        if str(item).strip()
+    ]
+    tag_list = [
+        str(item).strip()
+        for item in bundle_payload.get("tagList", [])
+        if str(item).strip()
+    ]
+    thumbnail_prompt_rows = [
+        {
+            "for_title": str((item or {}).get("forTitle") or "").strip(),
+            "prompt": str((item or {}).get("prompt") or "").strip(),
+        }
+        for item in bundle_payload.get("thumbnails", [])
+        if str((item or {}).get("prompt") or "").strip()
+    ]
+    if not titles:
+        raise RuntimeError("文案生成失败: stage=metadata_bundle provider=api error=API 未返回标题")
+    if not descriptions:
+        raise RuntimeError("文案生成失败: stage=metadata_bundle provider=api error=API 未返回简介")
+    if not tag_list:
+        raise RuntimeError("文案生成失败: stage=metadata_bundle provider=api error=API 未返回标签")
+    if not thumbnail_prompt_rows:
+        raise RuntimeError("文案生成失败: stage=metadata_bundle provider=api error=API 未返回缩略图提示词")
+    return {
+        "api_preset": api_preset,
+        "content_template": content_template,
+        "raw_text": raw_bundle,
+        "used_angle": used_angle,
+        "titles": titles,
+        "descriptions": descriptions,
+        "seo_hashtags": seo_hashtags,
+        "tag_list": tag_list,
+        "generation_source": "api",
+        "thumbnail_prompts": thumbnail_prompt_rows,
+    }
 
+    title_prompt = _build_title_stage_prompt(
+        content_template,
+        unique_seed=unique_seed,
+        avoid_titles=avoid_titles,
+        count=max(title_count + 2, 4),
+    )
+    emit(
+        f"[API] {tag}: stage=titles -> provider={api_preset.get('provider', '')} "
+        f"model={api_preset.get('model', '')} chars={len(title_prompt)}"
+    )
+    raw_titles, title_payload = _call_json_stage(
+        api_preset=api_preset,
+        prompt=title_prompt,
+        stage="titles",
+        image_data_url=image_data_url,
+        max_tokens_cap=700,
+    )
+    emit(f"[API] {tag}: stage=titles <- ok chars={len(raw_titles)}")
+    used_angle = str(title_payload.get("usedAngle") or content_template.get("angle") or "").strip()
+    titles = [str(item).strip() for item in title_payload.get("titles", []) if str(item).strip()]
+    if not titles:
+        raise RuntimeError("文案生成失败: stage=titles provider=api error=API 未返回标题")
     primary_title = titles[0]
     description_prompt = _build_description_stage_prompt(
         content_template,
         unique_seed=f"{unique_seed}|desc",
         title=primary_title,
         avoid_descriptions=avoid_descriptions,
+        avoid_tag_signatures=avoid_tag_signatures,
     )
     emit(
-        f"[API] {tag}: stage=description -> provider={api_preset.get('provider', '')} "
+        f"[API] {tag}: stage=description_tags -> provider={api_preset.get('provider', '')} "
         f"model={api_preset.get('model', '')} chars={len(description_prompt)}"
     )
     raw_desc, description_payload = _call_json_stage(
         api_preset=api_preset,
         prompt=description_prompt,
-        stage="description",
+        stage="description_tags",
         image_data_url=image_data_url,
-        max_tokens_cap=420,
+        max_tokens_cap=900,
     )
-    emit(f"[API] {tag}: stage=description <- ok chars={len(raw_desc)}")
+    emit(f"[API] {tag}: stage=description_tags <- ok chars={len(raw_desc)}")
     descriptions = [
         str(item).strip()
         for item in description_payload.get("descriptions", [])
         if str(item).strip()
     ]
-    if not descriptions:
-        raise RuntimeError("文案生成失败: stage=description provider=api error=API 未返回简介")
-    _ensure_unique_generated_values(label="description", values=descriptions, blocked_values=avoid_descriptions)
-    desc_target = _int_value(content_template.get("descLen"), 300)
-    filler = (
-        f" 讓{_compact_prompt_value(content_template.get('musicGenre'), limit=18) or '這段旋律'}與夜色繼續慢慢發酵，"
-        f"陪你把情緒穩穩放下。"
-    )
-    descriptions = [
-        _fit_text_length(
-            item,
-            min_len=max(220, desc_target - 30),
-            max_len=max(240, desc_target + 20),
-            filler=filler,
-        )
-        for item in descriptions
-    ]
-
-    tag_prompt = _build_tag_stage_prompt(
-        content_template,
-        unique_seed=f"{unique_seed}|tags",
-        title=primary_title,
-        avoid_tag_signatures=avoid_tag_signatures,
-    )
-    emit(
-        f"[API] {tag}: stage=tags -> provider={api_preset.get('provider', '')} "
-        f"model={api_preset.get('model', '')} chars={len(tag_prompt)}"
-    )
-    raw_tags, tag_payload = _call_json_stage(
-        api_preset=api_preset,
-        prompt=tag_prompt,
-        stage="tags",
-        image_data_url=image_data_url,
-        max_tokens_cap=260,
-    )
-    emit(f"[API] {tag}: stage=tags <- ok chars={len(raw_tags)}")
     seo_hashtags = [
         str(item).strip()
-        for item in tag_payload.get("seoHashtags", [])
+        for item in description_payload.get("seoHashtags", [])
         if str(item).strip()
     ]
     tag_list = [
         str(item).strip()
-        for item in tag_payload.get("tagList", [])
+        for item in description_payload.get("tagList", [])
         if str(item).strip()
     ]
+    if not descriptions:
+        raise RuntimeError("文案生成失败: stage=description_tags provider=api error=API 未返回简介")
     if not tag_list:
-        raise RuntimeError("文案生成失败: stage=tags provider=api error=API 未返回标签")
-    _ensure_unique_generated_values(
-        label="tag signature",
-        values=[" | ".join(tag_list)],
-        blocked_values=avoid_tag_signatures,
+        raise RuntimeError("文案生成失败: stage=description_tags provider=api error=API 未返回标签")
+    thumb_prompt = _build_thumbnail_prompt_stage(
+        content_template,
+        unique_seed=f"{unique_seed}|thumb",
+        titles=titles[: max(1, thumb_count)],
+        description=descriptions[0],
+        avoid_thumbnail_prompts=avoid_thumbnail_prompts,
+        count=thumb_count,
     )
-
-    thumbnail_prompt_rows: list[dict[str, str]] = []
-    raw_thumb_parts: list[str] = []
-    blocked_thumb_prompts = [str(item).strip() for item in (avoid_thumbnail_prompts or []) if str(item).strip()]
-    for index in range(thumb_count):
-        target_title = titles[index] if index < len(titles) else titles[0]
-        thumb_prompt = _build_thumbnail_prompt_stage(
-            content_template,
-            unique_seed=f"{unique_seed}|thumb|{index + 1}",
-            titles=[target_title],
-            description=descriptions[0],
-            avoid_thumbnail_prompts=[*blocked_thumb_prompts, *[row["prompt"] for row in thumbnail_prompt_rows]],
-            count=1,
-        )
-        emit(
-            f"[API] {tag}: stage=thumbnail_{index + 1} -> provider={api_preset.get('provider', '')} "
-            f"model={api_preset.get('model', '')} chars={len(thumb_prompt)}"
-        )
-        raw_thumb, thumb_payload = _call_json_stage(
-            api_preset=api_preset,
-            prompt=thumb_prompt,
-            stage=f"thumbnail_{index + 1}",
-            image_data_url=image_data_url,
-            max_tokens_cap=260,
-        )
-        emit(f"[API] {tag}: stage=thumbnail_{index + 1} <- ok chars={len(raw_thumb)}")
-        raw_thumb_parts.append(raw_thumb)
-        current_rows = [
-            {
-                "for_title": str((item or {}).get("forTitle") or target_title).strip() or target_title,
-                "prompt": str((item or {}).get("prompt") or "").strip(),
-            }
-            for item in thumb_payload.get("thumbnails", [])
-            if str((item or {}).get("prompt") or "").strip()
-        ]
-        if not current_rows:
-            raise RuntimeError(
-                f"文案生成失败: stage=thumbnail_{index + 1} provider=api error=API 未返回缩略图提示词"
-            )
-        _ensure_unique_generated_values(
-            label="thumbnail prompt",
-            values=[current_rows[0]["prompt"]],
-            blocked_values=[*blocked_thumb_prompts, *[row["prompt"] for row in thumbnail_prompt_rows]],
-        )
-        thumbnail_prompt_rows.append(current_rows[0])
-
+    emit(
+        f"[API] {tag}: stage=thumbnail_prompts -> provider={api_preset.get('provider', '')} "
+        f"model={api_preset.get('model', '')} chars={len(thumb_prompt)}"
+    )
+    raw_thumb, thumb_payload = _call_json_stage(
+        api_preset=api_preset,
+        prompt=thumb_prompt,
+        stage="thumbnail_prompts",
+        image_data_url=image_data_url,
+        max_tokens_cap=900,
+    )
+    emit(f"[API] {tag}: stage=thumbnail_prompts <- ok chars={len(raw_thumb)}")
+    thumbnail_prompt_rows = [
+        {
+            "for_title": str((item or {}).get("forTitle") or "").strip(),
+            "prompt": str((item or {}).get("prompt") or "").strip(),
+        }
+        for item in thumb_payload.get("thumbnails", [])
+        if str((item or {}).get("prompt") or "").strip()
+    ]
+    if not thumbnail_prompt_rows:
+        raise RuntimeError("文案生成失败: stage=thumbnail_prompts provider=api error=API 未返回缩略图提示词")
+    thumbnail_prompts = [item["prompt"] for item in thumbnail_prompt_rows if item.get("prompt")]
     return {
         "api_preset": api_preset,
         "content_template": content_template,
         "raw_text": json.dumps(
             {
-                "titles_raw": raw_title_parts,
+                "titles_raw": raw_titles,
                 "description_raw": raw_desc,
-                "tags_raw": raw_tags,
-                "thumbnail_raw": raw_thumb_parts,
+                "thumbnail_raw": raw_thumb,
             },
             ensure_ascii=False,
         ),
@@ -1754,9 +2002,29 @@ def call_image_model(api_preset: dict, prompt: str) -> dict[str, Any]:
     if not base_url or not api_key or not model:
         raise ValueError("当前图片 API 模板缺少 imageBaseUrl / imageApiKey / imageModel")
 
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}",
+    response = _post_json(
+        base_url,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        json_payload={
+            "model": model,
+            "modalities": ["text", "image"],
+            "messages": [{"role": "user", "content": str(prompt or "").strip()}],
+        },
+        timeout=DEFAULT_TIMEOUT_SECONDS,
+    )
+    raw = response.text
+    data = response.json()
+    if not response.ok:
+        raise RuntimeError(data.get("error", {}).get("message") or f"图片接口 HTTP {response.status_code}")
+    content = data.get("choices", [{}])[0].get("message", {}).get("content")
+    data_url = _extract_data_url(content) or _extract_data_url(data)
+    return {
+        "data_url": data_url,
+        "text": content if isinstance(content, str) else json.dumps(content or "", ensure_ascii=False),
+        "raw": raw,
     }
     payload = {
         "model": model,

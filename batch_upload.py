@@ -199,6 +199,23 @@ def _iter_window_plan_source_dirs(window_plan: Optional[Dict[str, Any]], tag: st
     return paths
 
 
+def _extract_window_plan_serials_from_plan(window_plan: Optional[Dict[str, Any]], tag: str) -> List[int]:
+    if not isinstance(window_plan, dict):
+        return []
+    wanted = _normalize_tag_for_match(tag)
+    serials: list[int] = []
+    for task in window_plan.get("tasks", []) or []:
+        if _normalize_tag_for_match(task.get("tag") or "") != wanted:
+            continue
+        try:
+            serial = int(task.get("serial") or 0)
+        except (TypeError, ValueError):
+            continue
+        if serial:
+            serials.append(serial)
+    return sorted(set(serials))
+
+
 def _count_matching_output_videos(folder: Path, date_key: str) -> int:
     if not folder.exists() or not folder.is_dir():
         return 0
@@ -650,7 +667,7 @@ async def human_click(page, locator, desc="", delay_profile: str = "generic"):
         return False
 
 
-async def wait_for_upload_details_ready(page, timeout_ms: int = 25000) -> bool:
+async def _legacy_wait_for_upload_details_ready_shadow(page, timeout_ms: int = 90000) -> bool:
     """等待上传详情页真正出现。"""
     selectors = [
         "ytcp-social-suggestions-textbox#title-textarea div#textbox",
@@ -659,10 +676,23 @@ async def wait_for_upload_details_ready(page, timeout_ms: int = 25000) -> bool:
         "ytcp-uploads-dialog #textbox[contenteditable='true']",
         "ytcp-uploads-dialog textarea",
         "ytcp-uploads-dialog input[type='text']",
-        "ytcp-video-metadata-editor #title-textarea #textbox",
-        "ytcp-video-metadata-editor-sidepanel ytcp-video-metadata-visibility",
-        "ytcp-button#save",
-        "#save",
+        "ytcp-uploads-dialog #description-textarea",
+        "ytcp-uploads-dialog ytcp-video-thumbnail-with-info",
+        "ytcp-uploads-dialog #scrollable-content",
+        "ytcp-uploads-dialog #next-button",
+        "ytcp-uploads-dialog ytcp-button#next-button",
+        "ytcp-uploads-dialog tp-yt-paper-radio-button[name='VIDEO_HAS_ALTERED_CONTENT_YES']",
+        "ytcp-uploads-dialog tp-yt-paper-radio-button[name='VIDEO_HAS_ALTERED_CONTENT_NO']",
+        "ytcp-uploads-dialog ytcp-form-select#category",
+        "ytcp-uploads-dialog ytcp-video-upload-progress",
+        "ytcp-video-thumbnail-with-info",
+        "#scrollable-content",
+        "#next-button",
+        "ytcp-button#next-button",
+        "tp-yt-paper-radio-button[name='VIDEO_HAS_ALTERED_CONTENT_YES']",
+        "tp-yt-paper-radio-button[name='VIDEO_HAS_ALTERED_CONTENT_NO']",
+        "ytcp-form-select#category",
+        "ytcp-video-upload-progress",
     ]
     deadline = time.monotonic() + max(1, timeout_ms) / 1000.0
 
@@ -670,7 +700,21 @@ async def wait_for_upload_details_ready(page, timeout_ms: int = 25000) -> bool:
         for sel in selectors:
             try:
                 locator = page.locator(sel).first
-                if await locator.count() > 0 and await locator.is_visible():
+                count = await locator.count()
+                if count <= 0:
+                    continue
+                if await locator.is_visible():
+                    return True
+                if any(
+                    marker in sel
+                    for marker in (
+                        "ytcp-video-upload-progress",
+                        "ytcp-video-thumbnail-with-info",
+                        "ytcp-form-select#category",
+                        "#scrollable-content",
+                        "#next-button",
+                    )
+                ):
                     return True
             except Exception:
                 continue
@@ -679,19 +723,27 @@ async def wait_for_upload_details_ready(page, timeout_ms: int = 25000) -> bool:
             ready = await page.evaluate(
                 """
                 () => {
-                    const dlg = document.querySelector('ytcp-uploads-dialog');
-                    if (dlg) {
-                        const text = (dlg.innerText || '').trim();
-                        if (/Details|詳情|详细信息|詳細資料/i.test(text)) return true;
-                    }
-                    const href = window.location.href || '';
+                    const url = String(location.href || '');
                     const bodyText = (document.body && document.body.innerText) ? document.body.innerText : '';
-                    const editPage = /studio\\.youtube\\.com\\/video\\//i.test(href);
-                    if (!editPage) return false;
-                    return (
-                        !!document.querySelector('ytcp-video-metadata-visibility') ||
-                        !!document.querySelector('ytcp-button#save, #save') ||
-                        /Video details|视频详细信息|影片詳細資料|視頻詳細資料/i.test(bodyText)
+                    const fileReady = !!Array.from(document.querySelectorAll("input[type='file']")).find(
+                        input => input.files && input.files.length > 0
+                    );
+                    const hasUploadUrl = url.includes('/upload');
+                    if (hasUploadUrl && fileReady) return true;
+                    const dlg = document.querySelector('ytcp-uploads-dialog');
+                    const text = dlg ? (dlg.innerText || '').trim() : bodyText.trim();
+                    const detailsRe = /Details|Video elements|Checks|Visibility|Filename|Video link|Uploading video|Upload complete|Saved as private|Saved as draft|詳情|详细信息|詳細資料|影片元素|检查|檢查|可见度|可見度|檔名|文件名|视频链接|影片連結|上傳中|上传中|上传完成|上傳完成/i;
+                    if (detailsRe.test(text)) return true;
+                    if (!dlg) return hasUploadUrl;
+                    return !!(
+                        dlg.querySelector('#scrollable-content') ||
+                        dlg.querySelector('#description-textarea') ||
+                        dlg.querySelector('#next-button') ||
+                        dlg.querySelector('ytcp-video-thumbnail-with-info') ||
+                        dlg.querySelector('ytcp-video-upload-progress') ||
+                        dlg.querySelector("tp-yt-paper-radio-button[name='VIDEO_HAS_ALTERED_CONTENT_YES']") ||
+                        dlg.querySelector("tp-yt-paper-radio-button[name='VIDEO_HAS_ALTERED_CONTENT_NO']") ||
+                        dlg.querySelector('ytcp-form-select#category')
                     );
                 }
                 """
@@ -706,6 +758,36 @@ async def wait_for_upload_details_ready(page, timeout_ms: int = 25000) -> bool:
     return False
 
 
+async def has_pending_upload_context(page, expected_filename: str = "") -> bool:
+    try:
+        return bool(
+            await page.evaluate(
+                """
+                ({ expectedFilename }) => {
+                    const bodyText = (document.body && document.body.innerText) ? document.body.innerText : '';
+                    const pageTitle = (document.title || '').trim();
+                    const hasUploadUrl = String(location.href || '').includes('/upload');
+                    const fileReady = !!Array.from(document.querySelectorAll("input[type='file']")).find(
+                        input => input.files && input.files.length > 0
+                    );
+                    const normalizedExpected = String(expectedFilename || '').trim().toLowerCase();
+                    const normalizedBody = bodyText.toLowerCase();
+                    const normalizedTitle = pageTitle.toLowerCase();
+                    const hasExpectedName = normalizedExpected && (normalizedBody.includes(normalizedExpected) || normalizedTitle.includes(normalizedExpected));
+                    const hasUploadShell = !!document.querySelector(
+                        "ytcp-uploads-dialog, ytcp-video-upload-progress, ytcp-video-thumbnail-with-info, #scrollable-content, #next-button"
+                    );
+                    const hasSaveBadge = /saved as private|saved as draft|uploading video|upload complete|filename|video link|details|visibility|视频链接|檔名|文件名/i.test(bodyText);
+                    return fileReady || hasExpectedName || hasUploadShell || hasSaveBadge || hasUploadUrl;
+                }
+                """,
+                {"expectedFilename": str(expected_filename or "").strip()},
+            )
+        )
+    except Exception:
+        return False
+
+
 async def is_phone_verification_required_for_upload(page) -> bool:
     """识别长视频上传前要求手机验证的账号权限提示。"""
     try:
@@ -717,6 +799,234 @@ async def is_phone_verification_required_for_upload(page) -> bool:
             }
             """
         )
+    except Exception:
+        return False
+
+
+def _upload_context_probe_script() -> str:
+    return """
+    ({ expectedFilename }) => {
+        const normalizedExpected = String(expectedFilename || '').trim().toLowerCase();
+        const textMatchers = [
+            'video link',
+            'filename',
+            'uploading video',
+            'upload complete',
+            'saved as private',
+            'saved as draft',
+            'details',
+            'video elements',
+            'checks',
+            'visibility',
+            'next',
+            'video link',
+            'saved as private',
+            'saved as draft',
+            '檔名',
+            '文件名',
+            '影片連結',
+            '视频链接',
+            '上傳中',
+            '上传中',
+            '上傳完成',
+            '上传完成',
+            '詳情',
+            '详细信息',
+            '影片元素',
+            '视频元素',
+            '可見度',
+            '可见度',
+        ];
+        const selectors = [
+            '#next-button',
+            'ytcp-button#next-button',
+            '#scrollable-content',
+            'ytcp-video-thumbnail-with-info',
+            'ytcp-video-upload-progress',
+            'ytcp-form-select#category',
+            'ytcp-social-suggestions-textbox#title-textarea',
+            '#description-textarea',
+            'a[href*="youtu.be/"]',
+            'a[href*="watch?v="]',
+            'tp-yt-paper-radio-button[name="VIDEO_HAS_ALTERED_CONTENT_YES"]',
+            'tp-yt-paper-radio-button[name="VIDEO_HAS_ALTERED_CONTENT_NO"]',
+            'input[type="file"]',
+        ];
+
+        const visited = new Set();
+        const foundSelectors = new Set();
+        let combinedText = '';
+        let fileReady = false;
+
+        const visit = (root) => {
+            if (!root || visited.has(root)) return;
+            visited.add(root);
+            const queryAll = typeof root.querySelectorAll === 'function' ? root.querySelectorAll.bind(root) : null;
+            if (queryAll) {
+                for (const selector of selectors) {
+                    try {
+                        const nodes = Array.from(queryAll(selector));
+                        if (nodes.length) {
+                            foundSelectors.add(selector);
+                            if (selector === 'input[type="file"]') {
+                                if (nodes.some((node) => node && node.files && node.files.length > 0)) {
+                                    fileReady = true;
+                                }
+                            }
+                        }
+                    } catch (_) {}
+                }
+            }
+
+            const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+            let node = walker.currentNode;
+            while (node) {
+                try {
+                    if (node.innerText) {
+                        combinedText += '\n' + String(node.innerText);
+                    }
+                    if (node.files && node.files.length > 0) {
+                        fileReady = true;
+                    }
+                    if (node.shadowRoot) {
+                        visit(node.shadowRoot);
+                    }
+                } catch (_) {}
+                node = walker.nextNode();
+            }
+        };
+
+        visit(document);
+        const bodyNode = document.body || null;
+        const bodyInnerText = bodyNode && bodyNode.innerText ? String(bodyNode.innerText) : '';
+        const bodyText = String(bodyInnerText + '\\n' + combinedText).toLowerCase();
+        const titleText = String(document.title || '').trim().toLowerCase();
+        const url = String(location.href || '').toLowerCase();
+        const hasExpectedName = normalizedExpected
+            ? bodyText.includes(normalizedExpected) || titleText.includes(normalizedExpected)
+            : false;
+        const matchedTexts = textMatchers.filter((item) => bodyText.includes(item));
+        const hasUploadShell =
+            foundSelectors.size > 0 ||
+            matchedTexts.length > 0 ||
+            hasExpectedName ||
+            (url.includes('/upload') && fileReady);
+
+        return {
+            ready: hasUploadShell,
+            hasUploadShell,
+            hasExpectedName,
+            fileReady,
+            url,
+            foundSelectors: Array.from(foundSelectors),
+            matchedTexts,
+        };
+    }
+    """
+
+
+async def wait_for_upload_details_ready(page, timeout_ms: int = 90000) -> bool:
+    deadline = time.monotonic() + max(1, timeout_ms) / 1000.0
+    expected_filename = ""
+    try:
+        expected_filename = await page.evaluate(
+            """
+            () => {
+                const inputs = Array.from(document.querySelectorAll("input[type='file']"));
+                const hit = inputs.find((input) => input.files && input.files.length > 0);
+                if (!hit || !hit.files || !hit.files.length) return '';
+                return String(hit.files[0].name || '').trim();
+            }
+            """
+        )
+    except Exception:
+        expected_filename = ""
+
+    while time.monotonic() < deadline:
+        try:
+            probe = await page.evaluate(
+                _upload_context_probe_script(),
+                {"expectedFilename": str(expected_filename or "").strip()},
+            )
+            if isinstance(probe, dict) and probe.get("ready"):
+                return True
+        except Exception:
+            pass
+        for selector in (
+            "ytcp-uploads-dialog #next-button",
+            "ytcp-uploads-dialog ytcp-button#next-button",
+            "ytcp-uploads-dialog ytcp-video-thumbnail-with-info",
+            "ytcp-uploads-dialog ytcp-video-upload-progress",
+            "ytcp-uploads-dialog ytcp-form-select#category",
+            "ytcp-uploads-dialog a[href*='youtu.be/']",
+            "ytcp-uploads-dialog a[href*='watch?v=']",
+            "#next-button",
+            "ytcp-button#next-button",
+            "ytcp-video-thumbnail-with-info",
+            "ytcp-video-upload-progress",
+            "ytcp-form-select#category",
+        ):
+            try:
+                locator = page.locator(selector).first
+                if await locator.count() > 0 and await locator.is_visible():
+                    return True
+            except Exception:
+                continue
+        try:
+            body_text = str(
+                await page.evaluate(
+                    """
+                    () => {
+                        const text = (document.body && document.body.innerText) ? document.body.innerText : '';
+                        return String(text || '');
+                    }
+                    """
+                )
+                or ""
+            ).lower()
+            if re.search(
+                r"video link|filename|uploading video|saved as private|saved as draft|details|visibility|檔名|文件名|影片連結|视频链接|上傳中|上传中|詳情|详细信息|可見度|可见度",
+                body_text,
+                flags=re.I,
+            ):
+                return True
+        except Exception:
+            pass
+        await asyncio.sleep(1)
+    return False
+
+
+async def get_selected_upload_filename(page) -> str:
+    try:
+        return str(
+            await page.evaluate(
+                """
+                () => {
+                    const inputs = Array.from(document.querySelectorAll("input[type='file']"));
+                    const hit = inputs.find((input) => input && input.files && input.files.length > 0);
+                    if (!hit || !hit.files || !hit.files.length) return '';
+                    return String(hit.files[0].name || '').trim();
+                }
+                """
+            )
+            or ""
+        ).strip()
+    except Exception:
+        return ""
+
+
+async def has_pending_upload_context(page, expected_filename: str = "") -> bool:
+    try:
+        probe = await page.evaluate(
+            _upload_context_probe_script(),
+            {"expectedFilename": str(expected_filename or "").strip()},
+        )
+        if isinstance(probe, dict) and probe.get("ready"):
+            return True
+        selected_name = await get_selected_upload_filename(page)
+        if selected_name and str(expected_filename or "").strip():
+            return selected_name.strip().lower() == str(expected_filename).strip().lower()
+        return bool(selected_name)
     except Exception:
         return False
 
@@ -5044,8 +5354,28 @@ async def select_file_with_cdp(page, file_path: str) -> bool:
                 input.dispatchEvent(new Event("input", { bubbles: true }));
             }
         }''')
-        
-        log("CDP 文件设置成功", "OK")
+
+        await asyncio.sleep(1.0)
+        selected_name = await get_selected_upload_filename(page)
+        pending_context = await has_pending_upload_context(page, Path(file_path).name)
+        probe = {}
+        try:
+            probe = await page.evaluate(
+                _upload_context_probe_script(),
+                {"expectedFilename": Path(file_path).name},
+            )
+        except Exception:
+            probe = {}
+        file_ready = bool((probe or {}).get("fileReady"))
+        upload_url = str((probe or {}).get("url") or "").lower()
+        if (
+            selected_name
+            and selected_name.strip().lower() == Path(file_path).name.strip().lower()
+        ) or pending_context or file_ready or "/upload" in upload_url:
+            log("CDP 文件设置成功并已确认进入上传上下文", "OK")
+            return True
+
+        log("CDP 已设置文件，但页面暂未立即确认接收，继续交给后续等待逻辑", "WARN")
         return True
         
     except Exception as e:
@@ -5222,7 +5552,9 @@ def save_upload_record(
     description: str,
     is_ypp: bool,
     ab_test_titles: List[str] = None,
-    success: bool = True
+    success: bool = True,
+    stage: str = "",
+    failure_reason: str = "",
 ):
     """
     保存上传记录，方便后续对比分析
@@ -5270,7 +5602,9 @@ def save_upload_record(
                 "title": title,
                 "description": description[:500] + "..." if len(description) > 500 else description,
                 "description_full_length": len(description)
-            }
+            },
+            "stage": stage,
+            "failure_reason": failure_reason,
         }
         
         if ab_test_titles:
@@ -5307,8 +5641,11 @@ def save_upload_record(
             "thumbnails": [t.name for t in thumbnails],
             "is_ypp": is_ypp,
             "success": success,
+            "stage": stage,
             "upload_time": datetime.now().strftime("%H:%M:%S")
         }
+        if failure_reason:
+            upload_entry["failure_reason"] = failure_reason
         
         if existing:
             summary["uploads"].remove(existing)
@@ -6646,6 +6983,8 @@ async def upload_single(
             # Step 3: 使用 CDP 选择视频文件（全程后台，不需要浏览器前台）
             title_selector = "ytcp-social-suggestions-textbox#title-textarea div#textbox"
             file_selected = False
+            saw_selected_file = False
+            had_any_cdp_success = False
             max_file_retries = 3
             
             for file_attempt in range(max_file_retries):
@@ -6653,33 +6992,39 @@ async def upload_single(
                 cdp_success = await select_file_with_cdp(page, str(video_path))
                 
                 if cdp_success:
-                    # 等待上传详情页出现
+                    had_any_cdp_success = True
                     try:
-                        ready = await wait_for_upload_details_ready(page, timeout_ms=25000)
-                        if not ready:
-                            if await is_phone_verification_required_for_upload(page):
-                                log("当前账号未完成手机验证，无法上传超过 15 分钟的视频", "ERR")
-                                return make_upload_result(
-                                    False,
-                                    True,
-                                    "当前账号未完成手机验证，无法上传超过 15 分钟的视频",
-                                    "phone_verification_required",
-                                )
-                            raise TimeoutError("upload details not ready")
-                        log("上传详情页面已出现 (CDP 后台模式)", "OK")
-                        await asyncio.sleep(1.5)
-                        unreadable_error = await detect_upload_file_read_error(page)
-                        if unreadable_error:
+                        selected_name = await get_selected_upload_filename(page)
+                        pending_context = await has_pending_upload_context(page, video_path.name)
+                        if (
+                            selected_name
+                            and selected_name.strip().lower() == video_path.name.strip().lower()
+                        ) or pending_context:
+                            saw_selected_file = True
+                            log("文件已进入上传上下文，交给后续详情页等待逻辑继续处理", "OK")
+                            file_selected = True
+                            break
+
+                        ready = await wait_for_upload_details_ready(page, timeout_ms=45000)
+                        if ready:
+                            log("上传详情页面已出现 (CDP 后台模式)", "OK")
+                            file_selected = True
+                            break
+
+                        if await is_phone_verification_required_for_upload(page):
+                            log("当前账号未完成手机验证，无法上传超过 15 分钟的视频", "ERR")
                             return make_upload_result(
                                 False,
                                 True,
-                                f"浏览器提示文件不可读: {unreadable_error}",
-                                "upload_file_unreadable",
+                                "当前账号未完成手机验证，无法上传超过 15 分钟的视频",
+                                "phone_verification_required",
                             )
-                        file_selected = True
-                        break
-                    except:
-                        log(f"详情页未出现 (可能 YouTube 抽风)，刷新重试 ({file_attempt + 1}/{max_file_retries})", "WARN")
+                        raise TimeoutError("upload context not acknowledged")
+                    except Exception as exc:
+                        log(
+                            f"详情页未出现 (可能 YouTube 抽风)，刷新重试 ({file_attempt + 1}/{max_file_retries}) | {exc}",
+                            "WARN",
+                        )
                 else:
                     log(f"CDP 设置文件失败，刷新重试 ({file_attempt + 1}/{max_file_retries})", "WARN")
                 
@@ -6739,9 +7084,71 @@ async def upload_single(
                         except:
                             pass
             
+            if not file_selected and saw_selected_file:
+                log(f"文件 {video_path.name} 已被上传输入框接收，跳过 file_select_failed 误判，继续做长等待", "WARN")
+                file_selected = True
+            elif not file_selected and had_any_cdp_success:
+                log(f"鏂囦欢 {video_path.name} 宸插畬鎴?CDP 閫夋嫨锛屼氦缁欏悗缁暱绛夊緟閫昏緫缁х画鍒ゆ柇", "WARN")
+                file_selected = True
+
+            if not file_selected:
+                try:
+                    pending_context = await has_pending_upload_context(page, video_path.name)
+                    selected_name = await get_selected_upload_filename(page)
+                    probe = await page.evaluate(
+                        _upload_context_probe_script(),
+                        {"expectedFilename": video_path.name},
+                    )
+                    file_ready = bool((probe or {}).get("fileReady"))
+                    upload_url = str((probe or {}).get("url") or "").lower()
+                    next_button = page.locator("#next-button, ytcp-button#next-button").first
+                    next_visible = False
+                    if await next_button.count() > 0:
+                        try:
+                            next_visible = await next_button.is_visible()
+                        except Exception:
+                            next_visible = True
+                    if pending_context or (
+                        selected_name and selected_name.strip().lower() == video_path.name.strip().lower()
+                    ) or next_visible or file_ready or "/upload" in upload_url:
+                        log(f"文件 {video_path.name} 在兜底检查中已被视作已加载，继续后续流程", "WARN")
+                        file_selected = True
+                except Exception as final_probe_exc:
+                    log(f"file_select_failed 兜底检查异常: {final_probe_exc}", "WARN")
+
             if not file_selected:
                 log("视频文件选择失败（已重试 3 次）", "ERR")
                 return make_upload_result(False, True, "视频文件选择失败", "file_select_failed")
+
+            details_ready = await wait_for_upload_details_ready(page, timeout_ms=150000)
+            pending_context = await has_pending_upload_context(page, video_path.name)
+            selected_name = await get_selected_upload_filename(page)
+            if (
+                not details_ready
+                and not pending_context
+                and selected_name
+                and selected_name.strip().lower() == video_path.name.strip().lower()
+            ):
+                log(f"详情页未完全就绪，但文件 {selected_name} 已挂入上传输入框，继续后续等待", "WARN")
+                pending_context = True
+            if not details_ready and not pending_context:
+                log("上传详情页首次未就绪，追加等待 45 秒后再判断", "WARN")
+                details_ready = await wait_for_upload_details_ready(page, timeout_ms=45000)
+                pending_context = await has_pending_upload_context(page, video_path.name)
+                selected_name = await get_selected_upload_filename(page)
+                if (
+                    not details_ready
+                    and not pending_context
+                    and selected_name
+                    and selected_name.strip().lower() == video_path.name.strip().lower()
+                ):
+                    log(f"追加等待后仍未就绪，但文件 {selected_name} 已挂入上传输入框，继续后续等待", "WARN")
+                    pending_context = True
+            if not details_ready and not pending_context:
+                log("上传详情页长时间未就绪，且未检测到有效上传上下文", "ERR")
+                return make_upload_result(False, True, "上传详情页未就绪", "upload_details_not_ready")
+            if not details_ready:
+                log("上传详情页仍未完全就绪，但已检测到文件已进入上传上下文，继续后续字段等待", "WARN")
             
             await random_delay(2, 3)
             
@@ -7484,27 +7891,15 @@ async def batch_upload(
     video_keyword = tag_config.get("video_keyword", tag)  # 使用配置的关键词或标签名
     project_folder = Path(config["projects_folder"]) / project_name if project_name else None
     
-    # ========== 动态环境 / 计划任务 ==========
-    # 优先保留计划任务里的显式窗口信息，实时环境列表只作为补充。
-    plan_tasks = _iter_window_plan_tasks(window_plan, tag)
-    plan_task_by_serial = {int(task["serial"]): task for task in plan_tasks}
-
-    containers, container_source, serial_to_channel_name = resolve_containers_for_tag(tag, project_folder)
-    live_container_by_serial = {
-        int(container.get("serialNumber", 0) or 0): dict(container)
-        for container in containers
-        if int(container.get("serialNumber", 0) or 0) > 0
-    }
-    mapping_registry = load_channel_mapping_registry()
-    serial_to_container_code = {
-        int(serial): str(info.get("containerCode") or "").strip()
-        for serial, info in mapping_registry.items()
-        if str(info.get("containerCode") or "").strip()
-    }
-
-    ordered_serials = [int(task["serial"]) for task in plan_tasks] if plan_tasks else sorted(live_container_by_serial.keys())
-    if not ordered_serials:
-        log(f"未找到标签为 '{tag}' 的环境或计划任务", "ERR")
+    # ========== 动态从 API 获取环境列表 ==========
+    # 获取该标签下的所有环境。若 HubStudio 未同步新赛道标签，则回退到 channels.md。
+    containers, container_source, serial_to_channel_name = resolve_containers_for_tag(
+        tag,
+        project_folder,
+        window_plan=window_plan,
+    )
+    if not containers:
+        log(f"未找到标签为 '{tag}' 的环境", "ERR")
         return make_batch_result(0, 0, 1)
 
     skip_set = set(skip_channels or [])
@@ -7512,7 +7907,16 @@ async def batch_upload(
         ordered_serials = [serial for serial in ordered_serials if serial not in skip_set]
         log(f"跳过指定序号: {sorted(skip_set)}", "WARN")
 
-    if not ordered_serials:
+    plan_serials = _extract_window_plan_serials_from_plan(window_plan, tag)
+    if plan_serials:
+        allowed_serials = set(plan_serials)
+        containers = [c for c in containers if int(c["serialNumber"]) in allowed_serials]
+        ypp_serials = [s for s in ypp_serials if s in allowed_serials]
+        non_ypp_serials = [s for s in non_ypp_serials if s in allowed_serials]
+        log(f"窗口任务计划限定序号: {plan_serials}", "OK")
+
+    all_serials = sorted(ypp_serials + non_ypp_serials)
+    if not all_serials:
         log(f"标签 {tag} 过滤后无可上传频道", "WARN")
         return make_batch_result(0, 0, 0)
 
@@ -8020,7 +8424,9 @@ async def batch_upload(
             description=description,
             is_ypp=is_ypp,
             ab_test_titles=ab_titles,
-            success=success
+            success=success,
+            stage=stage,
+            failure_reason="" if success else (stage or "upload_failed"),
         )
         
         if not success:
@@ -9099,20 +9505,7 @@ def load_channel_mapping_registry() -> Dict[int, Dict[str, Any]]:
 
 def extract_window_plan_serials(tag: str) -> List[int]:
     plan = globals().get("ACTIVE_WINDOW_PLAN")
-    if not isinstance(plan, dict):
-        return []
-    wanted = _normalize_tag_for_match(tag)
-    serials: List[int] = []
-    for task in plan.get("tasks", []) or []:
-        if _normalize_tag_for_match(task.get("tag", "")) != wanted:
-            continue
-        try:
-            serial = int(task.get("serial") or 0)
-        except (TypeError, ValueError):
-            continue
-        if serial:
-            serials.append(serial)
-    return sorted(set(serials))
+    return _extract_window_plan_serials_from_plan(plan, tag)
 
 
 def get_all_containers() -> List[Dict]:
@@ -9138,8 +9531,39 @@ def get_all_containers() -> List[Dict]:
     return []
 
 
-def resolve_containers_for_tag(tag: str, project_folder: Optional[Path]) -> tuple[List[Dict], str, Dict[int, str]]:
+def resolve_containers_for_tag(
+    tag: str,
+    project_folder: Optional[Path],
+    window_plan: Optional[Dict[str, Any]] = None,
+) -> tuple[List[Dict], str, Dict[int, str]]:
     serial_to_channel_name = load_channels_registry(project_folder)
+    wanted_serials = set(_extract_window_plan_serials_from_plan(window_plan, tag))
+
+    if wanted_serials:
+        matched = [
+            c for c in get_all_containers()
+            if int(c.get("serialNumber", 0) or 0) in wanted_serials
+        ]
+        matched = sorted(matched, key=lambda x: int(x.get("serialNumber", 0) or 0))
+        if matched:
+            log(
+                f"使用窗口任务计划限定环境: {sorted(wanted_serials)}",
+                "OK",
+            )
+            return matched, "window_plan_serials", serial_to_channel_name
+
+        mapping_registry = load_channel_mapping_registry()
+        mapped = [
+            mapping_registry[serial]
+            for serial in sorted(wanted_serials)
+            if serial in mapping_registry
+        ]
+        if mapped:
+            log(
+                f"BitBrowser 列表暂不可用，按窗口任务计划 / channel_mapping 回退匹配: {sorted(wanted_serials)}",
+                "WARN",
+            )
+            return mapped, "channel_mapping_plan_fallback", serial_to_channel_name
 
     tagged_containers = get_containers_by_tag(tag)
     if tagged_containers:

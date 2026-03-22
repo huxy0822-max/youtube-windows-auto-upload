@@ -214,6 +214,20 @@ def _lookup_template_name(available: dict[str, Any], tag: str) -> str:
     return ""
 
 
+def find_explicit_content_template_name(config: dict, tag: str) -> str:
+    templates = config.get("contentTemplates", {})
+    if not templates:
+        return ""
+    return _lookup_bound_template(config.get("tagBindings", {}), tag, templates)
+
+
+def find_explicit_api_preset_name(config: dict, tag: str) -> str:
+    presets = config.get("apiPresets", {})
+    if not presets:
+        return ""
+    return _lookup_bound_template(config.get("tagApiBindings", {}), tag, presets)
+
+
 def pick_content_template_name(config: dict, tag: str) -> str:
     templates = config.get("contentTemplates", {})
     if not templates:
@@ -230,13 +244,6 @@ def pick_content_template_name(config: dict, tag: str) -> str:
     return next(iter(templates))
 
 
-def get_bound_content_template_name(config: dict, tag: str) -> str:
-    templates = config.get("contentTemplates", {})
-    if not templates:
-        return ""
-    return _lookup_bound_template(config.get("tagBindings", {}), tag, templates)
-
-
 def pick_api_preset_name(config: dict, tag: str) -> str:
     presets = config.get("apiPresets", {})
     if not presets:
@@ -251,13 +258,6 @@ def pick_api_preset_name(config: dict, tag: str) -> str:
     if default_name in presets:
         return default_name
     return next(iter(presets))
-
-
-def get_bound_api_preset_name(config: dict, tag: str) -> str:
-    presets = config.get("apiPresets", {})
-    if not presets:
-        return ""
-    return _lookup_bound_template(config.get("tagApiBindings", {}), tag, presets)
 
 
 def parse_tag_range(raw: str) -> tuple[int, int]:
