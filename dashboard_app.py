@@ -755,33 +755,37 @@ class DashboardApp(ctk.CTk):
 
         add_frame = ctk.CTkFrame(tab)
         add_frame.grid(row=1, column=0, sticky="ew", padx=16, pady=8)
-        for column in range(5):
+        for column in range(6):
             add_frame.grid_columnconfigure(column, weight=1)
-        ctk.CTkLabel(add_frame, text="加入窗口时 YPP").grid(row=0, column=0, sticky="w", padx=(16, 8), pady=(14, 6))
+        ctk.CTkLabel(add_frame, text="????? YPP").grid(row=0, column=0, sticky="w", padx=(16, 8), pady=(14, 6))
         ctk.CTkOptionMenu(add_frame, variable=self.add_ypp_var, values=YES_NO_VALUES).grid(
             row=1, column=0, sticky="ew", padx=(16, 8), pady=(0, 14)
         )
-        ctk.CTkLabel(add_frame, text="数量(每窗口)").grid(row=0, column=1, sticky="w", padx=8, pady=(14, 6))
+        ctk.CTkLabel(add_frame, text="??(???)").grid(row=0, column=1, sticky="w", padx=8, pady=(14, 6))
         ctk.CTkEntry(add_frame, textvariable=self.add_quantity_var).grid(
             row=1, column=1, sticky="ew", padx=8, pady=(0, 14)
         )
-        ctk.CTkLabel(add_frame, text="分类").grid(row=0, column=2, sticky="w", padx=8, pady=(14, 6))
-        ctk.CTkOptionMenu(add_frame, variable=self.add_category_var, values=CATEGORY_VALUES).grid(
+        ctk.CTkLabel(add_frame, text="???").grid(row=0, column=2, sticky="w", padx=8, pady=(14, 6))
+        ctk.CTkOptionMenu(add_frame, variable=self.add_visibility_var, values=VISIBILITY_VALUES).grid(
             row=1, column=2, sticky="ew", padx=8, pady=(0, 14)
         )
-        ctk.CTkLabel(add_frame, text="儿童内容").grid(row=0, column=3, sticky="w", padx=8, pady=(14, 6))
-        ctk.CTkOptionMenu(add_frame, variable=self.add_kids_var, values=YES_NO_VALUES).grid(
+        ctk.CTkLabel(add_frame, text="??").grid(row=0, column=3, sticky="w", padx=8, pady=(14, 6))
+        ctk.CTkOptionMenu(add_frame, variable=self.add_category_var, values=CATEGORY_VALUES).grid(
             row=1, column=3, sticky="ew", padx=8, pady=(0, 14)
         )
-        ctk.CTkLabel(add_frame, text="AI 内容").grid(row=0, column=4, sticky="w", padx=8, pady=(14, 6))
+        ctk.CTkLabel(add_frame, text="????").grid(row=0, column=4, sticky="w", padx=8, pady=(14, 6))
+        ctk.CTkOptionMenu(add_frame, variable=self.add_kids_var, values=YES_NO_VALUES).grid(
+            row=1, column=4, sticky="ew", padx=8, pady=(0, 14)
+        )
+        ctk.CTkLabel(add_frame, text="AI ??").grid(row=0, column=5, sticky="w", padx=8, pady=(14, 6))
         ctk.CTkOptionMenu(add_frame, variable=self.add_ai_var, values=YES_NO_VALUES).grid(
-            row=1, column=4, sticky="ew", padx=(8, 16), pady=(0, 14)
+            row=1, column=5, sticky="ew", padx=(8, 16), pady=(0, 14)
         )
         ctk.CTkCheckBox(
             add_frame,
             text="通知订阅用户",
             variable=self.add_notify_var,
-        ).grid(row=2, column=4, sticky="w", padx=8, pady=(0, 6))
+        ).grid(row=2, column=5, sticky="w", padx=8, pady=(0, 6))
         self.add_schedule_checkbox = ctk.CTkCheckBox(
             add_frame,
             text="窗口定时覆盖",
@@ -2177,7 +2181,7 @@ class DashboardApp(ctk.CTk):
             quantity=quantity,
             is_ypp=_bool_from_yes_no(self.add_ypp_var.get()) or bool(info.is_ypp),
             title="",
-            visibility="schedule" if self.add_schedule_enabled_var.get() else self.default_visibility_var.get(),
+            visibility="schedule" if self.add_schedule_enabled_var.get() else self.add_visibility_var.get(),
             category=self.add_category_var.get(),
             made_for_kids=_bool_from_yes_no(self.add_kids_var.get()),
             altered_content=_bool_from_yes_no(self.add_ai_var.get()),
