@@ -6383,15 +6383,6 @@ async def upload_single(
             if await is_channel_creation_required(page):
                 log("当前账号尚未创建 YouTube 频道，无法执行上传", "ERR")
                 return make_upload_result(False, True, "当前账号尚未创建 YouTube 频道", "channel_not_created")
-            if await is_google_login_required(page):
-                log("当前窗口未登录 Google / YouTube Studio，无法自动上传", "ERR")
-                return make_upload_result(
-                    False,
-                    False,
-                    "当前窗口未登录 Google / YouTube Studio",
-                    "login_required",
-                    extra={"debug_port": debug_port},
-                )
             if await is_google_reauth_required(context):
                 log("当前账号需要 Google 二次验证 (Verify it's you / Authenticator)，无法继续自动上传", "ERR")
                 return make_upload_result(
@@ -6399,6 +6390,15 @@ async def upload_single(
                     False,
                     "当前账号需要 Google 二次验证 (Verify it's you / Authenticator)",
                     "reauth_required",
+                    extra={"debug_port": debug_port},
+                )
+            if await is_google_login_required(page):
+                log("当前窗口未登录 Google / YouTube Studio，无法自动上传", "ERR")
+                return make_upload_result(
+                    False,
+                    False,
+                    "当前窗口未登录 Google / YouTube Studio",
+                    "login_required",
                     extra={"debug_port": debug_port},
                 )
             
