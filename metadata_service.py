@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -13,6 +16,7 @@ SCRIPT_DIR = Path(__file__).parent
 UPLOAD_RECORDS_ROOT = SCRIPT_DIR / "upload_records"
 LEGACY_METADATA_HISTORY_PATH = SCRIPT_DIR / "data" / "metadata_history.json"
 _UPLOAD_HISTORY_SYNC_CACHE: dict[str, float] = {}
+_PATH_PROBE_TIMEOUT_SECONDS = 1.5
 
 LogFunc = Callable[[str], None]
 
@@ -22,6 +26,33 @@ def _noop_log(_message: str) -> None:
 
 
 def _read_json(path: Path, fallback: Any) -> Any:
+    if str(path).startswith("/Volumes/"):
+        ok, _detail = _probe_path_state(path, mode="file")
+        if not ok:
+            return fallback
+        script = (
+            "from pathlib import Path\n"
+            "import json, sys\n"
+            "path = Path(sys.argv[1])\n"
+            "try:\n"
+            "    payload = json.loads(path.read_text(encoding='utf-8'))\n"
+            "    print(json.dumps(payload, ensure_ascii=False))\n"
+            "except Exception:\n"
+            "    raise SystemExit(1)\n"
+        )
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", script, str(path)],
+                capture_output=True,
+                text=True,
+                timeout=_PATH_PROBE_TIMEOUT_SECONDS,
+                check=False,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return json.loads(result.stdout)
+            return fallback
+        except Exception:
+            return fallback
     if not path.exists():
         return fallback
     try:
@@ -65,7 +96,7 @@ def get_used_metadata_root(config: dict[str, Any] | None = None) -> Path:
 
 
 def _same_path(left: Path, right: Path) -> bool:
-    return left.resolve(strict=False) == right.resolve(strict=False)
+    return os.path.normcase(os.path.abspath(str(left))) == os.path.normcase(os.path.abspath(str(right)))
 
 
 def _used_metadata_root_candidates(config: dict[str, Any] | None = None) -> list[Path]:
@@ -83,15 +114,55 @@ def _ensure_writable_directory(path: Path) -> None:
     probe.unlink(missing_ok=True)
 
 
+def _probe_path_state(path: Path, *, mode: str) -> tuple[bool, str]:
+    script = (
+        "from pathlib import Path\n"
+        "import sys\n"
+        "path = Path(sys.argv[1])\n"
+        "mode = sys.argv[2]\n"
+        "try:\n"
+        "    if mode == 'file':\n"
+        "        ok = path.exists() and path.is_file()\n"
+        "    elif mode == 'dir':\n"
+        "        ok = path.exists() and path.is_dir()\n"
+        "    elif mode == 'writable_dir':\n"
+        "        path.mkdir(parents=True, exist_ok=True)\n"
+        "        probe = path / '.write_probe.tmp'\n"
+        "        probe.write_text('ok', encoding='utf-8')\n"
+        "        probe.unlink(missing_ok=True)\n"
+        "        ok = True\n"
+        "    else:\n"
+        "        ok = False\n"
+        "    raise SystemExit(0 if ok else 1)\n"
+        "except Exception as exc:\n"
+        "    print(type(exc).__name__ + ': ' + str(exc), file=sys.stderr)\n"
+        "    raise SystemExit(2)\n"
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(path), mode],
+            capture_output=True,
+            text=True,
+            timeout=_PATH_PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"probe timeout after {_PATH_PROBE_TIMEOUT_SECONDS:.1f}s"
+    detail = (result.stderr or result.stdout or "").strip()
+    return result.returncode == 0, detail
+
+
 def _resolve_used_metadata_root_for_read(config: dict[str, Any] | None = None) -> Path:
     candidates = _used_metadata_root_candidates(config)
     for candidate in candidates:
-        if (candidate / "used_metadata_history.json").exists():
+        ok, _detail = _probe_path_state(candidate / "used_metadata_history.json", mode="file")
+        if ok:
             return candidate
     for candidate in candidates:
-        if candidate.exists():
+        ok, _detail = _probe_path_state(candidate, mode="dir")
+        if ok:
             return candidate
-    return candidates[0]
+    return candidates[-1]
 
 
 def _resolve_used_metadata_root_for_write(
@@ -101,17 +172,18 @@ def _resolve_used_metadata_root_for_write(
 ) -> Path:
     candidates = _used_metadata_root_candidates(config)
     fallback = _default_used_metadata_root()
-    last_error: Exception | None = None
+    last_error_text = ""
     for index, candidate in enumerate(candidates):
         try:
-            _ensure_writable_directory(candidate)
+            ok, detail = _probe_path_state(candidate, mode="writable_dir")
+            if not ok:
+                raise OSError(detail or f"unable to access {candidate}")
             return candidate
         except Exception as exc:
-            last_error = exc
+            last_error_text = str(exc)
             if index == 0 and len(candidates) > 1:
                 log(f"[Metadata] 历史目录不可写，已回退到本地: {candidate} -> {fallback} | 原因: {exc}")
-    assert last_error is not None
-    raise last_error
+    raise OSError(last_error_text or f"unable to access used metadata root: {fallback}")
 
 
 def _used_metadata_history_path_for_write(
@@ -254,6 +326,8 @@ def _extract_manifest_metadata(upload_record: dict[str, Any]) -> tuple[list[str]
     video_path_text = str(video_info.get("path") or "").strip()
     serial = upload_record.get("serial")
     if not video_path_text or serial in (None, ""):
+        return tag_list, thumbnail_prompts, thumbnails
+    if video_path_text.startswith("/Volumes/"):
         return tag_list, thumbnail_prompts, thumbnails
     manifest_path = Path(video_path_text).parent / "upload_manifest.json"
     manifest = _read_json(manifest_path, {})

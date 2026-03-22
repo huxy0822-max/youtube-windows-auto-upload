@@ -3144,30 +3144,39 @@ class DashboardApp(ctk.CTk):
             elif selected_tag and str(task.tag or "").strip() == selected_tag:
                 should_override_source = True
 
-            cloned = create_task(
-                tag=task.tag,
-                serial=task.serial,
-                quantity=task.quantity,
-                is_ypp=task.is_ypp,
-                title=task.title,
-                description=task.description,
-                visibility=task.visibility,
-                category=task.category,
-                made_for_kids=task.made_for_kids,
-                altered_content=task.altered_content,
-                notify_subscribers=task.notify_subscribers,
-                scheduled_publish_at=task.scheduled_publish_at,
-                schedule_timezone=task.schedule_timezone,
-                source_dir=live_source_dir if should_override_source else task.source_dir,
-                channel_name=task.channel_name,
-                slot_index=getattr(task, "slot_index", 1),
-                total_slots=getattr(task, "total_slots", 1),
-                round_index=getattr(task, "round_index", 1),
-            )
-            cloned.tag_list = [str(item).strip() for item in task.tag_list if str(item).strip()]
-            cloned.thumbnails = [str(item).strip() for item in task.thumbnails if str(item).strip()]
-            cloned.ab_titles = [str(item).strip() for item in task.ab_titles if str(item).strip()]
-            runtime_tasks.append(cloned)
+            raw_quantity = max(1, int(getattr(task, "quantity", 1) or 1))
+            raw_slot_index = max(1, int(getattr(task, "slot_index", 1) or 1))
+            raw_total_slots = max(1, int(getattr(task, "total_slots", 1) or 1))
+            raw_round_index = max(1, int(getattr(task, "round_index", 1) or 1))
+            already_expanded = raw_total_slots > 1 or raw_slot_index > 1 or raw_round_index > 1
+            slot_indexes = [raw_slot_index] if already_expanded else list(range(1, raw_quantity + 1))
+            total_slots = raw_total_slots if already_expanded else raw_quantity
+
+            for slot_index in slot_indexes:
+                cloned = create_task(
+                    tag=task.tag,
+                    serial=task.serial,
+                    quantity=raw_quantity,
+                    is_ypp=task.is_ypp,
+                    title=task.title,
+                    description=task.description,
+                    visibility=task.visibility,
+                    category=task.category,
+                    made_for_kids=task.made_for_kids,
+                    altered_content=task.altered_content,
+                    notify_subscribers=task.notify_subscribers,
+                    scheduled_publish_at=task.scheduled_publish_at,
+                    schedule_timezone=task.schedule_timezone,
+                    source_dir=live_source_dir if should_override_source else task.source_dir,
+                    channel_name=task.channel_name,
+                    slot_index=slot_index,
+                    total_slots=total_slots,
+                    round_index=raw_round_index if already_expanded else slot_index,
+                )
+                cloned.tag_list = [str(item).strip() for item in task.tag_list if str(item).strip()]
+                cloned.thumbnails = [str(item).strip() for item in task.thumbnails if str(item).strip()]
+                cloned.ab_titles = [str(item).strip() for item in task.ab_titles if str(item).strip()]
+                runtime_tasks.append(cloned)
         return runtime_tasks
 
     def _build_current_run_plan(self, *, config: dict[str, Any] | None = None):
@@ -3985,30 +3994,39 @@ def _patched_runtime_window_tasks(self: DashboardApp) -> list[WindowTask]:
         elif selected_tag and str(task.tag or "").strip() == selected_tag:
             should_override_source = True
 
-        cloned = create_task(
-            tag=task.tag,
-            serial=task.serial,
-            quantity=getattr(task, "quantity", 1),
-            is_ypp=task.is_ypp,
-            title=task.title,
-            description=task.description,
-            visibility=task.visibility,
-            category=task.category,
-            made_for_kids=task.made_for_kids,
-            altered_content=task.altered_content,
-            notify_subscribers=task.notify_subscribers,
-            scheduled_publish_at=task.scheduled_publish_at,
-            schedule_timezone=task.schedule_timezone,
-            source_dir=live_source_dir if should_override_source else task.source_dir,
-            channel_name=task.channel_name,
-            slot_index=getattr(task, "slot_index", 1),
-            total_slots=getattr(task, "total_slots", 1),
-            round_index=getattr(task, "round_index", 1),
-        )
-        cloned.tag_list = [str(item).strip() for item in task.tag_list if str(item).strip()]
-        cloned.thumbnails = [str(item).strip() for item in task.thumbnails if str(item).strip()]
-        cloned.ab_titles = [str(item).strip() for item in task.ab_titles if str(item).strip()]
-        runtime_tasks.append(cloned)
+        raw_quantity = max(1, int(getattr(task, "quantity", 1) or 1))
+        raw_slot_index = max(1, int(getattr(task, "slot_index", 1) or 1))
+        raw_total_slots = max(1, int(getattr(task, "total_slots", 1) or 1))
+        raw_round_index = max(1, int(getattr(task, "round_index", 1) or 1))
+        already_expanded = raw_total_slots > 1 or raw_slot_index > 1 or raw_round_index > 1
+        slot_indexes = [raw_slot_index] if already_expanded else list(range(1, raw_quantity + 1))
+        total_slots = raw_total_slots if already_expanded else raw_quantity
+
+        for slot_index in slot_indexes:
+            cloned = create_task(
+                tag=task.tag,
+                serial=task.serial,
+                quantity=raw_quantity,
+                is_ypp=task.is_ypp,
+                title=task.title,
+                description=task.description,
+                visibility=task.visibility,
+                category=task.category,
+                made_for_kids=task.made_for_kids,
+                altered_content=task.altered_content,
+                notify_subscribers=task.notify_subscribers,
+                scheduled_publish_at=task.scheduled_publish_at,
+                schedule_timezone=task.schedule_timezone,
+                source_dir=live_source_dir if should_override_source else task.source_dir,
+                channel_name=task.channel_name,
+                slot_index=slot_index,
+                total_slots=total_slots,
+                round_index=raw_round_index if already_expanded else slot_index,
+            )
+            cloned.tag_list = [str(item).strip() for item in task.tag_list if str(item).strip()]
+            cloned.thumbnails = [str(item).strip() for item in task.thumbnails if str(item).strip()]
+            cloned.ab_titles = [str(item).strip() for item in task.ab_titles if str(item).strip()]
+            runtime_tasks.append(cloned)
     return runtime_tasks
 
 

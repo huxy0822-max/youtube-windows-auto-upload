@@ -84,6 +84,8 @@ STUDIO_UI_LOCATION = "US"
 UPLOAD_MONITOR_POLL_SECONDS = 10
 UPLOAD_SAFE_CLOSE_TIMEOUT_SECONDS = 2 * 60 * 60
 UPLOAD_SAFE_CLOSE_STABLE_POLLS = 2
+PUBLISH_BUTTON_READY_TIMEOUT_SECONDS = 10 * 60
+PUBLISH_BUTTON_READY_POLL_SECONDS = 5
 TAIL_CLOSE_WATCHER_TIMEOUT_SECONDS = 6 * 60 * 60
 NETWORK_RECOVERY_RETRY_WAIT_SECONDS = 6
 RETRYABLE_NETWORK_ERROR_MARKERS = (
@@ -3789,8 +3791,8 @@ async def get_upload_monitor_snapshot(page) -> Dict[str, Any]:
             }
 
             const uploadingRe = /Uploading|Yükleniyor|Téléversement|Caricamento|上[传傳]中|正在上传/i;
-            const uploadDoneRe = /Video uploaded|Upload complete|Yükleme tamamlandı|Téléversement terminé|Caricamento completato|视频上传完毕|影片上傳完畢|上[传傳]完成|上传完成/i;
-            const processingRe = /Processing video|Processing|İşleniyor|Traitement|Elaborazione|正在处理视频|处理中|處理中/i;
+            const uploadDoneRe = /Video uploaded|Upload complete|Yükleme tamamlandı|Téléversement terminé|Caricamento completato|视频上传完毕|影片上傳完畢|上[传傳]完成|上传完成|上传完毕|上傳完畢/i;
+            const processingRe = /Processing video|Processing|İşleniyor|Traitement|Elaborazione|正在处理视频|处理中|處理中|即将开始处理|即將開始處理/i;
             const checkingRe = /Running checks|Checking|正在检查|正在檢查/i;
             const checksCompleteRe = /Checks complete|No issues found|检查完毕|檢查完畢|未发现任何问题|未發現任何問題/i;
             const publishedRe = /Video published|Video yayınlandı|Vidéo publiée|Video pubblicato|影片已發布|视频已发布/i;
@@ -3802,9 +3804,7 @@ async def get_upload_monitor_snapshot(page) -> Dict[str, Any]:
             const rowUploadedRe = /\\bUploaded\\b|已上传|已上傳/i;
             const rowVisibilityRe = /\\b(Public|Private|Unlisted|Scheduled)\\b|公开|公開|私密|不公开|不公開|已排程|已定時/i;
 
-            result.active_processing =
-                processingRe.test(combinedText) &&
-                !/Processing will start|處理即將開始|处理中即将开始/i.test(combinedText);
+            result.active_processing = processingRe.test(combinedText);
             result.active_uploading = uploadingRe.test(combinedText);
             result.active_checking = checkingRe.test(combinedText);
             result.checks_complete = checksCompleteRe.test(combinedText);
@@ -3894,7 +3894,90 @@ def is_safe_to_close_after_publish(snapshot: Dict[str, Any]) -> bool:
     if status in {"upload_complete", "processing", "published", "checks_complete", "scheduled"}:
         return True
 
+    page_url = str(snapshot.get("page_url") or "")
+    if (
+        status == "unknown"
+        and not snapshot.get("dialog_visible")
+        and not snapshot.get("active_uploading")
+        and not snapshot.get("active_checking")
+        and (
+            "studio.youtube.com/channel/" in page_url
+            or "studio.youtube.com/video/" in page_url
+        )
+    ):
+        return True
+
     return False
+
+
+async def wait_for_publish_button_ready(
+    page,
+    serial: int,
+    timeout_seconds: int = PUBLISH_BUTTON_READY_TIMEOUT_SECONDS,
+    poll_seconds: int = PUBLISH_BUTTON_READY_POLL_SECONDS,
+) -> Dict[str, Any]:
+    """等待上传弹窗里的最终提交按钮从灰色变为可点击。"""
+    started_at = time.monotonic()
+    poll_count = 0
+    last_summary = None
+    last_snapshot: Dict[str, Any] = {}
+    last_state: Dict[str, Any] = {"found": False, "disabled": True, "text": "", "id": ""}
+
+    while True:
+        poll_count += 1
+        try:
+            await clear_blocking_overlays(page, f"publish-ready-{poll_count}")
+        except Exception:
+            pass
+
+        state = await get_visible_upload_dialog_button_state(
+            page,
+            button_id="done-button",
+            text_pattern="done|save|publish|schedule|完成|保存|yayınla|發佈|发布|公開|定時|定时|排程",
+        )
+        if isinstance(state, dict):
+            last_state = state
+
+        try:
+            snapshot = await get_upload_monitor_snapshot(page)
+        except Exception as e:
+            snapshot = {
+                "status": "monitor_error",
+                "progress_pct": None,
+                "progress_text": str(e),
+                "dialog_visible": False,
+                "active_uploading": False,
+                "active_processing": False,
+                "published_confirmed": False,
+                "page_url": page.url if not page.is_closed() else "",
+            }
+        last_snapshot = snapshot
+        summary = summarize_upload_monitor(snapshot)
+
+        if state.get("found") and not state.get("disabled"):
+            return {
+                "ready": True,
+                "state": state,
+                "reason": summary,
+                "snapshot": snapshot,
+            }
+
+        if summary != last_summary or poll_count == 1 or poll_count % 3 == 0:
+            log(
+                f"序号 {serial}: 最终提交按钮暂不可点，继续等待 | found={state.get('found')} disabled={state.get('disabled')} | {summary}",
+                "WAIT",
+            )
+            last_summary = summary
+
+        if time.monotonic() - started_at >= timeout_seconds:
+            return {
+                "ready": False,
+                "state": last_state,
+                "reason": summary,
+                "snapshot": last_snapshot,
+            }
+
+        await asyncio.sleep(max(1, poll_seconds))
 
 
 async def wait_for_safe_close_after_publish(
@@ -6150,6 +6233,37 @@ async def is_google_login_required(page) -> bool:
     return any(marker in lowered for marker in markers)
 
 
+async def is_google_reauth_required(context) -> bool:
+    """Detect Studio sensitive-action verification / TOTP challenge pages."""
+    challenge_url_markers = (
+        "accounts.google.com/v3/signin/challenge",
+        "studio.youtube.com/reauth",
+    )
+    body_markers = [
+        "verify it’s you",
+        "verify it's you",
+        "get a verification code from the google authenticator app",
+        "you need to verify your identity to continue",
+        "验证是你本人在操作",
+        "你需要确认自己的身份才能继续操作",
+        "google authenticator app",
+    ]
+
+    pages = list(getattr(context, "pages", []) or [])
+    for candidate in pages[:8]:
+        current_url = str(getattr(candidate, "url", "") or "").lower()
+        if any(marker in current_url for marker in challenge_url_markers):
+            return True
+        try:
+            body_text = await candidate.locator("body").inner_text(timeout=3000)
+        except Exception:
+            continue
+        lowered = body_text.lower()
+        if any(marker in lowered for marker in body_markers):
+            return True
+    return False
+
+
 # ============ 主上传函数 ============
 async def upload_single(
     container_code: str,
@@ -6276,6 +6390,15 @@ async def upload_single(
                     False,
                     "当前窗口未登录 Google / YouTube Studio",
                     "login_required",
+                    extra={"debug_port": debug_port},
+                )
+            if await is_google_reauth_required(context):
+                log("当前账号需要 Google 二次验证 (Verify it's you / Authenticator)，无法继续自动上传", "ERR")
+                return make_upload_result(
+                    False,
+                    False,
+                    "当前账号需要 Google 二次验证 (Verify it's you / Authenticator)",
+                    "reauth_required",
                     extra={"debug_port": debug_port},
                 )
             
@@ -7068,8 +7191,18 @@ async def upload_single(
             is_disabled = "true" if publish_state.get("disabled") else "false"
             
             if is_disabled == "true":
-                # ========== 灰色 = 上传失败, 立刻取消 ==========
-                log("❌ 最终提交按钮灰色 (不可点击) = 上传失败!", "ERR")
+                wait_result = await wait_for_publish_button_ready(page, serial)
+                if wait_result.get("ready"):
+                    publish_state = wait_result.get("state") or publish_state
+                    is_disabled = "false"
+                    log(
+                        f"最终提交按钮已恢复可点击，继续提交 | {wait_result.get('reason', '')}",
+                        "OK",
+                    )
+
+            if is_disabled == "true":
+                # ========== 灰色 = 等待超时后仍不可点, 取消 ==========
+                log("❌ 最终提交按钮等待超时后仍为灰色，取消当前上传", "ERR")
                 log("正在取消上传并清理...", "ACT")
                 
                 try:
@@ -7148,7 +7281,7 @@ async def upload_single(
                         pass
                 
                 log("📋 此频道将记录为失败, 需要重新上传", "ERR")
-                return make_upload_result(False, True, "最终提交按钮灰色，已取消上传", "publish_disabled")
+                return make_upload_result(False, True, "最终提交按钮等待超时仍灰色，已取消上传", "publish_disabled")
             
             # ========== 提交按钮可点击, 正常提交 ==========
             if not publish_state.get("clicked_via_dom"):
