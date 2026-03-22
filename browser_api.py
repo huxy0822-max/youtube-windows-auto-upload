@@ -483,7 +483,7 @@ def list_browser_envs(upload_config_path: str | Path | None = None) -> list[dict
         settings["base_url"],
         settings["list_endpoint"],
         settings["list_payload"],
-        provider=settings["provider"],
+        provider=str(settings.get("provider") or ""),
     )
     if not _is_success(settings["provider"], result):
         raise RuntimeError(_extract_error_message(result))
@@ -502,7 +502,7 @@ def start_browser_debug_port(container_code: str | int, upload_config_path: str 
             settings["base_url"],
             settings["open_endpoint"],
             payload,
-            provider=settings["provider"],
+            provider=str(settings.get("provider") or ""),
         )
     except requests.RequestException:
         recovered = _recover_existing_debug_port(container_code) if settings["provider"] == "bitbrowser" else None
@@ -522,7 +522,7 @@ def start_browser_debug_port(container_code: str | int, upload_config_path: str 
                     settings["base_url"],
                     settings["open_endpoint"],
                     payload,
-                    provider=settings["provider"],
+                    provider=str(settings.get("provider") or ""),
                     attempts=2,
                 )
                 if _is_success(settings["provider"], retry_result):
@@ -554,7 +554,7 @@ def stop_browser_container(container_code: str | int, upload_config_path: str | 
         settings["base_url"],
         settings["stop_endpoint"],
         payload,
-        provider=settings["provider"],
+        provider=str(settings.get("provider") or ""),
     )
     if not _is_success(settings["provider"], result):
         raise RuntimeError(_extract_error_message(result))

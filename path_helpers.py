@@ -38,25 +38,6 @@ def first_existing(candidates: Iterable[Path]) -> Path | None:
     return None
 
 
-def open_path_in_file_manager(target: str | Path) -> bool:
-    """跨平台打开文件或目录。"""
-    path = Path(target).expanduser().resolve(strict=False)
-    if not path.exists():
-        return False
-
-    try:
-        system = platform.system()
-        if system == "Darwin":
-            subprocess.run(["open", str(path)], check=False)
-        elif system == "Windows":
-            os.startfile(str(path))
-        else:
-            subprocess.run(["xdg-open", str(path)], check=False)
-        return True
-    except Exception:
-        return False
-
-
 def resolve_config_file(base_dir: str | Path, filename: str) -> Path:
     """
     查找配置文件。
@@ -136,3 +117,15 @@ def normalize_scheduler_config(raw_cfg: dict | None, base_dir: str | Path) -> di
             normalized_bindings[str(tag)] = str(normalize_path(text, base))
     cfg["group_source_bindings"] = normalized_bindings
     return cfg
+
+
+def open_path_in_file_manager(path_value: str | Path) -> None:
+    path = Path(path_value).expanduser().resolve(strict=False)
+    system = platform.system()
+    if system == "Windows":
+        os.startfile(str(path))
+        return
+    if system == "Darwin":
+        subprocess.run(["open", str(path)], check=False)
+        return
+    subprocess.run(["xdg-open", str(path)], check=False)

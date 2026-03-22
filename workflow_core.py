@@ -70,7 +70,7 @@ class WorkflowCancelledError(RuntimeError):
     pass
 
 
-@dataclass
+@dataclass(slots=True)
 class ExecutionControl:
     pause_event: threading.Event = field(default_factory=threading.Event)
     cancel_event: threading.Event = field(default_factory=threading.Event)
@@ -153,16 +153,15 @@ def _read_json(path: Path, fallback: Any) -> Any:
         return fallback
 
 
-@dataclass
+@dataclass(slots=True)
 class WindowInfo:
     tag: str
     serial: int
     channel_name: str = ""
-    container_code: str = ""
     is_ypp: bool = False
 
 
-@dataclass
+@dataclass(slots=True)
 class WindowTask:
     tag: str
     serial: int
@@ -182,7 +181,6 @@ class WindowTask:
     schedule_timezone: str = ""
     source_dir: str = ""
     channel_name: str = ""
-    container_code: str = ""
     tag_list: list[str] = field(default_factory=list)
     thumbnails: list[str] = field(default_factory=list)
     ab_titles: list[str] = field(default_factory=list)
@@ -215,8 +213,6 @@ class WindowTask:
             row["source_dir"] = self.source_dir.strip()
         if self.channel_name.strip():
             row["channel_name"] = self.channel_name.strip()
-        if self.container_code.strip():
-            row["container_code"] = self.container_code.strip()
         if self.tag_list:
             row["tag_list"] = [item for item in self.tag_list if str(item).strip()]
         if self.thumbnails:
@@ -226,7 +222,7 @@ class WindowTask:
         return row
 
 
-@dataclass
+@dataclass(slots=True)
 class WorkflowDefaults:
     date_mmdd: str
     visibility: str = "public"
@@ -273,18 +269,6 @@ def _coerce_float(value: Any, default: float) -> float:
         return default
 
 
-def _coerce_visual_numeric(value: Any, default: Any) -> Any:
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return default
-        if text.lower() == "random":
-            return "random"
-        if re.fullmatch(r"\s*-?\d+(?:\.\d+)?\s*[-~,]\s*-?\d+(?:\.\d+)?\s*", text):
-            return text
-    return value if value not in (None, "") else default
-
-
 def _build_render_options_from_defaults(defaults: WorkflowDefaults) -> RenderOptions:
     settings = defaults.visual_settings or {}
     opts = RenderOptions()
@@ -321,14 +305,14 @@ def _build_render_options_from_defaults(defaults: WorkflowDefaults) -> RenderOpt
     return opts
 
 
-@dataclass
+@dataclass(slots=True)
 class SimulationOptions:
     simulate_seconds: int = 90
     consume_sources: bool = False
     save_manifest: bool = True
 
 
-@dataclass
+@dataclass(slots=True)
 class RenderedItem:
     tag: str
     serial: int
@@ -341,11 +325,9 @@ class RenderedItem:
     tag_list: list[str]
     ab_titles: list[str]
     effect_desc: str
-    slot_index: int = 1
-    total_slots: int = 1
 
 
-@dataclass
+@dataclass(slots=True)
 class WorkflowResult:
     date_mmdd: str
     plan_path: str
@@ -384,68 +366,6 @@ def save_prompt_settings(config: dict[str, Any], path: Path = PROMPT_STUDIO_FILE
     save_prompt_studio_config(path, config)
 
 
-def save_api_preset(
-    *,
-    name: str,
-    payload: dict[str, Any],
-    path: Path = PROMPT_STUDIO_FILE,
-) -> dict[str, Any]:
-    config = load_prompt_settings(path)
-    clean_name = name.strip() or "默认API模板"
-    api_value = default_api_preset(clean_name)
-    api_value.update(payload or {})
-    api_value["name"] = clean_name
-    config.setdefault("apiPresets", {})[clean_name] = api_value
-    save_prompt_settings(config, path)
-    return config
-
-
-def save_content_template(
-    *,
-    name: str,
-    payload: dict[str, Any],
-    path: Path = PROMPT_STUDIO_FILE,
-) -> dict[str, Any]:
-    config = load_prompt_settings(path)
-    clean_name = name.strip() or "默认内容模板"
-    content_value = default_content_template(clean_name)
-    content_value.update(payload or {})
-    content_value["name"] = clean_name
-    config.setdefault("contentTemplates", {})[clean_name] = content_value
-    save_prompt_settings(config, path)
-    return config
-
-
-def bind_group_api_preset(
-    *,
-    tag: str,
-    api_name: str,
-    path: Path = PROMPT_STUDIO_FILE,
-) -> dict[str, Any]:
-    config = load_prompt_settings(path)
-    clean_tag = tag.strip()
-    clean_name = api_name.strip()
-    if clean_tag and clean_name:
-        config.setdefault("tagApiBindings", {})[clean_tag] = clean_name
-        save_prompt_settings(config, path)
-    return config
-
-
-def bind_group_content_template(
-    *,
-    tag: str,
-    content_name: str,
-    path: Path = PROMPT_STUDIO_FILE,
-) -> dict[str, Any]:
-    config = load_prompt_settings(path)
-    clean_tag = tag.strip()
-    clean_name = content_name.strip()
-    if clean_tag and clean_name:
-        config.setdefault("tagBindings", {})[clean_tag] = clean_name
-        save_prompt_settings(config, path)
-    return config
-
-
 def get_metadata_root(config: dict[str, Any] | None = None) -> Path:
     cfg = config or load_scheduler_settings()
     raw = str(cfg.get("metadata_root") or cfg.get("base_image_dir") or "").strip()
@@ -469,8 +389,6 @@ def ensure_prompt_presets(
     content_name: str,
     content_payload: dict[str, Any],
     tag: str | None = None,
-    bind_api: bool = False,
-    bind_content: bool = False,
     path: Path = PROMPT_STUDIO_FILE,
 ) -> dict[str, Any]:
     config = load_prompt_settings(path)
@@ -485,138 +403,14 @@ def ensure_prompt_presets(
     config.setdefault("apiPresets", {})[clean_api_name] = api_value
     config.setdefault("contentTemplates", {})[clean_content_name] = content_value
     if tag:
-        if bind_api:
-            config.setdefault("tagApiBindings", {})[tag] = clean_api_name
-        if bind_content:
-            config.setdefault("tagBindings", {})[tag] = clean_content_name
+        config.setdefault("tagApiBindings", {})[tag] = clean_api_name
+        config.setdefault("tagBindings", {})[tag] = clean_content_name
     save_prompt_settings(config, path)
     return config
 
 
-def validate_prompt_bindings(
-    *,
-    tags: list[str],
-    require_text_generation: bool,
-    require_image_generation: bool,
-    path: Path = PROMPT_STUDIO_FILE,
-) -> tuple[list[str], list[str]]:
-    config = load_prompt_settings(path)
-    errors: list[str] = []
-    warnings: list[str] = []
-    seen_tags: set[str] = set()
-
-    for raw_tag in tags:
-        tag = str(raw_tag or "").strip()
-        if not tag or tag in seen_tags:
-            continue
-        seen_tags.add(tag)
-
-        api_name = get_bound_api_preset_name(config, tag)
-        content_name = get_bound_content_template_name(config, tag)
-        api_presets = config.get("apiPresets") or {}
-        content_templates = config.get("contentTemplates") or {}
-
-        if not api_name:
-            errors.append(f"分组 {tag} 未绑定 API 模板。")
-            continue
-        if not content_name:
-            errors.append(f"分组 {tag} 未绑定内容模板。")
-            continue
-
-        api_preset = dict(api_presets.get(api_name) or {})
-        content_template = dict(content_templates.get(content_name) or {})
-
-        if not api_preset:
-            errors.append(f"分组 {tag} 绑定的 API 模板不存在：{api_name}")
-            continue
-        if not content_template:
-            errors.append(f"分组 {tag} 绑定的内容模板不存在：{content_name}")
-            continue
-
-        if require_text_generation:
-            missing = [
-                field
-                for field in ("baseUrl", "apiKey", "model")
-                if not str(api_preset.get(field) or "").strip()
-            ]
-            if missing:
-                errors.append(f"分组 {tag} 绑定的 API 模板 {api_name} 缺少 {', '.join(missing)}。")
-
-        if require_image_generation and str(api_preset.get("autoImageEnabled") or "0") == "1":
-            missing = [
-                field
-                for field in ("imageBaseUrl", "imageApiKey", "imageModel")
-                if not str(api_preset.get(field) or "").strip()
-            ]
-            if missing:
-                errors.append(f"分组 {tag} 绑定的 API 模板 {api_name} 缺少 {', '.join(missing)}。")
-        elif require_image_generation and str(api_preset.get("autoImageEnabled") or "0") != "1":
-            warnings.append(f"分组 {tag} 的 API 模板 {api_name} 未开启自动出图，将回退为源图缩略图。")
-
-    return errors, warnings
-
-
-def load_channel_container_map(path: Path = CHANNEL_MAPPING_FILE) -> dict[int, str]:
-    data = _read_json(path, {})
-    channels = data.get("channels") if isinstance(data, dict) else {}
-    if not isinstance(channels, dict):
-        return {}
-
-    registry: dict[int, str] = {}
-    for container_code, info in channels.items():
-        if not isinstance(info, dict):
-            continue
-        try:
-            serial = int(info.get("serial_number") or 0)
-        except (TypeError, ValueError):
-            continue
-        if serial <= 0:
-            continue
-        clean_code = str(container_code or "").strip()
-        if clean_code:
-            registry[serial] = clean_code
-    return registry
-
-
-def get_serial_container_catalog() -> dict[int, str]:
-    registry = load_channel_container_map(CHANNEL_MAPPING_FILE)
-    try:
-        for env in list_browser_envs():
-            try:
-                serial = int(env.get("serialNumber") or 0)
-            except (TypeError, ValueError):
-                continue
-            if serial <= 0:
-                continue
-            container_code = str(env.get("containerCode") or env.get("browserId") or "").strip()
-            if container_code:
-                registry[serial] = container_code
-    except Exception:
-        pass
-    return registry
-
-
-def validate_task_containers(tasks: list[WindowTask]) -> tuple[list[str], list[str]]:
-    registry = get_serial_container_catalog()
-    errors: list[str] = []
-    warnings: list[str] = []
-    for task in tasks:
-        task_code = task.container_code.strip()
-        known_code = str(registry.get(int(task.serial)) or "").strip()
-        if task_code and known_code and task_code != known_code:
-            warnings.append(
-                f"{task.tag}/{task.serial} 的 container_code 与当前 BitBrowser 映射不一致，将以任务值为准。"
-            )
-            continue
-        if task_code or known_code:
-            continue
-        errors.append(f"{task.tag}/{task.serial} 缺少可用的 container_code，无法稳定上传。")
-    return errors, warnings
-
-
 def get_group_catalog() -> dict[str, list[WindowInfo]]:
     channel_name_map = load_channel_name_map(CHANNEL_MAPPING_FILE)
-    container_map = load_channel_container_map(CHANNEL_MAPPING_FILE)
     static_catalog: dict[str, list[WindowInfo]] = {}
     ypp_map: dict[str, set[int]] = {}
     for tag in get_all_tags():
@@ -630,7 +424,6 @@ def get_group_catalog() -> dict[str, list[WindowInfo]]:
                     tag=tag,
                     serial=int(serial),
                     channel_name=channel_name_map.get(int(serial), ""),
-                    container_code=container_map.get(int(serial), ""),
                     is_ypp=int(serial) in ypp_serials,
                 )
             )
@@ -645,19 +438,12 @@ def get_group_catalog() -> dict[str, list[WindowInfo]]:
             clean_serial = int(serial)
             tag = str(env.get("tag") or "").strip() or "未分组"
             channel_name = str(env.get("name") or "").strip() or channel_name_map.get(clean_serial, "")
-            container_code = str(
-                env.get("containerCode")
-                or env.get("browserId")
-                or container_map.get(clean_serial)
-                or ""
-            ).strip()
             is_ypp = clean_serial in ypp_map.get(tag, set())
             group_rows = live_catalog.setdefault(tag, {})
             group_rows[clean_serial] = WindowInfo(
                 tag=tag,
                 serial=clean_serial,
                 channel_name=channel_name,
-                container_code=container_code,
                 is_ypp=is_ypp,
             )
     except Exception:
@@ -1284,22 +1070,6 @@ def _build_unique_seed(date_mmdd: str, tag: str, serial: int, *parts: str) -> st
     return "|".join(item for item in core if item)
 
 
-def _describe_effect_kwargs(effect_kwargs: dict[str, Any]) -> str:
-    parts = [
-        f"style={effect_kwargs.get('style')}",
-        f"spectrum={effect_kwargs.get('spectrum')}",
-        f"timeline={effect_kwargs.get('timeline')}",
-        f"particle={effect_kwargs.get('particle')}",
-        f"opacity={effect_kwargs.get('particle_opacity')}",
-        f"speed={effect_kwargs.get('particle_speed')}",
-        f"text_pos={effect_kwargs.get('text_pos')}",
-        f"text_size={effect_kwargs.get('text_size')}",
-        f"text_style={effect_kwargs.get('text_style')}",
-        f"font={effect_kwargs.get('text_font')}",
-    ]
-    return " | ".join(parts)
-
-
 def _resolve_manifest_media_path(folder: Path, value: Any) -> Path | None:
     raw = str(value or "").strip()
     if not raw:
@@ -1541,14 +1311,6 @@ def _pick_preferred_cover_paths(
     if existing:
         return existing, "existing"
     return [], ""
-
-
-def _resolve_task_container_code(task: WindowTask, channel: dict[str, Any] | None = None) -> str:
-    if task.container_code.strip():
-        return task.container_code.strip()
-    if isinstance(channel, dict):
-        return str(channel.get("container_code") or "").strip()
-    return ""
 
 
 def _generate_prompt_metadata(
@@ -2260,7 +2022,6 @@ def create_task(
     schedule_timezone: str = "",
     source_dir: str = "",
     channel_name: str = "",
-    container_code: str = "",
 ) -> WindowTask:
     return WindowTask(
         tag=str(tag).strip(),
@@ -2281,7 +2042,6 @@ def create_task(
         schedule_timezone=str(schedule_timezone or "").strip(),
         source_dir=str(source_dir or "").strip(),
         channel_name=str(channel_name or "").strip(),
-        container_code=str(container_code or "").strip(),
     )
 
 
@@ -2380,7 +2140,6 @@ def validate_existing_output_dirs(
     *,
     date_mmdd: str,
     config: dict[str, Any] | None = None,
-    allow_bootstrap: bool = False,
     log: LogFunc = _noop_log,
 ) -> tuple[list[str], list[str], dict[str, str]]:
     cfg = config or load_scheduler_settings()
@@ -2409,18 +2168,6 @@ def validate_existing_output_dirs(
         if not matched_folders:
             error_text = f"{tag} did not find an uploadable output folder"
             expected_dir = output_root / f"{date_mmdd}_{tag}"
-            if allow_bootstrap and expected_dir.exists():
-                bootstrap_errors: list[str] = []
-                for task in tag_tasks:
-                    existing_video = _find_existing_video(expected_dir, date_mmdd, task.serial, {})
-                    if not existing_video:
-                        bootstrap_errors.append(f"窗口 {task.serial} 缺少现成视频文件")
-                if not bootstrap_errors:
-                    resolved_dirs[tag] = str(expected_dir)
-                    warning = f"{tag} 将从现成视频目录自举 metadata/manifest: {expected_dir}"
-                    warnings.append(warning)
-                    log(f"[检查] {warning}")
-                    continue
             error_text += f": {expected_dir}"
             if last_details:
                 error_text += " | " + " ; ".join(last_details[:3])
@@ -2895,15 +2642,8 @@ def execute_direct_media_workflow(
                 date_mmdd=defaults.date_mmdd,
                 serial=task.serial,
             )
-            cover_count = 3 if task.is_ypp else 1
             if not defaults.generate_thumbnails and source_image.exists():
-                cover_paths = _make_cover_fallbacks(
-                    source_image,
-                    Path(state["metadata_dir"]),
-                    defaults.date_mmdd,
-                    task.serial,
-                    cover_count,
-                )
+                cover_paths = [source_image]
                 cover_source = "source_image"
             thumbnail_prompts: list[str] = []
             history_scope = get_used_metadata_scope(tag, config=config)

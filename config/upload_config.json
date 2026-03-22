@@ -17,7 +17,16 @@
   },
   "video_folder": "workspace/AutoTask",
   "projects_folder": "workspace/projects",
-  "tag_to_project": {},
+  "tag_to_project": {
+    "示例分组": {
+      "project_name": "示例分组",
+      "video_keyword": "示例分组",
+      "ypp_serials": [],
+      "non_ypp_serials": [
+        90
+      ]
+    }
+  },
   "ypp_settings": {
     "ab_test_titles": 3,
     "ab_test_thumbnails": 3

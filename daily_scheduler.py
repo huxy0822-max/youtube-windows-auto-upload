@@ -11,8 +11,6 @@
 - 这次整理后，路径会优先解析到当前仓库内的 `config/`，不再默认写死 macOS 目录。
 """
 
-from __future__ import annotations
-
 import os
 import sys
 import json
@@ -89,7 +87,7 @@ def _run_setup_wizard(config_file: Path) -> dict:
         from tkinter import filedialog, messagebox
     except ImportError:
         # 无 GUI 环境 (如服务器)，使用默认值
-        defaults = _default_platform_config()
+        defaults = default_scheduler_config(_SCRIPT_DIR)
         with open(config_file, 'w', encoding='utf-8') as f:
             json.dump(defaults, f, ensure_ascii=False, indent=2)
         print(f"📝 已生成默认配置: {config_file}")
@@ -231,7 +229,7 @@ def _ffmpeg_has_encoder(encoder_name: str) -> bool:
     return bool(needle) and needle in blob
 
 
-@lru_cache(maxsize=8)
+@lru_cache(maxsize=16)
 def _ffmpeg_has_filter(filter_name: str) -> bool:
     try:
         result = subprocess.run(
@@ -1047,6 +1045,8 @@ def build_effect_kwargs(opts: RenderOptions, *, rng=None) -> dict:
         "bass_pulse_scale": choose_float(getattr(opts, "fx_bass_pulse_scale", 0.03), default=0.03, minimum=0.0, maximum=0.12, precision=3),
         "bass_pulse_brightness": choose_float(getattr(opts, "fx_bass_pulse_brightness", 0.04), default=0.04, minimum=0.0, maximum=0.12, precision=3),
     }
+    if kwargs["text"] and not DRAWTEXT_FILTER_AVAILABLE:
+        kwargs["text"] = ""
     if kwargs["visual_preset"] == "mega_bass":
         mega_palettes = list_mega_bass_palette_names() or ["MegaBassPurple", "MegaBassGreen", "MegaBassAmber"]
         mega_styles = list_mega_bass_style_variants() or ["mega_neon_line"]

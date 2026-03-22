@@ -8,13 +8,10 @@ from typing import Any, Callable
 from workflow_core import (
     ArtifactReadyCallback,
     ExecutionControl,
-    PROMPT_STUDIO_FILE,
     SimulationOptions,
     WindowTask,
     WorkflowDefaults,
     WorkflowResult,
-    _find_existing_video,
-    _output_dir_matches_tasks,
     build_window_plan,
     execute_direct_media_workflow,
     execute_metadata_only_workflow,
@@ -22,11 +19,11 @@ from workflow_core import (
     _output_dir_matches_tasks,
     get_metadata_root,
     load_scheduler_settings,
+    refresh_existing_output_metadata,
     resolve_task_audio_dir,
     resolve_task_image_dir,
+    validate_existing_output_dirs,
     validate_group_sources,
-    validate_prompt_bindings,
-    validate_task_containers,
 )
 
 LogFunc = Callable[[str], None]
@@ -42,7 +39,7 @@ def _noop_log(_message: str) -> None:
     return
 
 
-@dataclass
+@dataclass(slots=True)
 class ModuleSelection:
     metadata: bool = False
     render: bool = False
@@ -62,7 +59,7 @@ class ModuleSelection:
         return [label for key, label in MODULE_LABELS.items() if self.as_dict().get(key)]
 
 
-@dataclass
+@dataclass(slots=True)
 class MediaScope:
     tag: str
     image_dir: str
@@ -71,7 +68,7 @@ class MediaScope:
     source_overrides: list[str] = field(default_factory=list)
 
 
-@dataclass
+@dataclass(slots=True)
 class RunPlan:
     tasks: list[WindowTask]
     defaults: WorkflowDefaults
@@ -85,7 +82,7 @@ class RunPlan:
     media_scopes: list[MediaScope] = field(default_factory=list)
 
 
-@dataclass
+@dataclass(slots=True)
 class ValidationReport:
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -99,7 +96,7 @@ class ValidationReport:
             raise ValueError("\n".join(self.errors))
 
 
-@dataclass
+@dataclass(slots=True)
 class ExecutionResult:
     run_plan: RunPlan
     validation: ValidationReport
@@ -321,21 +318,6 @@ def validate_run_plan(run_plan: RunPlan, *, log: LogFunc = _noop_log) -> Validat
         errors, warnings = validate_group_sources(run_plan.tasks, config=run_plan.config, log=log)
         report.errors.extend(errors)
         report.warnings.extend(warnings)
-
-    if modules.metadata:
-        prompt_errors, prompt_warnings = validate_prompt_bindings(
-            tags=[task.tag for task in run_plan.tasks],
-            require_text_generation=bool(run_plan.defaults.generate_text),
-            require_image_generation=bool(run_plan.defaults.generate_thumbnails),
-            path=PROMPT_STUDIO_FILE,
-        )
-        report.errors.extend(prompt_errors)
-        report.warnings.extend(prompt_warnings)
-
-    if modules.upload:
-        container_errors, container_warnings = validate_task_containers(run_plan.tasks)
-        report.errors.extend(container_errors)
-        report.warnings.extend(container_warnings)
 
     if modules.upload and not modules.render:
         errors, warnings, resolved_dirs = _validate_explicit_output_dirs(

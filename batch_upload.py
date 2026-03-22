@@ -273,116 +273,6 @@ def _resolve_plan_output_dir(window_plan: Optional[Dict[str, Any]], tag: str, da
     candidates.sort(key=lambda item: (-item[0], str(item[1]).lower()))
     return candidates[0][1]
 
-
-def _iter_window_plan_tasks(window_plan: Optional[Dict[str, Any]], tag: str) -> List[Dict[str, Any]]:
-    if not isinstance(window_plan, dict):
-        return []
-    wanted = _normalize_tag_for_match(tag)
-    tasks: List[Dict[str, Any]] = []
-    for task in window_plan.get("tasks", []) or []:
-        if _normalize_tag_for_match(task.get("tag") or "") != wanted:
-            continue
-        try:
-            serial = int(task.get("serial") or 0)
-        except (TypeError, ValueError):
-            continue
-        if serial <= 0:
-            continue
-        row = dict(task)
-        row["serial"] = serial
-        tasks.append(row)
-    return tasks
-
-
-def _resolve_manifest_media_path(folder: Path, value: Any) -> Optional[Path]:
-    raw = str(value or "").strip()
-    if not raw:
-        return None
-    path = Path(raw)
-    return path if path.is_absolute() else (folder / path)
-
-
-def _resolve_video_for_serial(
-    *,
-    serial: int,
-    manifest_channel: Optional[Dict[str, Any]],
-    videos: List[Path],
-    manifest_dir: Path,
-) -> Optional[Path]:
-    if isinstance(manifest_channel, dict):
-        explicit = _resolve_manifest_media_path(manifest_dir, manifest_channel.get("video"))
-        if explicit and explicit.exists():
-            return explicit
-
-    for video in videos:
-        match = re.match(r"\d{4}_(\d+)\.[^.]+$", video.name)
-        if match and int(match.group(1)) == serial:
-            return video
-    return None
-
-
-def _resolve_container_for_serial(
-    *,
-    serial: int,
-    tag: str,
-    plan_task: Optional[Dict[str, Any]],
-    manifest_channel: Optional[Dict[str, Any]],
-    live_container: Optional[Dict[str, Any]],
-    mapping_registry: Dict[int, Dict[str, Any]],
-    serial_to_channel_name: Dict[int, str],
-) -> Dict[str, Any]:
-    container = dict(live_container or {})
-    if not container and serial in mapping_registry:
-        container = dict(mapping_registry[serial])
-
-    container_code = str(
-        (plan_task or {}).get("container_code")
-        or (manifest_channel or {}).get("container_code")
-        or container.get("containerCode")
-        or ""
-    ).strip()
-    channel_name = str(
-        (manifest_channel or {}).get("channel_name")
-        or (plan_task or {}).get("channel_name")
-        or container.get("name")
-        or serial_to_channel_name.get(serial)
-        or ""
-    ).strip()
-
-    if not container:
-        container = {
-            "serialNumber": serial,
-            "tag": tag,
-            "tagName": tag,
-            "remark": "",
-        }
-    else:
-        container.setdefault("serialNumber", serial)
-        container.setdefault("tag", tag)
-        container.setdefault("tagName", container.get("tag", tag))
-        container.setdefault("remark", "")
-
-    if container_code:
-        container["containerCode"] = container_code
-    if channel_name:
-        container["name"] = channel_name
-    return container
-
-
-def _task_is_ypp(
-    *,
-    serial: int,
-    plan_task: Optional[Dict[str, Any]],
-    manifest_channel: Optional[Dict[str, Any]],
-    live_container: Optional[Dict[str, Any]],
-) -> bool:
-    if isinstance(plan_task, dict) and "is_ypp" in plan_task:
-        return bool(plan_task.get("is_ypp"))
-    if isinstance(manifest_channel, dict) and "is_ypp" in manifest_channel:
-        return bool(manifest_channel.get("is_ypp"))
-    remark = str((live_container or {}).get("remark") or "")
-    return "YPP" in remark.upper()
-
 def get_playlist_name(tag: str) -> str:
     """根据标签获取播放列表名称"""
     if tag in TAG_TO_PLAYLIST:
@@ -550,7 +440,6 @@ def _resolve_upload_click_delay_ms(profile: str = "generic", stage: str = "norma
 
 
 async def upload_click_delay(profile: str = "generic", *, stage: str = "normal"):
-    """上传自动化专用延迟。抖动模式会在区间内随机取值。"""
     delay_ms = _resolve_upload_click_delay_ms(profile, stage)
     if delay_ms <= 0:
         return
@@ -630,7 +519,7 @@ async def clear_blocking_overlays(page, reason: str = ""):
         pass
 
 async def human_click(page, locator, desc="", delay_profile: str = "generic"):
-    """优先直接点击，只有常规点击失败时才回退到鼠标坐标点击。"""
+    """优先直接点击，只有常规点击失败时才回退到坐标点击。"""
     log(f"点击: {desc}", "ACT")
     try:
         await clear_blocking_overlays(page, "pre-click")
@@ -1052,7 +941,6 @@ async def ensure_upload_radio_selected(
     radio_name: str,
     description: str,
     max_attempts: int = 4,
-    allow_dom_fallback: bool = True,
 ) -> bool:
     """点击上传弹窗中的 radio，并在继续前确认它真的处于选中态。"""
 
@@ -1284,20 +1172,6 @@ async def ensure_upload_radio_selected(
 
         if radio_count == 0:
             log(f"{description} 检查#{attempt}: 未找到 radio(name={radio_name})", "INFO")
-            if allow_dom_fallback:
-                dom_state = await _dom_locate_and_maybe_click(section_patterns, option_patterns, do_click=False)
-                if dom_state.get("selected"):
-                    if attempt > 1:
-                        log(f"{description} 已确认选中 (dom_probe:{dom_state.get('label', '')})", "OK")
-                    return True
-                dom_clicked = await _dom_locate_and_maybe_click(section_patterns, option_patterns, do_click=True)
-                if dom_clicked.get("clicked"):
-                    log(f"{description} DOM 兜底点击: {dom_clicked.get('label', '')}", "INFO")
-                    await asyncio.sleep(0.9)
-                    dom_verify = await _dom_locate_and_maybe_click(section_patterns, option_patterns, do_click=False)
-                    if dom_verify.get("selected"):
-                        log(f"{description} 已确认选中 (dom_verify:{dom_verify.get('label', '')})", "OK")
-                        return True
             await asyncio.sleep(0.7)
             continue
 
@@ -1322,6 +1196,12 @@ async def ensure_upload_radio_selected(
         if selected_before_click:
             if attempt > 1:
                 log(f"{description} 已确认选中 (already_selected)", "OK")
+            return True
+
+        dom_state = await _dom_locate_and_maybe_click(section_patterns, option_patterns, do_click=False)
+        if dom_state.get("selected"):
+            if attempt > 1:
+                log(f"{description} 已确认选中 (dom_probe:{dom_state.get('label', '')})", "OK")
             return True
 
         clicked = False
@@ -1366,15 +1246,14 @@ async def ensure_upload_radio_selected(
                 log(f"{description} 已确认选中 (playwright_verify)", "OK")
                 return True
 
-        if allow_dom_fallback:
-            dom_clicked = await _dom_locate_and_maybe_click(section_patterns, option_patterns, do_click=True)
-            if dom_clicked.get("clicked"):
-                log(f"{description} DOM 兜底点击: {dom_clicked.get('label', '')}", "INFO")
-                await asyncio.sleep(0.9)
-                dom_verify = await _dom_locate_and_maybe_click(section_patterns, option_patterns, do_click=False)
-                if dom_verify.get("selected"):
-                    log(f"{description} 已确认选中 (dom_verify:{dom_verify.get('label', '')})", "OK")
-                    return True
+        dom_clicked = await _dom_locate_and_maybe_click(section_patterns, option_patterns, do_click=True)
+        if dom_clicked.get("clicked"):
+            log(f"{description} DOM 兜底点击: {dom_clicked.get('label', '')}", "INFO")
+            await asyncio.sleep(0.9)
+            dom_verify = await _dom_locate_and_maybe_click(section_patterns, option_patterns, do_click=False)
+            if dom_verify.get("selected"):
+                log(f"{description} 已确认选中 (dom_verify:{dom_verify.get('label', '')})", "OK")
+                return True
 
         await asyncio.sleep(0.6)
 
@@ -2557,23 +2436,19 @@ async def set_video_category(page, category: str) -> bool:
 async def set_made_for_kids_setting(page, made_for_kids: bool) -> bool:
     radio_name = "VIDEO_MADE_FOR_KIDS_MFK" if made_for_kids else "VIDEO_MADE_FOR_KIDS_NOT_MFK"
     desc = "Made for kids" if made_for_kids else "Not made for kids"
-    return await ensure_upload_radio_selected(page, radio_name, desc, allow_dom_fallback=False)
+    return await ensure_upload_radio_selected(page, radio_name, desc)
 
 
 async def set_altered_content_setting(page, altered_content: bool) -> bool:
     radio_name = "VIDEO_HAS_ALTERED_CONTENT_YES" if altered_content else "VIDEO_HAS_ALTERED_CONTENT_NO"
     desc = f"Altered content = {'Yes' if altered_content else 'No'}"
-    return await ensure_upload_radio_selected(page, radio_name, desc, allow_dom_fallback=False)
+    return await ensure_upload_radio_selected(page, radio_name, desc)
 
 
 async def fill_video_tags(page, tags: List[str]) -> bool:
     clean_tags = [str(item).strip() for item in (tags or []) if str(item).strip()]
     if not clean_tags:
         return True
-
-    advanced_ready = await ensure_advanced_settings_open(page)
-    if not advanced_ready:
-        log("标签填写前未能确认高级设置已展开，继续尝试直接定位标签输入框", "WARN")
 
     joined = ", ".join(clean_tags[:50])
     tag_selectors = [
@@ -2585,10 +2460,6 @@ async def fill_video_tags(page, tags: List[str]) -> bool:
         'ytcp-video-tags input[type="text"]',
         'input[aria-label*="Tags"]',
         'textarea[aria-label*="Tags"]',
-        'input[aria-label*="标签"]',
-        'textarea[aria-label*="标签"]',
-        'input[placeholder*="标签"]',
-        'textarea[placeholder*="标签"]',
     ]
 
     for selector in tag_selectors:
@@ -3072,215 +2943,6 @@ async def try_click_publish_button(page) -> bool:
     return False
 
 
-async def try_publish_from_video_edit_page(
-    page,
-    *,
-    serial: int,
-    visibility: str,
-    scheduled_publish_at: str | None = None,
-    schedule_timezone: str | None = None,
-    debug_port: int | None = None,
-    context=None,
-) -> Optional[Dict[str, Any]]:
-    current_url = str(getattr(page, "url", "") or "")
-    try:
-        visibility_button = page.locator("ytcp-video-metadata-visibility #select-button").first
-        has_visibility_button = await visibility_button.count() > 0 and await visibility_button.is_visible()
-    except Exception:
-        has_visibility_button = False
-
-    if "/video/" not in current_url and not has_visibility_button:
-        return None
-
-    log("检测到 Studio 视频编辑页，改走侧边栏公开流程", "WARN")
-
-    try:
-        if not has_visibility_button:
-            return make_upload_result(False, True, "编辑页缺少公开范围入口", "edit_page_visibility_missing")
-
-        async def _dialog_open() -> bool:
-            try:
-                save_btn = page.locator("ytcp-button#save-button, #save-button").first
-                if await save_btn.count() > 0 and await save_btn.is_visible():
-                    return True
-            except Exception:
-                pass
-            try:
-                public_radio = page.locator("tp-yt-paper-radio-button[name='PUBLIC']").first
-                if await public_radio.count() > 0 and await public_radio.is_visible():
-                    return True
-            except Exception:
-                pass
-            return False
-
-        dialog_opened = await _dialog_open()
-        for attempt in range(1, 4):
-            if dialog_opened:
-                break
-            clicked = await human_click(page, visibility_button, f"编辑页公开范围#{attempt}")
-            await asyncio.sleep(1.0)
-            dialog_opened = await _dialog_open()
-            if dialog_opened:
-                break
-            if not clicked or not dialog_opened:
-                await visibility_button.click(force=True, timeout=5000)
-                await asyncio.sleep(1.0)
-                dialog_opened = await _dialog_open()
-            if dialog_opened:
-                break
-            try:
-                await visibility_button.focus()
-                await page.keyboard.press("Enter")
-            except Exception:
-                pass
-            await asyncio.sleep(0.8)
-            dialog_opened = await _dialog_open()
-        if not dialog_opened:
-            return make_upload_result(False, True, "编辑页公开范围弹窗未能打开", "edit_page_visibility_dialog_missing")
-
-        log(f"设置可见性 = {visibility}...")
-        if str(visibility or "").strip().lower() == "public":
-            visibility_ok = await ensure_public_visibility_selected(page)
-            if not visibility_ok:
-                visibility_ok = await apply_visibility_settings(
-                    page,
-                    visibility,
-                    scheduled_publish_at=scheduled_publish_at,
-                    schedule_timezone=schedule_timezone,
-                )
-        else:
-            visibility_ok = await apply_visibility_settings(
-                page,
-                visibility,
-                scheduled_publish_at=scheduled_publish_at,
-                schedule_timezone=schedule_timezone,
-            )
-        if not visibility_ok:
-            return make_upload_result(False, True, f"未能确认可见性 = {visibility}", "visibility_selection_failed")
-
-        publish_pattern = "done|save|publish|schedule|完成|保存|yayınla|發佈|发布|公開|定時|定时|排程"
-        publish_state = await get_visible_upload_dialog_button_state(
-            page,
-            button_id="save-button",
-            text_pattern=publish_pattern,
-        )
-
-        if not publish_state.get("found"):
-            log("编辑页未找到最终提交按钮，尝试 DOM 兜底直接点击", "WARN")
-            publish_clicked = await try_click_publish_button(page)
-            if not publish_clicked:
-                return make_upload_result(False, True, "编辑页未找到最终提交按钮", "publish_button_missing")
-            await asyncio.sleep(2)
-            dialog_result = await handle_publish_anyway_dialog(
-                page,
-                serial=serial,
-                max_wait_seconds=15,
-                poll_seconds=1,
-            )
-            if dialog_result.get("detected") and not dialog_result.get("clicked"):
-                log("检测到内容检查提示，但未能自动点击 'Publish anyway'，后续监控会继续重试", "WARN")
-            publish_state = {"found": True, "disabled": False, "clicked_via_dom": True}
-
-        if publish_state.get("disabled"):
-            top_save = page.locator("ytcp-button#save, #save").first
-            try:
-                if await top_save.count() > 0 and await top_save.is_visible():
-                    top_disabled = ((await top_save.get_attribute("aria-disabled")) or "").lower() == "true"
-                    if not top_disabled:
-                        log("编辑页先保存详情，等待最终提交按钮可点击", "WARN")
-                        clicked = await human_click(page, top_save, "编辑页保存", delay_profile="done")
-                        if not clicked:
-                            await upload_click_delay("done", stage="retry")
-                            await top_save.click(force=True, timeout=5000)
-                        await asyncio.sleep(2.0)
-            except Exception as save_exc:
-                log(f"编辑页保存详情失败: {save_exc}", "WARN")
-
-            deadline = time.monotonic() + 2 * 60 * 60
-            wait_round = 0
-            while time.monotonic() < deadline:
-                wait_round += 1
-                publish_state = await get_visible_upload_dialog_button_state(
-                    page,
-                    button_id="save-button",
-                    text_pattern=publish_pattern,
-                )
-                if publish_state.get("found") and not publish_state.get("disabled"):
-                    break
-                if wait_round == 1 or wait_round % 6 == 0:
-                    try:
-                        snapshot = await get_best_upload_monitor_snapshot(page, context=context)
-                        log(
-                            f"编辑页最终提交按钮仍不可点，继续等待: {summarize_upload_monitor(snapshot)}",
-                            "WAIT",
-                        )
-                    except Exception:
-                        log("编辑页最终提交按钮仍不可点，继续等待 YouTube 处理/上传", "WAIT")
-                await asyncio.sleep(10)
-            if publish_state.get("disabled"):
-                return make_upload_result(
-                    False,
-                    False,
-                    "编辑页最终提交按钮仍不可点击，继续保留浏览器等待",
-                    "publish_pending_monitor",
-                    extra={"debug_port": debug_port},
-                )
-
-        if not publish_state.get("clicked_via_dom"):
-            log("点击最终提交按钮...", "ACT")
-            publish_clicked = await click_visible_upload_dialog_button(
-                page,
-                "Done / Publish / Schedule",
-                button_id="save-button",
-                text_pattern=publish_pattern,
-                delay_profile="done",
-            )
-            if not publish_clicked:
-                publish_clicked = await try_click_publish_button(page)
-            if not publish_clicked:
-                return make_upload_result(False, True, "点击最终提交按钮失败", "publish_click_failed")
-            await asyncio.sleep(2)
-            dialog_result = await handle_publish_anyway_dialog(
-                page,
-                serial=serial,
-                max_wait_seconds=15,
-                poll_seconds=1,
-            )
-            if dialog_result.get("detected") and not dialog_result.get("clicked"):
-                log("检测到内容检查提示，但未能自动点击 'Publish anyway'，后续监控会继续重试", "WARN")
-            log("✅ 已点击最终提交按钮!", "OK")
-
-        monitor_result = await wait_for_safe_close_after_publish(page, serial, context=context)
-        if not monitor_result.get("confirmed"):
-            log("=" * 60)
-            log("⚠️ Publish 已点击，但尚未确认上传完成，浏览器将保持打开", "WARN")
-            log(f"原因: {monitor_result.get('reason', '未知')}", "WARN")
-            log("=" * 60)
-            return make_upload_result(
-                False,
-                False,
-                monitor_result.get("reason", "未确认安全关闭状态"),
-                "publish_pending_monitor",
-                monitor_result.get("snapshot"),
-                extra={"debug_port": debug_port},
-            )
-
-        final_state = monitor_result.get("snapshot", {}).get("status", "safe_to_close")
-        log("=" * 60)
-        log(f"✅ 已确认上传进入安全关闭状态: {final_state}", "OK")
-        log(f"监控摘要: {monitor_result.get('reason', '')}", "OK")
-        log("=" * 60)
-        return make_upload_result(
-            True,
-            True,
-            monitor_result.get("reason", "已确认安全关闭"),
-            str(final_state),
-            monitor_result.get("snapshot"),
-        )
-    except Exception as exc:
-        return make_upload_result(False, True, f"编辑页发布失败: {exc}", "edit_page_publish_failed")
-
-
 async def wait_for_monetization_section(page, timeout_ms: int = 15000) -> bool:
     """等待 Monetization 页面/区域真正出现。"""
     deadline = time.monotonic() + max(1, timeout_ms) / 1000.0
@@ -3582,11 +3244,11 @@ async def human_fill(page, locator, text, desc="", delay_profile: str = "generic
         await wait_until_locator_clickable(page, locator, desc=desc, timeout_ms=10000)
         await upload_click_delay(delay_profile, stage="normal")
         await locator.click()
-        await asyncio.sleep(random.uniform(0.3, 0.5))
+        await asyncio.sleep(random.uniform(0.2, 0.35))
         await page.keyboard.press("Control+a" if IS_WINDOWS else "Meta+a")
         await asyncio.sleep(random.uniform(0.1, 0.2))
         await locator.fill(text)
-        await asyncio.sleep(random.uniform(0.5, 1.0))
+        await asyncio.sleep(random.uniform(0.3, 0.6))
         return True
     except Exception as e:
         if "intercepts pointer events" in str(e) or "overlay-backdrop" in str(e):
@@ -3645,10 +3307,6 @@ async def fill_visible_upload_field(page, field_name: str, text: str) -> bool:
                         'ytcp-video-tags input[type="text"]',
                         'input[aria-label*="Tags"]',
                         'textarea[aria-label*="Tags"]',
-                        'input[aria-label*="标签"]',
-                        'textarea[aria-label*="标签"]',
-                        'input[placeholder*="标签"]',
-                        'textarea[placeholder*="标签"]',
                     ],
                 };
 
@@ -4142,7 +3800,7 @@ async def get_upload_monitor_snapshot(page) -> Dict[str, Any]:
             const rowPublishedRe = /\\bPublished\\b|已发布|已發佈/i;
             const rowScheduledRe = /\\bScheduled\\b|已排程|已定時|定时发布|定時發布/i;
             const rowUploadedRe = /\\bUploaded\\b|已上传|已上傳/i;
-            const rowVisibilityRe = /\\b(Public|Private|Unlisted|Scheduled)\\b|公开|公開|私密|私享|不公开|不公開|已排程|已定時/i;
+            const rowVisibilityRe = /\\b(Public|Private|Unlisted|Scheduled)\\b|公开|公開|私密|不公开|不公開|已排程|已定時/i;
 
             result.active_processing =
                 processingRe.test(combinedText) &&
@@ -4209,80 +3867,6 @@ async def get_upload_monitor_snapshot(page) -> Dict[str, Any]:
     return snapshot if isinstance(snapshot, dict) else {}
 
 
-def _upload_monitor_status_rank(snapshot: Dict[str, Any]) -> float:
-    status = str(snapshot.get("status") or "unknown").strip().lower()
-    priority = {
-        "published": 90,
-        "scheduled": 80,
-        "processing": 70,
-        "checks_complete": 65,
-        "upload_complete": 60,
-        "checking": 50,
-        "uploading": 40,
-        "unknown": 10,
-        "monitor_error": 0,
-        "page_closed": -10,
-    }
-    base = float(priority.get(status, 5))
-    pct = snapshot.get("progress_pct")
-    if isinstance(pct, (int, float)):
-        base += min(max(float(pct), 0.0), 100.0) / 1000.0
-    if snapshot.get("published_confirmed"):
-        base += 5.0
-    if snapshot.get("dialog_visible"):
-        base += 0.05
-    return base
-
-
-async def get_best_upload_monitor_snapshot(page, *, context=None) -> Dict[str, Any]:
-    """Across reused CDP tabs, pick the most informative Studio upload snapshot."""
-    preferred_pages = [page]
-    if context is not None:
-        for candidate in list(getattr(context, "pages", []) or []):
-            if candidate not in preferred_pages:
-                preferred_pages.append(candidate)
-
-    best_snapshot: Dict[str, Any] | None = None
-    best_rank = float("-inf")
-    for candidate in preferred_pages:
-        url = (getattr(candidate, "url", "") or "").lower()
-        if not url:
-            continue
-        if "console.bitbrowser.net" in url or url.startswith("chrome-extension://"):
-            continue
-
-        try:
-            snapshot = await get_upload_monitor_snapshot(candidate)
-        except Exception as exc:
-            snapshot = {
-                "status": "monitor_error",
-                "progress_pct": None,
-                "progress_text": str(exc),
-                "dialog_visible": False,
-                "active_uploading": False,
-                "active_processing": False,
-                "active_checking": False,
-                "published_confirmed": False,
-                "page_url": getattr(candidate, "url", "") or "",
-            }
-
-        if not isinstance(snapshot, dict):
-            continue
-
-        snapshot["page_url"] = snapshot.get("page_url") or getattr(candidate, "url", "") or ""
-        rank = _upload_monitor_status_rank(snapshot)
-        if candidate is page:
-            rank += 0.001
-
-        if rank > best_rank:
-            best_rank = rank
-            best_snapshot = snapshot
-
-    if best_snapshot is not None:
-        return best_snapshot
-    return await get_upload_monitor_snapshot(page)
-
-
 def summarize_upload_monitor(snapshot: Dict[str, Any]) -> str:
     """格式化监控摘要，便于写入日志。"""
     status = snapshot.get("status", "unknown")
@@ -4318,7 +3902,6 @@ async def wait_for_safe_close_after_publish(
     serial: int,
     timeout_seconds: int = UPLOAD_SAFE_CLOSE_TIMEOUT_SECONDS,
     poll_seconds: int = UPLOAD_MONITOR_POLL_SECONDS,
-    context=None,
 ) -> Dict[str, Any]:
     """点击 Publish 后持续监控，只有进入安全状态才允许关浏览器。"""
     started_at = time.monotonic()
@@ -4338,7 +3921,7 @@ async def wait_for_safe_close_after_publish(
         if dialog_result.get("clicked"):
             stable_safe_polls = 0
         try:
-            snapshot = await get_best_upload_monitor_snapshot(page, context=context)
+            snapshot = await get_upload_monitor_snapshot(page)
         except Exception as e:
             snapshot = {
                 "status": "monitor_error",
@@ -4628,8 +4211,6 @@ def launch_tail_close_watcher(
     serial: int,
     container_code: str,
     debug_port: Optional[int],
-    tag: Optional[str] = None,
-    date_mmdd: Optional[str] = None,
 ) -> bool:
     """主监控超时后，起一个独立 watcher 持续盯到安全状态再关窗。"""
     if not debug_port:
@@ -4653,17 +4234,7 @@ def launch_tail_close_watcher(
                 str(debug_port),
                 "--timeout-seconds",
                 str(TAIL_CLOSE_WATCHER_TIMEOUT_SECONDS),
-            ]
-            + (
-                ["--tag", str(tag).strip()]
-                if str(tag or "").strip()
-                else []
-            )
-            + (
-                ["--date", str(date_mmdd).strip()]
-                if str(date_mmdd or "").strip()
-                else []
-            ),
+            ],
             cwd=str(SCRIPT_DIR),
             start_new_session=True,
         )
@@ -5258,6 +4829,7 @@ async def select_file_with_playwright(page, file_path: str) -> bool:
 
         try:
             async with page.expect_file_chooser(timeout=6000) as fc_info:
+                await upload_click_delay("file", stage="normal")
                 await btn.click(force=True)
             chooser = await fc_info.value
             await chooser.set_files(target)
@@ -5281,29 +4853,12 @@ async def select_file_with_cdp(page, file_path: str) -> bool:
     注意：不需要先点击 Select files 按钮，直接找 file input 设置文件
     """
     log(f"CDP 选择文件: {Path(file_path).name}", "ACT")
-
-    if IS_MAC and any(ord(ch) > 127 for ch in str(file_path)):
-        log("macOS 检测到非 ASCII 路径，切换 Playwright 文件注入", "INFO")
-        return await select_file_with_playwright(page, file_path)
     
     try:
-        await ensure_upload_picker_open(page)
-        input_ready = False
-        for _ in range(20):
-            try:
-                if await page.locator("input[type='file']").count() > 0:
-                    input_ready = True
-                    break
-            except Exception:
-                pass
-            await asyncio.sleep(0.5)
-        if not input_ready:
-            log("CDP: 上传页 file input 仍未出现，继续尝试深度查询", "WARN")
-
         cdp = await page.context.new_cdp_session(page)
         
         # 获取 DOM 根节点
-        doc = await cdp.send('DOM.getDocument', {'depth': -1, 'pierce': True})
+        doc = await cdp.send('DOM.getDocument')
         root_node_id = doc['root']['nodeId']
         
         # 查找 <input type="file"> 元素
@@ -5313,28 +4868,6 @@ async def select_file_with_cdp(page, file_path: str) -> bool:
         })
         
         node_id = result.get('nodeId', 0)
-        if node_id == 0:
-            try:
-                search = await cdp.send('DOM.performSearch', {'query': 'input[type="file"]'})
-                result_count = int(search.get('resultCount', 0) or 0)
-                if result_count > 0:
-                    matches = await cdp.send(
-                        'DOM.getSearchResults',
-                        {
-                            'searchId': search['searchId'],
-                            'fromIndex': 0,
-                            'toIndex': min(result_count, 1),
-                        },
-                    )
-                    node_ids = matches.get('nodeIds', []) or []
-                    if node_ids:
-                        node_id = int(node_ids[0])
-                try:
-                    await cdp.send('DOM.discardSearchResults', {'searchId': search['searchId']})
-                except Exception:
-                    pass
-            except Exception:
-                pass
         if node_id == 0:
             log("CDP: 未找到 file input 元素，切换 Playwright 回退", "WARN")
             return await select_file_with_playwright(page, file_path)
@@ -5381,27 +4914,6 @@ async def select_file_with_cdp(page, file_path: str) -> bool:
     except Exception as e:
         log(f"CDP 文件选择失败: {e}，切换 Playwright 回退", "WARN")
         return await select_file_with_playwright(page, file_path)
-
-
-async def detect_upload_file_read_error(page) -> Optional[str]:
-    try:
-        body_text = await page.locator("body").inner_text(timeout=3000)
-    except Exception:
-        return None
-
-    lowered = body_text.lower()
-    markers = [
-        "文件不可读",
-        "找不到或无法读取你的文件",
-        "file is unreadable",
-        "can't read your file",
-        "cannot read your file",
-        "unable to read your file",
-    ]
-    for marker in markers:
-        if marker in lowered:
-            return marker
-    return None
 
 # ============ 上传状态管理 ============
 def get_upload_status(tag: str, date: str, serials: List[int]) -> Dict[int, Dict]:
@@ -5881,70 +5393,12 @@ async def add_playlist_card(page, playlist_name: str) -> bool:
         # Step 3: 方案A - 用播放列表名字直接点击 (已验证成功)
         log(f"选择播放列表: '{playlist_name}'...")
         try:
-            picked = await page.evaluate(
-                r"""
-                (playlistName) => {
-                    const visible = (el) => !!el && (
-                        el.offsetParent !== null ||
-                        el.offsetWidth > 0 ||
-                        el.offsetHeight > 0 ||
-                        el.getClientRects().length > 0
-                    );
-                    const textOf = (el) => ((el && (el.innerText || el.textContent)) || '').trim();
-                    const clickEl = (el) => {
-                        if (!(el instanceof HTMLElement) || !visible(el)) return false;
-                        try { el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); } catch (_) {}
-                        try { el.click(); } catch (_) {}
-                        for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
-                            try {
-                                el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, composed: true }));
-                            } catch (_) {}
-                        }
-                        return true;
-                    };
-                    const dialogs = Array.from(
-                        document.querySelectorAll('ytve-modal-host, tp-yt-paper-dialog, ytcp-dialog, [role="dialog"]')
-                    ).filter(visible);
-                    const roots = dialogs.length ? dialogs : [document];
-                    const clickableSelector = [
-                        'tp-yt-paper-item',
-                        '[role="option"]',
-                        '[role="button"]',
-                        'button',
-                        'ytcp-menu-service-item-renderer',
-                        'ytve-playlist-picker-item',
-                    ].join(', ');
-                    for (const root of roots) {
-                        const nodes = Array.from(root.querySelectorAll(clickableSelector));
-                        for (const node of nodes) {
-                            if (!visible(node)) continue;
-                            const text = textOf(node);
-                            if (!text || !text.includes(playlistName)) continue;
-                            if (
-                                node.matches('input, textarea, [contenteditable="true"]') ||
-                                node.querySelector?.('#textbox, input, textarea, [contenteditable="true"]')
-                            ) {
-                                continue;
-                            }
-                            if (clickEl(node)) return { clicked: true, method: 'dialog_click', text };
-                        }
-                    }
-                    return { clicked: false, method: 'not_found' };
-                }
-                """,
-                playlist_name,
-            )
-            if not picked.get("clicked"):
-                pl_element = page.locator(
-                    "tp-yt-paper-item, [role='option'], [role='button'], button, ytcp-menu-service-item-renderer"
-                ).filter(has_text=playlist_name).first
-                if await pl_element.count() > 0:
-                    await pl_element.click(force=True)
-                    picked = {"clicked": True, "method": "locator_filter"}
-            if picked.get("clicked"):
-                log(f"已点击播放列表 '{playlist_name}' ({picked.get('method')})", "OK")
+            pl_element = page.get_by_text(playlist_name, exact=False).first
+            if await pl_element.count() > 0:
+                await pl_element.click()
+                log(f"已点击播放列表 '{playlist_name}'", "OK")
             else:
-                log(f"未找到包含 '{playlist_name}' 的播放列表选项", "WARN")
+                log(f"未找到包含 '{playlist_name}' 的元素", "WARN")
                 await page.evaluate("document.querySelector('#discard-button')?.click()")
                 await asyncio.sleep(1)
                 return False
@@ -6696,75 +6150,6 @@ async def is_google_login_required(page) -> bool:
     return any(marker in lowered for marker in markers)
 
 
-async def select_best_upload_page(context, *, log_selection: bool = True):
-    """Pick the most relevant YouTube/Studio page from a reused CDP context."""
-    pages = list(getattr(context, "pages", []) or [])
-    if not pages:
-        return await context.new_page()
-
-    ranked_pages = []
-    for index, page in enumerate(pages):
-        url = (getattr(page, "url", "") or "").lower()
-        score = 0
-        reason = "fallback"
-
-        if "studio.youtube.com" in url:
-            score = 100
-            reason = "studio"
-        elif "youtube.com" in url and "console.bitbrowser.net" not in url:
-            score = 80
-            reason = "youtube"
-        elif "accounts.google.com" in url:
-            score = 20
-            reason = "google_login"
-        elif "gds.google.com" in url:
-            score = 10
-            reason = "google_redirect"
-        elif "console.bitbrowser.net" in url:
-            score = -100
-            reason = "bitbrowser_console"
-        elif url.startswith("chrome-extension://"):
-            score = -200
-            reason = "extension"
-
-        title = ""
-        try:
-            title = (await page.title()).strip()
-        except Exception:
-            title = ""
-
-        if title:
-            lowered_title = title.lower()
-            if "youtube studio" in lowered_title and score < 90:
-                score = max(score, 90 if "gds.google.com" not in url else 15)
-                reason = "studio_title" if "gds.google.com" not in url else "google_redirect_title"
-            elif "google account" in lowered_title and score < 25:
-                score = max(score, 25)
-                reason = "google_account_title"
-            elif "bitbrowser" in lowered_title and score > -100:
-                score = -100
-                reason = "bitbrowser_title"
-
-        ranked_pages.append((score, index, page, reason, title, url))
-
-    ranked_pages.sort(key=lambda item: (item[0], -item[1]), reverse=True)
-    selected = ranked_pages[0]
-    page = selected[2]
-    if log_selection:
-        log(
-            "候选标签页: "
-            + " | ".join(
-                f"#{index}:{reason}:score={score}:title={(title or 'N/A')[:40]}:url={(url or 'about:blank')[:100]}"
-                for score, index, _page, reason, title, url in ranked_pages
-            )
-        )
-        log(
-            f"选中上传标签页: #{selected[1]} ({selected[3]}) -> {(selected[4] or 'N/A')[:60]} | {(selected[5] or 'about:blank')[:160]}",
-            "OK",
-        )
-    return page
-
-
 # ============ 主上传函数 ============
 async def upload_single(
     container_code: str,
@@ -6836,7 +6221,7 @@ async def upload_single(
                         raise e
             
             context = browser.contexts[0]
-            page = await select_best_upload_page(context)
+            page = context.pages[0] if context.pages else await context.new_page()
             
             # ========== 窗口切换: 将浏览器窗口带到前台 ==========
             await page.bring_to_front()
@@ -6910,7 +6295,6 @@ async def upload_single(
             create_btn = None
             used_selector = None
             max_create_retries = 2  # 最多重试 2 轮 (含刷新)
-            opened_direct_upload = False
             
             for create_round in range(max_create_retries):
                 # 先快速扫一遍
@@ -6943,15 +6327,10 @@ async def upload_single(
                 # 仍然找不到，刷新页面再试一次
                 if create_round < max_create_retries - 1:
                     log("Create 按钮仍未找到，刷新页面重试...", "WARN")
-                    try:
-                        await page.reload(wait_until="domcontentloaded", timeout=15000)
-                        await asyncio.sleep(10)
-                    except Exception as exc:
-                        log(f"刷新页面超时，改用直达上传页兜底: {exc}", "WARN")
-                        opened_direct_upload = await open_direct_upload_page(page)
-                        if opened_direct_upload:
-                            break
+                    await page.reload(wait_until="domcontentloaded")
+                    await asyncio.sleep(10)
             
+            opened_direct_upload = False
             if create_btn:
                 await human_click(page, create_btn, f"Create ({used_selector})")
                 await random_delay(1, 2)
@@ -7239,7 +6618,6 @@ async def upload_single(
                                     log(f"  封面输入框数量不足，等待重试 ({attempt + 1}/2)", "WARN")
                                     await asyncio.sleep(2)
                                     continue
-                                await upload_click_delay("file", stage="normal")
                                 await ab_inputs.nth(idx).set_input_files(str(thumbnails[idx]))
                                 log(f"  封面 {idx+1} 上传中...")
                                 await random_delay(1.5, 2.5)
@@ -7378,17 +6756,8 @@ async def upload_single(
                     log("上传封面图 (单张)...")
                     thumbnail_input = page.locator('.style-scope.ytcp-video-custom-still-editor input[type="file"]').first
                     if await thumbnail_input.count() > 0:
-                        await upload_click_delay("file", stage="normal")
                         await thumbnail_input.set_input_files(str(thumbnails[0]))
                         await random_delay(2, 3)
-                        unreadable_error = await detect_upload_file_read_error(page)
-                        if unreadable_error:
-                            return make_upload_result(
-                                False,
-                                True,
-                                f"浏览器提示文件不可读: {unreadable_error}",
-                                "upload_file_unreadable",
-                            )
                         log("封面上传完成", "OK")
                 
                 # 设置播放列表 (非 YPP)
@@ -7405,10 +6774,20 @@ async def upload_single(
                 log("未能确认儿童内容选项，继续后续流程", "WARN")
             await random_delay(0.5, 1)
             
-            # ========== 展开高级设置 ==========
-            advanced_ready = await ensure_advanced_settings_open(page)
-            if not advanced_ready:
-                log("未能确认高级设置已展开，继续尝试后续控件定位", "WARN")
+            # ========== 展开 Show more ==========
+            # 验证成功 (2026-01-30): 使用 scrollIntoViewIfNeeded + ID 选择器 (多语言通用)
+            show_more = page.locator("ytcp-button#toggle-button").first
+            if await show_more.count() > 0:
+                try:
+                    await show_more.scroll_into_view_if_needed()
+                    await asyncio.sleep(0.5)
+                    # 只有当它是收起状态时才点击 (虽然通常一开始都是收起的)
+                    # Show more 按钮本身存在，通过点击它展开。
+                    if await show_more.is_visible():
+                        await human_click(page, show_more, "Show more (#toggle-button)")
+                        await random_delay(2.0, 2.5)  # 等待展开动画
+                except Exception as e:
+                    log(f"Show more 点击失败: {e}", "WARN")
 
             # ========== 标签 ==========
             if tags:
@@ -7445,18 +6824,6 @@ async def upload_single(
                 log("未能确认订阅通知开关状态，继续后续流程", "WARN")
             
             await random_delay(0.5, 1)
-
-            edit_page_result = await try_publish_from_video_edit_page(
-                page,
-                serial=serial,
-                visibility=visibility,
-                scheduled_publish_at=scheduled_publish_at,
-                schedule_timezone=schedule_timezone,
-                debug_port=debug_port,
-                context=context,
-            )
-            if edit_page_result is not None:
-                return edit_page_result
             
             # 点击 Next (Details → Monetization 或 Video elements)
             # 大文件时，Studio 可能在上传进度较低时不渲染 Next 按钮；这里需要长等待。
@@ -7466,17 +6833,6 @@ async def upload_single(
                 await set_made_for_kids_setting(page, made_for_kids)
                 next_clicked = await click_next_button(page, "Next (retry)", timeout_ms=10 * 60 * 1000)
             if not next_clicked:
-                edit_page_result = await try_publish_from_video_edit_page(
-                    page,
-                    serial=serial,
-                    visibility=visibility,
-                    scheduled_publish_at=scheduled_publish_at,
-                    schedule_timezone=schedule_timezone,
-                    debug_port=debug_port,
-                    context=context,
-                )
-                if edit_page_result is not None:
-                    return edit_page_result
                 return make_upload_result(
                     False,
                     True,
@@ -7826,7 +7182,7 @@ async def upload_single(
                     log(f"点击最终提交按钮失败: {e}", "ERR")
                     return make_upload_result(False, True, f"点击最终提交按钮失败: {e}", "publish_click_failed")
 
-            monitor_result = await wait_for_safe_close_after_publish(page, serial, context=context)
+            monitor_result = await wait_for_safe_close_after_publish(page, serial)
             if not monitor_result.get("confirmed"):
                 log("=" * 60)
                 log("⚠️ Publish 已点击，但尚未确认上传完成，浏览器将保持打开", "WARN")
@@ -7901,10 +7257,23 @@ async def batch_upload(
     if not containers:
         log(f"未找到标签为 '{tag}' 的环境", "ERR")
         return make_batch_result(0, 0, 1)
-
+    
+    # 根据 remark 字段判断 YPP（备注包含 "YPP" 则为 YPP 频道）
+    ypp_serials = []
+    non_ypp_serials = []
+    for c in containers:
+        serial = c["serialNumber"]
+        remark = c.get("remark") or ""
+        if "YPP" in remark.upper():
+            ypp_serials.append(serial)
+        else:
+            non_ypp_serials.append(serial)
+    
     skip_set = set(skip_channels or [])
     if skip_set:
-        ordered_serials = [serial for serial in ordered_serials if serial not in skip_set]
+        containers = [c for c in containers if int(c["serialNumber"]) not in skip_set]
+        ypp_serials = [s for s in ypp_serials if s not in skip_set]
+        non_ypp_serials = [s for s in non_ypp_serials if s not in skip_set]
         log(f"跳过指定序号: {sorted(skip_set)}", "WARN")
 
     plan_serials = _extract_window_plan_serials_from_plan(window_plan, tag)
@@ -7919,27 +7288,29 @@ async def batch_upload(
     if not all_serials:
         log(f"标签 {tag} 过滤后无可上传频道", "WARN")
         return make_batch_result(0, 0, 0)
-
-    all_serials = list(ordered_serials)
-    ypp_serials = [
-        serial
-        for serial in ordered_serials
-        if _task_is_ypp(
-            serial=serial,
-            plan_task=plan_task_by_serial.get(serial),
-            manifest_channel=None,
-            live_container=live_container_by_serial.get(serial),
-        )
-    ]
-
+    
     log(f"标签: {tag}")
     log(f"项目: {project_name}")
-    log(f"环境序号: {ordered_serials} (共 {len(ordered_serials)} 个)")
-    log(f"YPP 序号: {ypp_serials}")
-    log(f"环境来源: {container_source if containers else ('window_plan' if plan_tasks else container_source)}")
-    log(f"找到 {len(containers)} 个实时环境")
-    if serial_to_container_code:
-        log(f"加载 channel_mapping: {len(serial_to_container_code)} 个映射", "OK")
+    log(f"环境序号: {all_serials} (共 {len(all_serials)} 个)")
+    log(f"YPP 序号: {ypp_serials} (备注含 'YPP')")
+    log(f"环境来源: {container_source}")
+    
+    # ========== 加载 serial -> container_code 映射 ==========
+    serial_to_container_code = {}
+    if CHANNEL_MAPPING_PATH.exists():
+        try:
+            with open(CHANNEL_MAPPING_PATH, "r", encoding="utf-8") as f:
+                mapping_data = json.load(f)
+            for code, info in mapping_data.get("channels", {}).items():
+                s = info.get("serial_number")
+                if s:
+                    serial_to_container_code[s] = code
+            log(f"加载 channel_mapping: {len(serial_to_container_code)} 个映射", "OK")
+        except Exception as e:
+            log(f"加载 channel_mapping 失败: {e}", "WARN")
+    
+    # containers 已经在上面获取过了，这里直接使用
+    log(f"找到 {len(containers)} 个环境")
     if serial_to_channel_name:
         log(f"加载频道名称: {len(serial_to_channel_name)} 个 (channels.md)", "OK")
     
@@ -7959,11 +7330,12 @@ async def batch_upload(
         videos = find_videos(config["video_folder"], video_keyword, date_key, tag=tag)
     
     if not videos:
-        log("当前未在标准目录扫描到视频文件，将优先依赖 manifest 中的显式视频路径", "WARN")
-    else:
-        log(f"找到 {len(videos)} 个视频文件")
-        for v in videos:
-            log(f"  - {v.name}")
+        log(f"未找到匹配的视频文件 (日期: {date}, 关键词: {video_keyword})", "ERR")
+        return make_batch_result(0, 0, 1)
+    
+    log(f"找到 {len(videos)} 个视频文件")
+    for v in videos:
+        log(f"  - {v.name}")
     
     # ========== 新增: 尝试读取 upload_manifest.json ==========
     # Manifest 优先模式：从冻结的清单读取标题、简介和封面路径
@@ -7989,10 +7361,6 @@ async def batch_upload(
     plan_default_options = {}
     if isinstance(window_plan, dict):
         plan_default_options = window_plan.get("default_upload_options", {}) or {}
-    manifest_channels = manifest_data.get("channels", {}) if isinstance(manifest_data, dict) and isinstance(manifest_data.get("channels"), dict) else {}
-    if not manifest_channels and not dry_run:
-        log("上传缺少有效的 upload_manifest.json，已停止执行", "ERR")
-        return make_batch_result(0, 0, 1)
     
     # 获取项目文件夹
     # 解析元数据（仅在无 manifest 时使用）
@@ -8012,43 +7380,31 @@ async def batch_upload(
     
     if dry_run:
         log("\n=== 预览模式 (新匹配逻辑) ===\n")
-        for serial in all_serials:
-            plan_task = plan_task_by_serial.get(serial)
-            raw_manifest = manifest_channels.get(str(serial)) if isinstance(manifest_channels.get(str(serial)), dict) else None
-            container = _resolve_container_for_serial(
-                serial=serial,
-                tag=tag,
-                plan_task=plan_task,
-                manifest_channel=raw_manifest,
-                live_container=live_container_by_serial.get(serial),
-                mapping_registry=mapping_registry,
-                serial_to_channel_name=serial_to_channel_name,
-            )
+        for i, container in enumerate(containers):
+            serial = container["serialNumber"]
+            if serial not in all_serials:
+                continue
+            
+            is_ypp = serial in ypp_serials
+            # 按容器号匹配视频
+            video = None
+            for v in videos:
+                v_match = re.match(r'\d{4}_(\d+)\.[^.]+$', v.name)
+                if v_match and int(v_match.group(1)) == serial:
+                    video = v
+                    break
 
-            is_ypp = _task_is_ypp(
-                serial=serial,
-                plan_task=plan_task,
-                manifest_channel=raw_manifest,
-                live_container=container,
-            )
-            video = _resolve_video_for_serial(
-                serial=serial,
-                manifest_channel=raw_manifest,
-                videos=videos,
-                manifest_dir=resolved_video_dir,
-            )
-
-            if raw_manifest:
-                ch_manifest = raw_manifest
+            if manifest_data and str(serial) in manifest_data.get("channels", {}):
+                ch_manifest = manifest_data["channels"][str(serial)]
                 ch_manifest = merge_manifest_with_window_task(
                     ch_manifest,
-                    plan_task,
+                    find_window_task(window_plan, tag, serial),
                     default_upload_options=plan_default_options,
                 )
-                is_ypp = bool(ch_manifest.get("is_ypp", is_ypp))
+                is_ypp = bool(ch_manifest.get("is_ypp", serial in ypp_serials))
                 thumbnails = [Path(p) for p in ch_manifest.get("thumbnails", []) if Path(p).exists()]
                 title = ch_manifest.get("title", "默认")
-                channel_name = ch_manifest.get("channel_name") or container.get("name") or serial_to_channel_name.get(serial, "未知")
+                channel_name = ch_manifest.get("channel_name") or serial_to_channel_name.get(serial, "未知")
                 current_set_num = ch_manifest.get("set")
             else:
                 # 按 Container ID 匹配元数据
@@ -8078,11 +7434,7 @@ async def batch_upload(
                         title = list(titles_dict.values())[0]
                     elif isinstance(titles_dict, list) and titles_dict:
                         title = titles_dict[0]
-                channel_name = (
-                    (channel_meta.get("name") if channel_meta else "")
-                    or container.get("name")
-                    or "未知"
-                )
+                channel_name = channel_meta.get("name", "未知") if channel_meta else "未知"
 
             print(f"序号 {serial}: {channel_name}")
             print(f"  视频: {video.name if video else '无'}")
@@ -8111,7 +7463,6 @@ async def batch_upload(
     # 初始化成功计数器
     success_count = 0
     failed_serials = []
-    pending_serials = []
     if active_success_windows is None:
         active_success_windows = []
 
@@ -8159,53 +7510,42 @@ async def batch_upload(
             await close_due_success_windows()
 
     # 开始上传
-    for serial in all_serials:
+    for i, container in enumerate(containers):
+        serial = container["serialNumber"]
+        if serial not in all_serials:
+            continue
+        
+        # 跳过不在上传列表中的频道
         if serial not in upload_serials:
             continue
-
-        plan_task = plan_task_by_serial.get(serial)
-        raw_manifest = manifest_channels.get(str(serial)) if isinstance(manifest_channels.get(str(serial)), dict) else None
-        container = _resolve_container_for_serial(
-            serial=serial,
-            tag=tag,
-            plan_task=plan_task,
-            manifest_channel=raw_manifest,
-            live_container=live_container_by_serial.get(serial),
-            mapping_registry=mapping_registry,
-            serial_to_channel_name=serial_to_channel_name,
-        )
-        container_code = str(container.get("containerCode") or serial_to_container_code.get(serial) or "").strip()
-        is_ypp = _task_is_ypp(
-            serial=serial,
-            plan_task=plan_task,
-            manifest_channel=raw_manifest,
-            live_container=container,
-        )
-
-        video = _resolve_video_for_serial(
-            serial=serial,
-            manifest_channel=raw_manifest,
-            videos=videos,
-            manifest_dir=resolved_video_dir,
-        )
+        
+        container_code = str(container["containerCode"])
+        is_ypp = serial in ypp_serials
+        
+        # 获取视频（按容器号精确匹配文件名）
+        # AutoTask 格式: {MMDD}_{容器号}.mp4
+        video = None
+        for v in videos:
+            # 从文件名提取容器号: "0212_113.mp4" → 113
+            v_match = re.match(r'\d{4}_(\d+)\.[^.]+$', v.name)
+            if v_match and int(v_match.group(1)) == serial:
+                video = v
+                break
+        
         if not video:
             log(f"序号 {serial}: 未找到匹配的视频文件", "WARN")
-            continue
-        if not container_code:
-            log(f"序号 {serial}: 缺少 container_code，无法启动对应浏览器窗口", "ERR")
-            failed_serials.append(serial)
             continue
         
         # ========== Manifest 模式: 直接读取冻结数据 ==========
         thumbnail_prompts = []
-        if raw_manifest:
-            ch_manifest = raw_manifest
+        if manifest_data and str(serial) in manifest_data.get("channels", {}):
+            ch_manifest = manifest_data["channels"][str(serial)]
             ch_manifest = merge_manifest_with_window_task(
                 ch_manifest,
-                plan_task,
+                find_window_task(window_plan, tag, serial),
                 default_upload_options=plan_default_options,
             )
-            is_ypp = bool(ch_manifest.get("is_ypp", is_ypp))
+            is_ypp = bool(ch_manifest.get("is_ypp", serial in ypp_serials))
             title = ch_manifest.get("title", "Video Title")
             description = ch_manifest.get("description", "")
             tag_list = [str(item).strip() for item in ch_manifest.get("tag_list", []) if str(item).strip()]
@@ -8305,13 +7645,15 @@ async def batch_upload(
                 schedule_timezone=schedule_timezone,
                 made_for_kids=made_for_kids,
                 altered_content=altered_content,
-                notify_subscribers=bool(upload_options.get("notify_subscribers", False)),
+                notify_subscribers=bool(ch_manifest.get("notify_subscribers", False)),
                 category=category,
             )
         except Exception as e:
             log(f"序号 {serial} 上传异常: {e}", "ERR")
             upload_result = make_upload_result(False, True, f"外层捕获异常: {e}", "batch_upload_exception")
         finally:
+            if staged_dir is not None:
+                shutil.rmtree(staged_dir, ignore_errors=True)
             success = bool(upload_result.get("success"))
             close_browser_now = bool(upload_result.get("close_browser", True))
             stage = str(upload_result.get("stage") or "").strip()
@@ -8326,8 +7668,6 @@ async def batch_upload(
                             serial=serial,
                             container_code=container_code,
                             debug_port=upload_result.get("debug_port"),
-                            tag=tag,
-                            date_mmdd=date_key,
                         )
                     if tail_watcher_started:
                         log(
@@ -8344,17 +7684,10 @@ async def batch_upload(
                         f"序号 {serial}: 上传失败(stage={stage or 'unknown'})，保留浏览器窗口供人工检查",
                         "WARN",
                     )
-                if staged_dir and success:
-                    try:
-                        shutil.rmtree(staged_dir, ignore_errors=True)
-                        log(f"序号 {serial}: 已清理临时上传素材 {staged_dir}", "INFO")
-                    except Exception as cleanup_exc:
-                        log(f"序号 {serial}: 清理临时上传素材失败: {cleanup_exc}", "WARN")
 
         success = bool(upload_result.get("success"))
         close_browser_now = bool(upload_result.get("close_browser", True))
         stage = str(upload_result.get("stage") or "").strip()
-        pending_publish = (not success) and stage == "publish_pending_monitor" and not close_browser_now
 
         if success:
             success_count += 1
@@ -8407,12 +7740,10 @@ async def batch_upload(
         
         # 保存详细上传记录
         # 优先从 channels.md 获取频道名，其次从 API
-        channel_name = str(
-            (ch_manifest.get("channel_name") if isinstance(ch_manifest, dict) else "")
-            or container.get("name")
-            or serial_to_channel_name.get(serial)
-            or f"频道{serial}"
-        ).strip()
+        channel_name = serial_to_channel_name.get(serial)
+        if not channel_name:
+            container_info = next((c for c in containers if c.get("serialNumber") == serial), {})
+            channel_name = container_info.get("name", f"频道{serial}")
         save_upload_record(
             tag=tag,
             date=date_key,
@@ -8435,19 +7766,12 @@ async def batch_upload(
                     f"序号 {serial} 已点击 Publish，主监控超时；尾程 watcher 已接手后续自动关窗",
                     "WARN",
                 )
-                pending_serials.append(serial)
-            elif pending_publish:
-                log(
-                    f"序号 {serial} 尚未确认最终安全关闭，浏览器现场已保留继续观察",
-                    "WARN",
-                )
-                pending_serials.append(serial)
             else:
                 log(
                     f"序号 {serial} 上传失败(stage={stage or 'unknown'})，浏览器已保留待人工接管",
                     "WARN",
                 )
-                failed_serials.append(serial)
+            failed_serials.append(serial)
 
     # 批次结束时顺带清理一次已到期窗口，并提示剩余窗口
     await close_due_success_windows()
@@ -8470,8 +7794,7 @@ async def batch_upload(
                 "completed_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
                 "total": len(upload_serials),
                 "success": success_count,
-                "failed": len(failed_serials),
-                "pending": len(pending_serials),
+                "failed": len(upload_serials) - success_count,
             }
             with open(report_path, "w", encoding="utf-8") as f:
                 json.dump(report, f, ensure_ascii=False, indent=2)
@@ -8481,26 +7804,18 @@ async def batch_upload(
     
     # === 新增：记录上传日志 ===
     try:
-        history_status = "success"
-        if failed_serials and pending_serials:
-            history_status = "partial"
-        elif failed_serials:
-            history_status = "failed"
-        elif pending_serials:
-            history_status = "pending"
+        history_path = UPLOAD_HISTORY_PATH
 
         new_record = {
             "date": date_key,
             "tag": tag,
             "count": success_count,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "status": history_status,
-            "failed_count": len(failed_serials),
-            "pending_count": len(pending_serials),
+            "status": "success"
         }
 
-        if append_upload_history(UPLOAD_HISTORY_PATH, new_record):
-            log(f"✅ 上传记录已保存到: {UPLOAD_HISTORY_PATH.name}", "OK")
+        if append_upload_history(history_path, new_record):
+            log(f"✅ 上传记录已保存到: {history_path.name}", "OK")
 
     except Exception as e:
         log(f"⚠️ 保存日志失败: {e}", "WARN")
@@ -8508,8 +7823,8 @@ async def batch_upload(
     return make_batch_result(
         len(upload_serials),
         success_count,
-        len(failed_serials),
-        len(pending_serials),
+        len(upload_serials) - success_count,
+        len([s for s in failed_serials if s is not None]),
     )
 
 # ============ 主函数 ============
@@ -8647,7 +7962,6 @@ def _run_auto_mode(args, config, window_plan=None):
 
 def _run_traditional_mode(args, config, window_plan=None):
     tags = []
-    interactive_session = bool(sys.stdin.isatty() and sys.stdout.isatty())
     
     if args.channel and not args.tag:
         found_tag = None
@@ -8674,7 +7988,7 @@ def _run_traditional_mode(args, config, window_plan=None):
     if not date_str:
         today = datetime.now().strftime("%-m.%d")
         default_date = today
-        if not args.auto_confirm and interactive_session:
+        if not args.auto_confirm:
             date_input = input(f"请输入视频日期 (默认为 {default_date}): ").strip()
             date_str = date_input if date_input else default_date
         else:
@@ -8688,10 +8002,8 @@ def _run_traditional_mode(args, config, window_plan=None):
         print(f"📺 单个频道: {args.channel}")
     print("=" * 60 + "\n")
     
-    if not args.auto_confirm and not args.dry_run and interactive_session:
+    if not args.auto_confirm:
         input("按 Enter 开始执行 (Ctrl+C 退出)...")
-    elif not interactive_session:
-        print("ℹ️ 非交互终端，跳过开始前确认")
     
     active_success_windows = []
     had_failures = False
@@ -8996,182 +8308,8 @@ async def set_notify_subscribers(page, enabled: bool) -> bool:
     return False
 
 
-async def read_advanced_settings_state(page) -> Dict[str, Any]:
-    collapsed_markers = [
-        "展开",
-        "显示高级设置",
-        "show more",
-        "show advanced settings",
-    ]
-    expanded_markers = [
-        "收起",
-        "隐藏高级设置",
-        "show less",
-        "hide advanced settings",
-    ]
-    state: Dict[str, Any] = {
-        "category_found": False,
-        "category_visible": False,
-        "toggle_found": False,
-        "toggle_text": "",
-        "toggle_label": "",
-        "expanded": False,
-        "collapsed": False,
-        "ready": False,
-    }
-    for selector in ("#category-container", "ytcp-form-select#category", "#category"):
-        locator = page.locator(selector).first
-        try:
-            if await locator.count() == 0:
-                continue
-            state["category_found"] = True
-            if await locator.is_visible():
-                state["category_visible"] = True
-                break
-        except Exception:
-            continue
-
-    toggle = page.locator("ytcp-button#toggle-button").first
-    try:
-        if await toggle.count() > 0:
-            state["toggle_found"] = True
-            try:
-                state["toggle_text"] = (await toggle.inner_text(timeout=1500)).strip()
-            except Exception:
-                state["toggle_text"] = ""
-            for attr_name in ("aria-label", "label", "title"):
-                try:
-                    attr_value = (await toggle.get_attribute(attr_name)) or ""
-                except Exception:
-                    attr_value = ""
-                if attr_value.strip():
-                    state["toggle_label"] = attr_value.strip()
-                    break
-            combined = f"{state['toggle_text']} {state['toggle_label']}".strip().lower()
-            state["expanded"] = any(marker in combined for marker in expanded_markers)
-            state["collapsed"] = any(marker in combined for marker in collapsed_markers)
-    except Exception:
-        pass
-
-    state["ready"] = bool(state["category_visible"] or state["expanded"])
-    return state
-
-
-async def ensure_advanced_settings_open(page, max_attempts: int = 5) -> bool:
-    async def _click_toggle_with_dom_fallback() -> bool:
-        toggle = page.locator("ytcp-button#toggle-button").first
-        try:
-            if await toggle.count() == 0:
-                return False
-        except Exception:
-            return False
-
-        click_targets = [
-            toggle.locator("button").first,
-            toggle.locator("[role='button']").first,
-            toggle,
-        ]
-        for target in click_targets:
-            try:
-                if await target.count() == 0 or not await target.is_visible():
-                    continue
-                try:
-                    await target.scroll_into_view_if_needed(timeout=3000)
-                except Exception:
-                    pass
-                clicked = await human_click(page, target, "高级设置切换")
-                if clicked:
-                    return True
-                await target.click(force=True, timeout=3000)
-                return True
-            except Exception:
-                continue
-
-        try:
-            clicked = await page.evaluate(
-                """
-                () => {
-                    const visible = (el) => !!el && (
-                        el.offsetParent !== null ||
-                        el.offsetWidth > 0 ||
-                        el.offsetHeight > 0 ||
-                        el.getClientRects().length > 0
-                    );
-                    const clickEl = (el) => {
-                        if (!(el instanceof HTMLElement) || !visible(el)) return false;
-                        try { el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" }); } catch (_) {}
-                        try { el.click(); } catch (_) {}
-                        for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
-                            try {
-                                el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, composed: true }));
-                            } catch (_) {}
-                        }
-                        return true;
-                    };
-                    const host = document.querySelector("ytcp-button#toggle-button");
-                    if (!host) return false;
-                    const targets = [
-                        host.querySelector?.("button"),
-                        host.querySelector?.("[role='button']"),
-                        host,
-                    ].filter(Boolean);
-                    for (const target of targets) {
-                        if (clickEl(target)) return true;
-                    }
-                    return false;
-                }
-                """
-            )
-            return bool(clicked)
-        except Exception:
-            return False
-
-    for attempt in range(1, max_attempts + 1):
-        await clear_blocking_overlays(page, f"advanced-settings-{attempt}")
-        state = await read_advanced_settings_state(page)
-        log(
-            "Advanced settings "
-            f"check#{attempt}: ready={state.get('ready')} category_visible={state.get('category_visible')} "
-            f"toggle_found={state.get('toggle_found')} expanded={state.get('expanded')} "
-            f"text={state.get('toggle_text', '')} label={state.get('toggle_label', '')}",
-            "INFO",
-        )
-        if state.get("ready"):
-            return True
-        if not state.get("toggle_found"):
-            await asyncio.sleep(0.8)
-            continue
-
-        clicked = await _click_toggle_with_dom_fallback()
-        log(f"Advanced settings click#{attempt}: clicked={clicked}", "INFO")
-        if not clicked:
-            try:
-                toggle = page.locator("ytcp-button#toggle-button").first
-                await toggle.focus()
-                await page.keyboard.press("Enter")
-            except Exception:
-                pass
-        await asyncio.sleep(1.0)
-        verify = await read_advanced_settings_state(page)
-        log(
-            "Advanced settings "
-            f"verify#{attempt}: ready={verify.get('ready')} category_visible={verify.get('category_visible')} "
-            f"expanded={verify.get('expanded')} text={verify.get('toggle_text', '')} "
-            f"label={verify.get('toggle_label', '')}",
-            "INFO",
-        )
-        if verify.get("ready"):
-            return True
-
-    log("未能确认高级设置已展开", "WARN")
-    return False
-
-
 async def set_video_category_music(page, max_attempts: int = 6) -> bool:
     music_markers = ("music", "音樂", "音乐")
-    advanced_ready = await ensure_advanced_settings_open(page)
-    if not advanced_ready:
-        log("Category 设置前未能确认高级设置已展开，继续尝试直接定位分类控件", "WARN")
 
     async def _read_state() -> Dict[str, Any]:
         texts: list[str] = []

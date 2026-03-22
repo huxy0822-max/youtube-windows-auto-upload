@@ -36,7 +36,7 @@ from prompt_studio import (
     pick_api_preset_name,
     pick_content_template_name,
 )
-from path_helpers import normalize_scheduler_config
+from path_helpers import normalize_scheduler_config, open_path_in_file_manager
 from run_plan_service import (
     build_module_selection,
     build_run_plan,
@@ -46,7 +46,6 @@ from run_plan_service import (
     validate_run_plan,
 )
 from group_upload_workflow import normalize_mmdd
-from path_helpers import open_path_in_file_manager
 from upload_window_planner import derive_tags_and_skip_channels
 from utils import get_all_tags, get_tag_info
 from workflow_core import (
@@ -57,17 +56,14 @@ from workflow_core import (
     WindowTask,
     WorkflowDefaults,
     WorkflowCancelledError,
-    bind_group_api_preset,
-    bind_group_content_template,
     create_task,
     describe_group_bindings,
+    ensure_prompt_presets,
     get_group_bindings,
     get_group_catalog,
     get_metadata_root,
     load_prompt_settings,
     load_scheduler_settings,
-    save_api_preset,
-    save_content_template,
     save_scheduler_settings,
     save_window_plan,
     set_group_binding,
@@ -326,7 +322,7 @@ class DashboardApp(ctk.CTk):
         self._build_layout()
         self._refresh_groups()
         self._refresh_prompt_dropdowns()
-        self._sync_prompt_selection_from_group()
+        self._load_prompt_for_group()
         self._refresh_task_tree()
         self._refresh_bindings_box()
         self._bind_variable_events()
@@ -682,7 +678,7 @@ class DashboardApp(ctk.CTk):
     def _bind_variable_events(self) -> None:
         self.current_group_var.trace_add("write", lambda *_: self._refresh_window_buttons())
         self.binding_group_var.trace_add("write", lambda *_: self.binding_folder_var.set(get_group_bindings(self.scheduler_config).get(self.binding_group_var.get(), "")))
-        self.prompt_group_var.trace_add("write", lambda *_: self._sync_prompt_selection_from_group())
+        self.prompt_group_var.trace_add("write", lambda *_: self._load_prompt_for_group())
         self.run_metadata_var.trace_add("write", lambda *_: self._preview_plan())
         self.run_render_var.trace_add("write", lambda *_: self._preview_plan())
         self.run_upload_var.trace_add("write", lambda *_: self._preview_plan())
@@ -744,7 +740,12 @@ class DashboardApp(ctk.CTk):
 
 
     def _build_upload_tab(self) -> None:
-        tab = self._create_scrollable_tab("上传")
+        base_tab = self.tabview.tab("上传")
+        base_tab.grid_columnconfigure(0, weight=1)
+        base_tab.grid_rowconfigure(0, weight=1)
+        tab = ctk.CTkScrollableFrame(base_tab)
+        tab.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+        tab.grid_columnconfigure(0, weight=1)
 
         group_frame = ctk.CTkFrame(tab)
         group_frame.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
@@ -945,7 +946,12 @@ class DashboardApp(ctk.CTk):
         self.task_tree.grid(row=1, column=0, sticky="ew", padx=8, pady=(4, 8))
 
     def _build_visual_tab(self) -> None:
-        tab = self._create_scrollable_tab("高级视觉")
+        base_tab = self.tabview.tab("高级视觉")
+        base_tab.grid_columnconfigure(0, weight=1)
+        base_tab.grid_rowconfigure(0, weight=1)
+        tab = ctk.CTkScrollableFrame(base_tab)
+        tab.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+        tab.grid_columnconfigure(0, weight=1)
 
         intro = ctk.CTkFrame(tab)
         intro.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
@@ -1093,7 +1099,12 @@ class DashboardApp(ctk.CTk):
         ).grid(row=1, column=0, sticky="w", padx=16, pady=(0, 14))
 
     def _build_prompt_tab(self) -> None:
-        tab = self._create_scrollable_tab("提示词")
+        base_tab = self.tabview.tab("提示词")
+        base_tab.grid_columnconfigure(0, weight=1)
+        base_tab.grid_rowconfigure(0, weight=1)
+        tab = ctk.CTkScrollableFrame(base_tab)
+        tab.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+        tab.grid_columnconfigure(0, weight=1)
 
         top = ctk.CTkFrame(tab)
         top.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
@@ -1300,32 +1311,6 @@ class DashboardApp(ctk.CTk):
             except Exception:
                 pass
         return str(variable.get()).strip()
-
-    def _range_row(
-        self,
-        parent: ctk.CTkFrame,
-        row: int,
-        label: str,
-        min_var: ctk.StringVar,
-        max_var: ctk.StringVar,
-    ) -> None:
-        ctk.CTkLabel(parent, text=label).grid(row=row, column=0, sticky="w", padx=16, pady=(0, 6))
-        ctk.CTkEntry(parent, textvariable=min_var, placeholder_text="最小值").grid(
-            row=row, column=1, sticky="ew", padx=(16, 8), pady=(0, 12)
-        )
-        ctk.CTkLabel(parent, text="到").grid(row=row, column=2, sticky="ew", padx=4, pady=(0, 12))
-        ctk.CTkEntry(parent, textvariable=max_var, placeholder_text="最大值").grid(
-            row=row, column=3, sticky="ew", padx=(8, 16), pady=(0, 12)
-        )
-
-    def _create_scrollable_tab(self, tab_name: str) -> ctk.CTkScrollableFrame:
-        base_tab = self.tabview.tab(tab_name)
-        base_tab.grid_columnconfigure(0, weight=1)
-        base_tab.grid_rowconfigure(0, weight=1)
-        tab = ctk.CTkScrollableFrame(base_tab)
-        tab.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
-        tab.grid_columnconfigure(0, weight=1)
-        return tab
 
     def _collect_visual_settings(self) -> dict[str, Any]:
         return {
@@ -2246,7 +2231,6 @@ class DashboardApp(ctk.CTk):
             schedule_timezone=self.add_schedule_timezone_var.get() if self.add_schedule_enabled_var.get() else "",
             source_dir=self.source_dir_override_var.get(),
             channel_name=info.channel_name,
-            container_code=info.container_code,
         )
         for index, existing in enumerate(self.window_tasks):
             if existing.tag == task.tag and existing.serial == task.serial:
@@ -2455,31 +2439,26 @@ class DashboardApp(ctk.CTk):
 
     def _sync_prompt_selection_from_group(self) -> None:
         self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
-        tag = self.prompt_group_var.get().strip()
+        tag = self.prompt_group_var.get()
         api_name = pick_api_preset_name(self.prompt_config, tag)
         content_name = pick_content_template_name(self.prompt_config, tag)
         self._loading_prompt_form = True
         self.api_preset_var.set(api_name)
         self.content_template_var.set(content_name)
+
         self._load_prompt_for_group()
 
     def _load_prompt_for_group(self) -> None:
         self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
-        api_presets = self.prompt_config.get("apiPresets") or {}
-        content_templates = self.prompt_config.get("contentTemplates") or {}
-        tag = self.prompt_group_var.get().strip()
-        api_name = self.api_preset_var.get().strip()
-        content_name = self.content_template_var.get().strip()
-
-        if api_name not in api_presets:
-            api_name = pick_api_preset_name(self.prompt_config, tag)
-        if content_name not in content_templates:
-            content_name = pick_content_template_name(self.prompt_config, tag)
+        tag = self.prompt_group_var.get()
+        api_name = pick_api_preset_name(self.prompt_config, tag)
+        content_name = pick_content_template_name(self.prompt_config, tag)
+        self._loading_prompt_form = True
         self.api_preset_var.set(api_name)
         self.content_template_var.set(content_name)
 
-        api_data = dict(api_presets.get(api_name) or {})
-        content_data = dict(content_templates.get(content_name) or {})
+        api_data = dict((self.prompt_config.get("apiPresets") or {}).get(api_name) or {})
+        content_data = dict((self.prompt_config.get("contentTemplates") or {}).get(content_name) or {})
 
         self.provider_var.set(str(api_data.get("provider") or "openai_compatible"))
         self.base_url_var.set(str(api_data.get("baseUrl") or ""))
@@ -2512,60 +2491,65 @@ class DashboardApp(ctk.CTk):
         self.prompt_form_dirty = False
 
     def _save_api_preset(self) -> None:
+        tag = self.prompt_group_var.get()
         name = self.api_save_name_var.get().strip() or self.api_preset_var.get().strip()
         if not name:
             messagebox.showerror("保存失败", "请填写 API 模板名称")
             return
-        self.prompt_config = save_api_preset(
-            name=name,
-            payload=self._current_api_form(),
+        ensure_prompt_presets(
+            api_name=name,
+            api_payload=self._current_api_form(),
+            content_name=self.content_template_var.get().strip() or "默认内容模板",
+            content_payload=self._current_content_form(),
             path=PROMPT_STUDIO_FILE,
         )
+        self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
         self._refresh_prompt_dropdowns()
         self.api_preset_var.set(name)
-        self.api_save_name_var.set(name)
         self._log(f"[提示词] 已保存 API 模板: {name}")
+        if tag:
+            self.api_save_name_var.set(name)
 
     def _save_content_template(self) -> None:
         name = self.content_save_name_var.get().strip() or self.content_template_var.get().strip()
         if not name:
             messagebox.showerror("保存失败", "请填写内容模板名称")
             return
-        self.prompt_config = save_content_template(
-            name=name,
-            payload=self._current_content_form(),
+        ensure_prompt_presets(
+            api_name=self.api_preset_var.get().strip() or "默认API模板",
+            api_payload=self._current_api_form(),
+            content_name=name,
+            content_payload=self._current_content_form(),
             path=PROMPT_STUDIO_FILE,
         )
+        self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
         self._refresh_prompt_dropdowns()
         self.content_template_var.set(name)
-        self.content_save_name_var.set(name)
         self._log(f"[提示词] 已保存内容模板: {name}")
 
     def _bind_group_api(self) -> None:
-        tag = self.prompt_group_var.get().strip()
-        api_name = self.api_preset_var.get().strip()
-        if not tag or not api_name:
-            messagebox.showerror("绑定失败", "请先选择分组和 API 模板")
-            return
+        ensure_prompt_presets(
+            api_name=self.api_preset_var.get().strip() or "默认API模板",
+            api_payload=self._current_api_form(),
+            content_name=self.content_template_var.get().strip() or "默认内容模板",
+            content_payload=self._current_content_form(),
+            tag=self.prompt_group_var.get(),
+            path=PROMPT_STUDIO_FILE,
+        )
         self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
-        if api_name not in (self.prompt_config.get("apiPresets") or {}):
-            messagebox.showerror("绑定失败", f"未找到 API 模板：{api_name}")
-            return
-        self.prompt_config = bind_group_api_preset(tag=tag, api_name=api_name, path=PROMPT_STUDIO_FILE)
-        self._log(f"[提示词] {tag} 已绑定 API 模板 {api_name}")
+        self._log(f"[提示词] {self.prompt_group_var.get()} 已绑定 API 模板 {self.api_preset_var.get()}")
 
     def _bind_group_content(self) -> None:
-        tag = self.prompt_group_var.get().strip()
-        content_name = self.content_template_var.get().strip()
-        if not tag or not content_name:
-            messagebox.showerror("绑定失败", "请先选择分组和内容模板")
-            return
+        ensure_prompt_presets(
+            api_name=self.api_preset_var.get().strip() or "默认API模板",
+            api_payload=self._current_api_form(),
+            content_name=self.content_template_var.get().strip() or "默认内容模板",
+            content_payload=self._current_content_form(),
+            tag=self.prompt_group_var.get(),
+            path=PROMPT_STUDIO_FILE,
+        )
         self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
-        if content_name not in (self.prompt_config.get("contentTemplates") or {}):
-            messagebox.showerror("绑定失败", f"未找到内容模板：{content_name}")
-            return
-        self.prompt_config = bind_group_content_template(tag=tag, content_name=content_name, path=PROMPT_STUDIO_FILE)
-        self._log(f"[提示词] {tag} 已绑定内容模板 {content_name}")
+        self._log(f"[提示词] {self.prompt_group_var.get()} 已绑定内容模板 {self.content_template_var.get()}")
 
     def _test_text_api(self) -> None:
         try:
@@ -2656,6 +2640,70 @@ class DashboardApp(ctk.CTk):
         if target.exists():
             open_path_in_file_manager(target)
 
+    def _parse_upload_delay_range_ms(self, label: str, min_text: str, max_text: str) -> tuple[int, int]:
+        raw_min = str(min_text or "").strip() or "0"
+        raw_max = str(max_text or "").strip() or raw_min
+        try:
+            min_ms = max(0, int(raw_min))
+            max_ms = max(0, int(raw_max))
+        except ValueError as exc:
+            raise ValueError(f"{label} 延迟必须是整数毫秒。") from exc
+        if max_ms < min_ms:
+            raise ValueError(f"{label} 延迟上限不能小于下限。")
+        return min_ms, max_ms
+
+    def _collect_upload_delay_settings(self) -> dict[str, Any]:
+        mode_label = self.upload_delay_mode_var.get().strip()
+        mode = "jitter" if mode_label == "抖动" else "steady"
+        generic = self._parse_upload_delay_range_ms(
+            "通用上传点击",
+            self.upload_click_delay_min_ms_var.get(),
+            self.upload_click_delay_max_ms_var.get(),
+        )
+        return {
+            "mode": mode,
+            "generic": generic,
+            "file": self._parse_upload_delay_range_ms(
+                "文件上传",
+                self.upload_file_delay_min_ms_var.get(),
+                self.upload_file_delay_max_ms_var.get(),
+            ),
+            "next": self._parse_upload_delay_range_ms(
+                "Next",
+                self.upload_next_delay_min_ms_var.get(),
+                self.upload_next_delay_max_ms_var.get(),
+            ),
+            "done": self._parse_upload_delay_range_ms(
+                "Done",
+                self.upload_done_delay_min_ms_var.get(),
+                self.upload_done_delay_max_ms_var.get(),
+            ),
+            "publish": self._parse_upload_delay_range_ms(
+                "Publish",
+                self.upload_publish_delay_min_ms_var.get(),
+                self.upload_publish_delay_max_ms_var.get(),
+            ),
+        }
+
+    def _append_upload_delay_args(self, cmd: list[str], delay_settings: dict[str, Any] | None) -> None:
+        if not delay_settings:
+            return
+
+        mode = str(delay_settings.get("mode") or "steady").strip().lower()
+        if mode in {"jitter", "steady"}:
+            cmd.extend(["--click-delay-mode", mode])
+
+        generic_min, generic_max = delay_settings.get("generic", (0, 0))
+        if generic_min > 0 or generic_max > 0:
+            cmd.extend(["--click-delay-min-ms", str(generic_min)])
+            cmd.extend(["--click-delay-max-ms", str(generic_max)])
+
+        for prefix in ("file", "next", "done", "publish"):
+            profile_min, profile_max = delay_settings.get(prefix, (0, 0))
+            if profile_min > 0 or profile_max > 0:
+                cmd.extend([f"--{prefix}-delay-min-ms", str(profile_min)])
+                cmd.extend([f"--{prefix}-delay-max-ms", str(profile_max)])
+
 
     def _collect_output_dirs_from_result(self, result) -> dict[str, str]:
         prepared: dict[str, str] = {}
@@ -2679,6 +2727,7 @@ class DashboardApp(ctk.CTk):
         *,
         retain_days: str,
         auto_close: bool,
+        delay_settings: dict[str, Any] | None = None,
     ) -> None:
         current_config = dict(run_plan.config or {})
         single_modules = build_module_selection(metadata=False, render=False, upload=True)
@@ -2721,6 +2770,7 @@ class DashboardApp(ctk.CTk):
         ]
         if auto_close:
             cmd.append("--auto-close-browser")
+        self._append_upload_delay_args(cmd, delay_settings)
 
         label = f"{task.tag}/{task.serial}"
         self._log("[Upload] Stream dispatch -> " + " ".join(cmd))
@@ -2788,6 +2838,7 @@ class DashboardApp(ctk.CTk):
         prepared_output_dirs: dict[str, str] | None = None,
         retain_days: str | None = None,
         auto_close: bool | None = None,
+        delay_settings: dict[str, Any] | None = None,
     ) -> bool:
         plan = deepcopy(run_plan.window_plan)
         if prepared_output_dirs:
@@ -2827,7 +2878,7 @@ class DashboardApp(ctk.CTk):
                 ]
                 if auto_close:
                     per_cmd.append("--auto-close-browser")
-                self._append_upload_delay_args(per_cmd, upload_delay_settings)
+                self._append_upload_delay_args(per_cmd, delay_settings)
                 self._log("[Upload] " + " ".join(per_cmd))
                 proc = subprocess.Popen(
                     per_cmd,
@@ -2929,7 +2980,7 @@ class DashboardApp(ctk.CTk):
         ]
         if auto_close:
             cmd.append("--auto-close-browser")
-        self._append_upload_delay_args(cmd, upload_delay_settings)
+        self._append_upload_delay_args(cmd, delay_settings)
         if skip_channels:
             cmd.append("--skip-channels=" + ",".join(str(item) for item in skip_channels))
         self._log("[上传] " + " ".join(cmd))
@@ -3182,10 +3233,15 @@ class DashboardApp(ctk.CTk):
         )
 
     def _build_start_tab(self) -> None:
-        tab = self._create_scrollable_tab("快捷开始")
+        base_tab = self.tabview.tab("快捷开始")
+        base_tab.grid_columnconfigure(0, weight=1)
+        base_tab.grid_rowconfigure(0, weight=1)
+        tab = ctk.CTkScrollableFrame(base_tab)
+        tab.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+        tab.grid_columnconfigure(0, weight=1)
 
         task_frame = ctk.CTkFrame(tab)
-        task_frame.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
+        task_frame.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 8))
         for column in range(6):
             task_frame.grid_columnconfigure(column, weight=1)
         ctk.CTkLabel(task_frame, text="本次任务", font=ctk.CTkFont(size=24, weight="bold")).grid(
@@ -3193,7 +3249,7 @@ class DashboardApp(ctk.CTk):
         )
         ctk.CTkLabel(
             task_frame,
-            text="勾选今天要执行的模块。随机与否全部在高级视觉里用 random 或区间控制，这里不再保留全局随机开关。",
+            text="勾选今天要执行的模块。只勾一个就单独跑那一个，勾多个就按顺序连续执行。",
             text_color="#b8c1cc",
         ).grid(row=1, column=0, columnspan=6, sticky="w", padx=16, pady=(0, 10))
         ctk.CTkCheckBox(task_frame, text="生成标题/简介/标签/缩略图", variable=self.run_metadata_var).grid(
@@ -3213,56 +3269,15 @@ class DashboardApp(ctk.CTk):
         ctk.CTkEntry(task_frame, textvariable=self.simulate_seconds_var, width=120).grid(
             row=3, column=3, sticky="w", padx=(0, 12), pady=(0, 8)
         )
+        ctk.CTkSwitch(task_frame, text="随机视觉特效", variable=self.randomize_effects_var).grid(
+            row=3, column=4, columnspan=2, sticky="w", padx=8, pady=(0, 8)
+        )
         ctk.CTkButton(
             task_frame,
             text="打开高级视觉",
             command=lambda: self.tabview.set("高级视觉"),
             width=140,
-        ).grid(row=3, column=4, columnspan=2, sticky="w", padx=8, pady=(0, 8))
-        ctk.CTkLabel(task_frame, text="上传延迟策略").grid(row=4, column=0, sticky="w", padx=(16, 8), pady=(0, 12))
-        ctk.CTkOptionMenu(task_frame, variable=self.upload_delay_mode_var, values=["抖动", "稳态"]).grid(
-            row=4, column=1, sticky="w", padx=(0, 12), pady=(0, 12)
-        )
-        ctk.CTkLabel(task_frame, text="文件上传 下限/上限(ms)").grid(row=4, column=2, sticky="w", padx=(0, 8), pady=(0, 12))
-        ctk.CTkEntry(task_frame, textvariable=self.upload_file_delay_min_ms_var, width=100).grid(
-            row=4, column=3, sticky="w", padx=(0, 12), pady=(0, 12)
-        )
-        ctk.CTkEntry(task_frame, textvariable=self.upload_file_delay_max_ms_var, width=100).grid(
-            row=4, column=4, sticky="w", padx=(0, 12), pady=(0, 12)
-        )
-        ctk.CTkLabel(
-            task_frame,
-            text="抖动=每次在区间内取值；稳态=主点下限、兜底中值、强制上限。",
-            text_color="#b8c1cc",
-            justify="left",
-        ).grid(row=4, column=5, sticky="w", padx=(0, 16), pady=(0, 12))
-        ctk.CTkLabel(task_frame, text="Next 下限/上限(ms)").grid(row=5, column=0, sticky="w", padx=(16, 8), pady=(0, 12))
-        ctk.CTkEntry(task_frame, textvariable=self.upload_next_delay_min_ms_var, width=100).grid(
-            row=5, column=1, sticky="w", padx=(0, 12), pady=(0, 12)
-        )
-        ctk.CTkEntry(task_frame, textvariable=self.upload_next_delay_max_ms_var, width=100).grid(
-            row=5, column=2, sticky="w", padx=(0, 12), pady=(0, 12)
-        )
-        ctk.CTkLabel(task_frame, text="Done 下限/上限(ms)").grid(row=5, column=3, sticky="w", padx=(0, 8), pady=(0, 12))
-        ctk.CTkEntry(task_frame, textvariable=self.upload_done_delay_min_ms_var, width=100).grid(
-            row=5, column=4, sticky="w", padx=(0, 12), pady=(0, 12)
-        )
-        ctk.CTkEntry(task_frame, textvariable=self.upload_done_delay_max_ms_var, width=100).grid(
-            row=5, column=5, sticky="w", padx=(0, 12), pady=(0, 12)
-        )
-        ctk.CTkLabel(task_frame, text="Publish 下限/上限(ms)").grid(row=6, column=0, sticky="w", padx=(16, 8), pady=(0, 12))
-        ctk.CTkEntry(task_frame, textvariable=self.upload_publish_delay_min_ms_var, width=100).grid(
-            row=6, column=1, sticky="w", padx=(0, 12), pady=(0, 12)
-        )
-        ctk.CTkEntry(task_frame, textvariable=self.upload_publish_delay_max_ms_var, width=100).grid(
-            row=6, column=2, sticky="w", padx=(0, 12), pady=(0, 12)
-        )
-        ctk.CTkLabel(
-            task_frame,
-            text="这些延迟只影响自动上传链路：文件注入、Next、Done/Save、Publish 兜底点击。",
-            text_color="#b8c1cc",
-            justify="left",
-        ).grid(row=6, column=3, columnspan=3, sticky="w", padx=(0, 16), pady=(0, 12))
+        ).grid(row=4, column=4, columnspan=2, sticky="w", padx=8, pady=(0, 8))
 
         option_frame = ctk.CTkFrame(tab)
         option_frame.grid(row=1, column=0, sticky="ew", padx=16, pady=8)
@@ -3460,7 +3475,7 @@ class DashboardApp(ctk.CTk):
             return
 
         try:
-            run_plan = self._build_current_run_plan(config=saved_config)
+            run_plan = self._build_current_run_plan()
         except Exception as exc:
             self.start_preview.insert("1.0", f"Plan build failed: {exc}")
             return
@@ -3545,6 +3560,11 @@ class DashboardApp(ctk.CTk):
         if not self.window_tasks:
             messagebox.showerror("Cannot Start", "Add at least one window task first.")
             return
+        try:
+            upload_delay_settings = self._collect_upload_delay_settings()
+        except ValueError as exc:
+            messagebox.showerror("Upload Delay Invalid", str(exc))
+            return
         if module_selection.metadata:
             if not bool(self.generate_text_var.get()):
                 self.generate_text_var.set(True)
@@ -3571,6 +3591,7 @@ class DashboardApp(ctk.CTk):
         upload_runtime = {
             "retain_days": str(self.cleanup_days_var.get().strip() or "5"),
             "auto_close": bool(self.upload_auto_close_var.get()),
+            "delay_settings": upload_delay_settings,
         }
 
         def job() -> bool:
@@ -3598,6 +3619,7 @@ class DashboardApp(ctk.CTk):
                     output_dir,
                     retain_days=upload_runtime["retain_days"],
                     auto_close=upload_runtime["auto_close"],
+                    delay_settings=upload_runtime["delay_settings"],
                 )
 
             execution = execute_run_plan(
@@ -3627,6 +3649,7 @@ class DashboardApp(ctk.CTk):
                     prepared_output_dirs=execution.prepared_output_dirs,
                     retain_days=upload_runtime["retain_days"],
                     auto_close=upload_runtime["auto_close"],
+                    delay_settings=upload_runtime["delay_settings"],
                 )
 
             return False
@@ -3692,11 +3715,15 @@ class DashboardApp(ctk.CTk):
             _bind_tree(widget)
 
     def _build_start_tab(self) -> None:
-        tab = self.tabview.tab("快捷开始")
+        base_tab = self.tabview.tab("快捷开始")
+        base_tab.grid_columnconfigure(0, weight=1)
+        base_tab.grid_rowconfigure(0, weight=1)
+        tab = ctk.CTkScrollableFrame(base_tab)
+        tab.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
         tab.grid_columnconfigure(0, weight=1)
 
         task_frame = ctk.CTkFrame(tab)
-        task_frame.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
+        task_frame.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 8))
         for column in range(6):
             task_frame.grid_columnconfigure(column, weight=1)
         ctk.CTkLabel(task_frame, text="本次任务", font=ctk.CTkFont(size=24, weight="bold")).grid(
@@ -3730,9 +3757,53 @@ class DashboardApp(ctk.CTk):
             command=lambda: self.tabview.set("高级视觉"),
             width=140,
         ).grid(row=3, column=4, columnspan=2, sticky="w", padx=8, pady=(0, 8))
+        ctk.CTkLabel(task_frame, text="上传延迟策略").grid(row=4, column=0, sticky="w", padx=(16, 8), pady=(0, 12))
+        ctk.CTkOptionMenu(task_frame, variable=self.upload_delay_mode_var, values=["抖动", "稳态"]).grid(
+            row=4, column=1, sticky="w", padx=(0, 12), pady=(0, 12)
+        )
+        ctk.CTkLabel(task_frame, text="文件上传 下限/上限(ms)").grid(row=4, column=2, sticky="w", padx=(0, 8), pady=(0, 12))
+        ctk.CTkEntry(task_frame, textvariable=self.upload_file_delay_min_ms_var, width=100).grid(
+            row=4, column=3, sticky="w", padx=(0, 12), pady=(0, 12)
+        )
+        ctk.CTkEntry(task_frame, textvariable=self.upload_file_delay_max_ms_var, width=100).grid(
+            row=4, column=4, sticky="w", padx=(0, 12), pady=(0, 12)
+        )
+        ctk.CTkLabel(
+            task_frame,
+            text="抖动=每次在区间内取值；稳态=主点下限、兜底中值、强制上限。",
+            text_color="#b8c1cc",
+            justify="left",
+        ).grid(row=4, column=5, sticky="w", padx=(0, 16), pady=(0, 12))
+        ctk.CTkLabel(task_frame, text="Next 下限/上限(ms)").grid(row=5, column=0, sticky="w", padx=(16, 8), pady=(0, 12))
+        ctk.CTkEntry(task_frame, textvariable=self.upload_next_delay_min_ms_var, width=100).grid(
+            row=5, column=1, sticky="w", padx=(0, 12), pady=(0, 12)
+        )
+        ctk.CTkEntry(task_frame, textvariable=self.upload_next_delay_max_ms_var, width=100).grid(
+            row=5, column=2, sticky="w", padx=(0, 12), pady=(0, 12)
+        )
+        ctk.CTkLabel(task_frame, text="Done 下限/上限(ms)").grid(row=5, column=3, sticky="w", padx=(0, 8), pady=(0, 12))
+        ctk.CTkEntry(task_frame, textvariable=self.upload_done_delay_min_ms_var, width=100).grid(
+            row=5, column=4, sticky="w", padx=(0, 12), pady=(0, 12)
+        )
+        ctk.CTkEntry(task_frame, textvariable=self.upload_done_delay_max_ms_var, width=100).grid(
+            row=5, column=5, sticky="w", padx=(0, 12), pady=(0, 12)
+        )
+        ctk.CTkLabel(task_frame, text="Publish 下限/上限(ms)").grid(row=6, column=0, sticky="w", padx=(16, 8), pady=(0, 12))
+        ctk.CTkEntry(task_frame, textvariable=self.upload_publish_delay_min_ms_var, width=100).grid(
+            row=6, column=1, sticky="w", padx=(0, 12), pady=(0, 12)
+        )
+        ctk.CTkEntry(task_frame, textvariable=self.upload_publish_delay_max_ms_var, width=100).grid(
+            row=6, column=2, sticky="w", padx=(0, 12), pady=(0, 12)
+        )
+        ctk.CTkLabel(
+            task_frame,
+            text="这些延迟只影响自动上传链路：文件注入、Next、Done/Save、Publish。",
+            text_color="#b8c1cc",
+            justify="left",
+        ).grid(row=6, column=3, columnspan=3, sticky="w", padx=(0, 16), pady=(0, 12))
 
         option_frame = ctk.CTkFrame(tab)
-        option_frame.grid(row=1, column=0, sticky="ew", padx=16, pady=8)
+        option_frame.grid(row=1, column=0, sticky="ew", padx=8, pady=8)
         option_frame.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             option_frame,
@@ -3742,7 +3813,7 @@ class DashboardApp(ctk.CTk):
         ).grid(row=0, column=0, sticky="w", padx=16, pady=16)
 
         action_frame = ctk.CTkFrame(tab)
-        action_frame.grid(row=2, column=0, sticky="ew", padx=16, pady=8)
+        action_frame.grid(row=2, column=0, sticky="ew", padx=8, pady=8)
         for column in range(5):
             action_frame.grid_columnconfigure(column, weight=1)
         ctk.CTkButton(action_frame, text="预览计划", command=self._preview_plan).grid(
@@ -3762,8 +3833,8 @@ class DashboardApp(ctk.CTk):
         )
 
         self.start_preview = ctk.CTkTextbox(tab, height=420)
-        self.start_preview.grid(row=3, column=0, sticky="nsew", padx=16, pady=(8, 16))
-        tab.grid_rowconfigure(3, weight=1)
+        self.start_preview.grid(row=3, column=0, sticky="nsew", padx=8, pady=(8, 16))
+        self._bind_scroll_frame_wheel(tab, base_tab, tab, task_frame, option_frame, action_frame, self.start_preview, include_textboxes=True)
 
     def _build_paths_tab(self) -> None:
         base_tab = self.tabview.tab("路径配置")
@@ -4090,6 +4161,7 @@ def _patched_launch_stream_upload_for_task(
     *,
     retain_days: str,
     auto_close: bool,
+    delay_settings: dict[str, Any] | None = None,
 ) -> None:
     current_config = dict(run_plan.config or {})
     single_modules = build_module_selection(metadata=False, render=False, upload=True)
@@ -4142,6 +4214,7 @@ def _patched_launch_stream_upload_for_task(
     ]
     if auto_close:
         cmd.append("--auto-close-browser")
+    self._append_upload_delay_args(cmd, delay_settings)
 
     label = runtime_key
     self._log("[Upload] Stream dispatch -> " + " ".join(cmd))
@@ -4224,6 +4297,7 @@ def _patched_dispatch_upload_round(
     *,
     retain_days: str,
     auto_close: bool,
+    delay_settings: dict[str, Any] | None = None,
 ) -> list[str]:
     with self._upload_process_lock:
         self._upload_failures = []
@@ -4240,6 +4314,7 @@ def _patched_dispatch_upload_round(
             output_dir,
             retain_days=retain_days,
             auto_close=auto_close,
+            delay_settings=delay_settings,
         )
         launched += 1
     if launched == 0:
@@ -4262,6 +4337,11 @@ def _patched_start_real_flow(self: DashboardApp) -> None:
         return
     if not self.window_tasks:
         messagebox.showerror("Cannot Start", "Add at least one window task first.")
+        return
+    try:
+        upload_delay_settings = self._collect_upload_delay_settings()
+    except ValueError as exc:
+        messagebox.showerror("Upload Delay Invalid", str(exc))
         return
     if module_selection.metadata:
         if not bool(self.generate_text_var.get()):
@@ -4298,6 +4378,7 @@ def _patched_start_real_flow(self: DashboardApp) -> None:
     upload_runtime = {
         "retain_days": str(self.cleanup_days_var.get().strip() or "5"),
         "auto_close": bool(self.upload_auto_close_var.get()),
+        "delay_settings": upload_delay_settings,
     }
 
     def job() -> bool:
@@ -4357,6 +4438,7 @@ def _patched_start_real_flow(self: DashboardApp) -> None:
                     output_dir,
                     retain_days=upload_runtime["retain_days"],
                     auto_close=upload_runtime["auto_close"],
+                    delay_settings=upload_runtime["delay_settings"],
                 )
 
             if round_plan.modules.render or round_plan.modules.metadata:
@@ -4389,6 +4471,7 @@ def _patched_start_real_flow(self: DashboardApp) -> None:
                     round_plan,
                     retain_days=upload_runtime["retain_days"],
                     auto_close=upload_runtime["auto_close"],
+                    delay_settings=upload_runtime["delay_settings"],
                 )
                 if self._cancel_requested:
                     return False
