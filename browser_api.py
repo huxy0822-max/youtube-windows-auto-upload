@@ -140,7 +140,7 @@ def _post_json(
 
 
 def _post_json_with_curl(url: str, payload: dict[str, Any], *, timeout: int = 60) -> dict[str, Any] | None:
-    """BitBrowser 在部分 macOS 环境下会对 Python HTTP 客户端返回 502，curl 更稳定。"""
+    """BitBrowser 在部分 macOS 环境对 requests 不稳定，curl 更稳。"""
     payload_text = json.dumps(payload or {}, ensure_ascii=False, separators=(",", ":"))
     try:
         completed = subprocess.run(

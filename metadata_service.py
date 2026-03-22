@@ -114,6 +114,14 @@ def _resolve_used_metadata_root_for_write(
     raise last_error
 
 
+def _used_metadata_history_path_for_write(
+    config: dict[str, Any] | None = None,
+    *,
+    log: LogFunc = _noop_log,
+) -> Path:
+    return _resolve_used_metadata_root_for_write(config, log=log) / "used_metadata_history.json"
+
+
 def get_used_metadata_history_path(config: dict[str, Any] | None = None) -> Path:
     return _resolve_used_metadata_root_for_read(config) / "used_metadata_history.json"
 
@@ -228,7 +236,7 @@ def get_used_metadata_scope(
 
 
 def _cache_key_for_history_sync(config: dict[str, Any] | None, tag: str | None) -> str:
-    root = str(get_used_metadata_root(config))
+    root = str(_resolve_used_metadata_root_for_read(config))
     return f"{root.lower()}::{_metadata_key(tag or '*')}"
 
 
@@ -337,7 +345,7 @@ def sync_uploaded_history_into_used_metadata(
         for tag_key, rows in list(tags.items()):
             if isinstance(rows, list):
                 tags[tag_key] = rows[-20000:]
-        _write_json(get_used_metadata_history_path(config), data)
+        _write_json(_used_metadata_history_path_for_write(config), data)
 
     _UPLOAD_HISTORY_SYNC_CACHE[cache_key] = now
     return changed
@@ -470,11 +478,11 @@ def record_used_metadata(
     signature = _record_signature(record)
     all_rows = _iter_metadata_rows(data)
     if signature and any(_record_signature(item) == signature for item in all_rows):
-        _write_json(get_used_metadata_history_path(config), data)
+        _write_json(_used_metadata_history_path_for_write(config), data)
         return
     rows.append(record)
     tags[tag_key] = rows[-max(1000, keep_per_tag):]
-    _write_json(get_used_metadata_history_path(config), data)
+    _write_json(_used_metadata_history_path_for_write(config), data)
 
 
 def archive_uploaded_metadata(
@@ -491,7 +499,7 @@ def archive_uploaded_metadata(
     move_files: bool = True,
     log: LogFunc = _noop_log,
 ) -> Path:
-    root = get_used_metadata_root(config)
+    root = _resolve_used_metadata_root_for_write(config, log=log)
     archive_dir = root / _metadata_key(tag) / f"{date_mmdd}_{serial}"
     archive_dir.mkdir(parents=True, exist_ok=True)
 

@@ -35,6 +35,7 @@ from prompt_studio import (
     load_prompt_studio_config,
     pick_api_preset_name,
     pick_content_template_name,
+    save_prompt_studio_config,
 )
 from path_helpers import normalize_scheduler_config, open_path_in_file_manager
 from run_plan_service import (
@@ -789,33 +790,37 @@ class DashboardApp(ctk.CTk):
 
         add_frame = ctk.CTkFrame(tab)
         add_frame.grid(row=1, column=0, sticky="ew", padx=16, pady=8)
-        for column in range(5):
+        for column in range(6):
             add_frame.grid_columnconfigure(column, weight=1)
-        ctk.CTkLabel(add_frame, text="加入窗口时 YPP").grid(row=0, column=0, sticky="w", padx=(16, 8), pady=(14, 6))
+        ctk.CTkLabel(add_frame, text="????? YPP").grid(row=0, column=0, sticky="w", padx=(16, 8), pady=(14, 6))
         ctk.CTkOptionMenu(add_frame, variable=self.add_ypp_var, values=YES_NO_VALUES).grid(
             row=1, column=0, sticky="ew", padx=(16, 8), pady=(0, 14)
         )
-        ctk.CTkLabel(add_frame, text="数量(每窗口)").grid(row=0, column=1, sticky="w", padx=8, pady=(14, 6))
+        ctk.CTkLabel(add_frame, text="??(???)").grid(row=0, column=1, sticky="w", padx=8, pady=(14, 6))
         ctk.CTkEntry(add_frame, textvariable=self.add_quantity_var).grid(
             row=1, column=1, sticky="ew", padx=8, pady=(0, 14)
         )
-        ctk.CTkLabel(add_frame, text="分类").grid(row=0, column=2, sticky="w", padx=8, pady=(14, 6))
-        ctk.CTkOptionMenu(add_frame, variable=self.add_category_var, values=CATEGORY_VALUES).grid(
+        ctk.CTkLabel(add_frame, text="???").grid(row=0, column=2, sticky="w", padx=8, pady=(14, 6))
+        ctk.CTkOptionMenu(add_frame, variable=self.add_visibility_var, values=VISIBILITY_VALUES).grid(
             row=1, column=2, sticky="ew", padx=8, pady=(0, 14)
         )
-        ctk.CTkLabel(add_frame, text="儿童内容").grid(row=0, column=3, sticky="w", padx=8, pady=(14, 6))
-        ctk.CTkOptionMenu(add_frame, variable=self.add_kids_var, values=YES_NO_VALUES).grid(
+        ctk.CTkLabel(add_frame, text="??").grid(row=0, column=3, sticky="w", padx=8, pady=(14, 6))
+        ctk.CTkOptionMenu(add_frame, variable=self.add_category_var, values=CATEGORY_VALUES).grid(
             row=1, column=3, sticky="ew", padx=8, pady=(0, 14)
         )
-        ctk.CTkLabel(add_frame, text="AI 内容").grid(row=0, column=4, sticky="w", padx=8, pady=(14, 6))
+        ctk.CTkLabel(add_frame, text="????").grid(row=0, column=4, sticky="w", padx=8, pady=(14, 6))
+        ctk.CTkOptionMenu(add_frame, variable=self.add_kids_var, values=YES_NO_VALUES).grid(
+            row=1, column=4, sticky="ew", padx=8, pady=(0, 14)
+        )
+        ctk.CTkLabel(add_frame, text="AI ??").grid(row=0, column=5, sticky="w", padx=8, pady=(14, 6))
         ctk.CTkOptionMenu(add_frame, variable=self.add_ai_var, values=YES_NO_VALUES).grid(
-            row=1, column=4, sticky="ew", padx=(8, 16), pady=(0, 14)
+            row=1, column=5, sticky="ew", padx=(8, 16), pady=(0, 14)
         )
         ctk.CTkCheckBox(
             add_frame,
             text="通知订阅用户",
             variable=self.add_notify_var,
-        ).grid(row=2, column=4, sticky="w", padx=8, pady=(0, 6))
+        ).grid(row=2, column=5, sticky="w", padx=8, pady=(0, 6))
         self.add_schedule_checkbox = ctk.CTkCheckBox(
             add_frame,
             text="窗口定时覆盖",
@@ -2222,7 +2227,7 @@ class DashboardApp(ctk.CTk):
             quantity=quantity,
             is_ypp=_bool_from_yes_no(self.add_ypp_var.get()) or bool(info.is_ypp),
             title="",
-            visibility="schedule" if self.add_schedule_enabled_var.get() else self.default_visibility_var.get(),
+            visibility="schedule" if self.add_schedule_enabled_var.get() else self.add_visibility_var.get(),
             category=self.add_category_var.get(),
             made_for_kids=_bool_from_yes_no(self.add_kids_var.get()),
             altered_content=_bool_from_yes_no(self.add_ai_var.get()),
@@ -2437,17 +2442,6 @@ class DashboardApp(ctk.CTk):
             f"API={api_name} | 内容模板={content_name}"
         )
 
-    def _sync_prompt_selection_from_group(self) -> None:
-        self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
-        tag = self.prompt_group_var.get()
-        api_name = pick_api_preset_name(self.prompt_config, tag)
-        content_name = pick_content_template_name(self.prompt_config, tag)
-        self._loading_prompt_form = True
-        self.api_preset_var.set(api_name)
-        self.content_template_var.set(content_name)
-
-        self._load_prompt_for_group()
-
     def _load_prompt_for_group(self) -> None:
         self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
         tag = self.prompt_group_var.get()
@@ -2528,27 +2522,21 @@ class DashboardApp(ctk.CTk):
         self._log(f"[提示词] 已保存内容模板: {name}")
 
     def _bind_group_api(self) -> None:
-        ensure_prompt_presets(
-            api_name=self.api_preset_var.get().strip() or "默认API模板",
-            api_payload=self._current_api_form(),
-            content_name=self.content_template_var.get().strip() or "默认内容模板",
-            content_payload=self._current_content_form(),
-            tag=self.prompt_group_var.get(),
-            path=PROMPT_STUDIO_FILE,
-        )
-        self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
+        tag = self.prompt_group_var.get().strip()
+        name = self.api_preset_var.get().strip() or "默认API模板"
+        config = load_prompt_studio_config(PROMPT_STUDIO_FILE)
+        config.setdefault("tagApiBindings", {})[tag] = name
+        save_prompt_studio_config(PROMPT_STUDIO_FILE, config)
+        self.prompt_config = config
         self._log(f"[提示词] {self.prompt_group_var.get()} 已绑定 API 模板 {self.api_preset_var.get()}")
 
     def _bind_group_content(self) -> None:
-        ensure_prompt_presets(
-            api_name=self.api_preset_var.get().strip() or "默认API模板",
-            api_payload=self._current_api_form(),
-            content_name=self.content_template_var.get().strip() or "默认内容模板",
-            content_payload=self._current_content_form(),
-            tag=self.prompt_group_var.get(),
-            path=PROMPT_STUDIO_FILE,
-        )
-        self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
+        tag = self.prompt_group_var.get().strip()
+        name = self.content_template_var.get().strip() or "默认内容模板"
+        config = load_prompt_studio_config(PROMPT_STUDIO_FILE)
+        config.setdefault("tagBindings", {})[tag] = name
+        save_prompt_studio_config(PROMPT_STUDIO_FILE, config)
+        self.prompt_config = config
         self._log(f"[提示词] {self.prompt_group_var.get()} 已绑定内容模板 {self.content_template_var.get()}")
 
     def _test_text_api(self) -> None:
@@ -2688,7 +2676,6 @@ class DashboardApp(ctk.CTk):
     def _append_upload_delay_args(self, cmd: list[str], delay_settings: dict[str, Any] | None) -> None:
         if not delay_settings:
             return
-
         mode = str(delay_settings.get("mode") or "steady").strip().lower()
         if mode in {"jitter", "steady"}:
             cmd.extend(["--click-delay-mode", mode])
@@ -3233,15 +3220,11 @@ class DashboardApp(ctk.CTk):
         )
 
     def _build_start_tab(self) -> None:
-        base_tab = self.tabview.tab("快捷开始")
-        base_tab.grid_columnconfigure(0, weight=1)
-        base_tab.grid_rowconfigure(0, weight=1)
-        tab = ctk.CTkScrollableFrame(base_tab)
-        tab.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+        tab = self.tabview.tab("快捷开始")
         tab.grid_columnconfigure(0, weight=1)
 
         task_frame = ctk.CTkFrame(tab)
-        task_frame.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 8))
+        task_frame.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
         for column in range(6):
             task_frame.grid_columnconfigure(column, weight=1)
         ctk.CTkLabel(task_frame, text="本次任务", font=ctk.CTkFont(size=24, weight="bold")).grid(

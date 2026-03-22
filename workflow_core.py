@@ -8,13 +8,21 @@ import shutil
 import subprocess
 import threading
 import time
-from dataclasses import asdict, dataclass, field
+import sys
+from dataclasses import asdict, dataclass as _dataclass, field
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
+
+
+def dataclass(*args, **kwargs):
+    if sys.version_info < (3, 10) and "slots" in kwargs:
+        kwargs = dict(kwargs)
+        kwargs.pop("slots", None)
+    return _dataclass(*args, **kwargs)
 
 from content_generation import (
     call_image_model,

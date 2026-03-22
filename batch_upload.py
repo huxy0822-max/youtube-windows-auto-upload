@@ -519,7 +519,7 @@ async def clear_blocking_overlays(page, reason: str = ""):
         pass
 
 async def human_click(page, locator, desc="", delay_profile: str = "generic"):
-    """优先直接点击，只有常规点击失败时才回退到坐标点击。"""
+    """优先直接点击，失败时再回退到坐标点击。"""
     log(f"点击: {desc}", "ACT")
     try:
         await clear_blocking_overlays(page, "pre-click")
@@ -536,8 +536,8 @@ async def human_click(page, locator, desc="", delay_profile: str = "generic"):
         except Exception as direct_exc:
             box = await locator.bounding_box()
             if box:
-                x = box["x"] + box["width"] * random.uniform(0.3, 0.7)
-                y = box["y"] + box["height"] * random.uniform(0.3, 0.7)
+                x = box['x'] + box['width'] * random.uniform(0.3, 0.7)
+                y = box['y'] + box['height'] * random.uniform(0.3, 0.7)
                 await upload_click_delay(delay_profile, stage="fallback")
                 await page.mouse.click(x, y)
             else:
