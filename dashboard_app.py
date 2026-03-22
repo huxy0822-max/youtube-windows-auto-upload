@@ -67,6 +67,8 @@ from workflow_core import (
     save_scheduler_settings,
     save_window_plan,
     set_group_binding,
+    task_round_label,
+    task_runtime_key,
 )
 
 SCRIPT_DIR = Path(__file__).parent
@@ -444,6 +446,7 @@ class DashboardApp(ctk.CTk):
         self.current_group_var = ctk.StringVar(value=current_group)
         self.source_dir_override_var = ctk.StringVar(value=state.get("source_dir_override", ""))
         self.add_ypp_var = ctk.StringVar(value=state.get("add_ypp", "no"))
+        self.add_quantity_var = ctk.StringVar(value=str(state.get("add_quantity", "1")))
         self.add_title_var = ctk.StringVar(value=state.get("add_title", ""))
         self.add_visibility_var = ctk.StringVar(value=state.get("add_visibility", "public"))
         self.add_category_var = ctk.StringVar(value=state.get("add_category", "Music"))
@@ -545,7 +548,7 @@ class DashboardApp(ctk.CTk):
         self._run_phase: str = "空闲"
         self._run_include_upload: bool = False
         self._run_render_done: set[str] = set()
-        self._run_upload_done: set[int] = set()
+        self._run_upload_done: set[str] = set()
         self.execution_control: ExecutionControl | None = None
         self._run_paused: bool = False
         self._cancel_requested: bool = False
@@ -752,31 +755,35 @@ class DashboardApp(ctk.CTk):
 
         add_frame = ctk.CTkFrame(tab)
         add_frame.grid(row=1, column=0, sticky="ew", padx=16, pady=8)
-        for column in range(6):
+        for column in range(7):
             add_frame.grid_columnconfigure(column, weight=1)
         ctk.CTkLabel(add_frame, text="加入窗口时 YPP").grid(row=0, column=0, sticky="w", padx=(16, 8), pady=(14, 6))
         ctk.CTkOptionMenu(add_frame, variable=self.add_ypp_var, values=YES_NO_VALUES).grid(
             row=1, column=0, sticky="ew", padx=(16, 8), pady=(0, 14)
         )
+        ctk.CTkLabel(add_frame, text="数量").grid(row=0, column=1, sticky="w", padx=8, pady=(14, 6))
+        ctk.CTkEntry(add_frame, textvariable=self.add_quantity_var).grid(
+            row=1, column=1, sticky="ew", padx=8, pady=(0, 14)
+        )
         ctk.CTkLabel(add_frame, text="自定义标题").grid(row=0, column=1, sticky="w", padx=8, pady=(14, 6))
         ctk.CTkEntry(add_frame, textvariable=self.add_title_var).grid(
-            row=1, column=1, sticky="ew", padx=8, pady=(0, 14)
+            row=1, column=2, sticky="ew", padx=8, pady=(0, 14)
         )
         ctk.CTkLabel(add_frame, text="可见性").grid(row=0, column=2, sticky="w", padx=8, pady=(14, 6))
         ctk.CTkOptionMenu(add_frame, variable=self.add_visibility_var, values=VISIBILITY_VALUES).grid(
-            row=1, column=2, sticky="ew", padx=8, pady=(0, 14)
+            row=1, column=3, sticky="ew", padx=8, pady=(0, 14)
         )
         ctk.CTkLabel(add_frame, text="分类").grid(row=0, column=3, sticky="w", padx=8, pady=(14, 6))
         ctk.CTkOptionMenu(add_frame, variable=self.add_category_var, values=CATEGORY_VALUES).grid(
-            row=1, column=3, sticky="ew", padx=8, pady=(0, 14)
+            row=1, column=4, sticky="ew", padx=8, pady=(0, 14)
         )
         ctk.CTkLabel(add_frame, text="儿童内容").grid(row=0, column=4, sticky="w", padx=8, pady=(14, 6))
         ctk.CTkOptionMenu(add_frame, variable=self.add_kids_var, values=YES_NO_VALUES).grid(
-            row=1, column=4, sticky="ew", padx=8, pady=(0, 14)
+            row=1, column=5, sticky="ew", padx=8, pady=(0, 14)
         )
         ctk.CTkLabel(add_frame, text="AI 内容").grid(row=0, column=5, sticky="w", padx=8, pady=(14, 6))
         ctk.CTkOptionMenu(add_frame, variable=self.add_ai_var, values=YES_NO_VALUES).grid(
-            row=1, column=5, sticky="ew", padx=(8, 16), pady=(0, 14)
+            row=1, column=6, sticky="ew", padx=(8, 16), pady=(0, 14)
         )
         ctk.CTkCheckBox(
             add_frame,
@@ -813,7 +820,7 @@ class DashboardApp(ctk.CTk):
 
         default_frame = ctk.CTkFrame(tab)
         default_frame.grid(row=2, column=0, sticky="ew", padx=16, pady=8)
-        for column in range(6):
+        for column in range(7):
             default_frame.grid_columnconfigure(column, weight=1)
         ctk.CTkLabel(default_frame, text="统一默认规则", font=ctk.CTkFont(size=22, weight="bold")).grid(
             row=0, column=0, columnspan=6, sticky="w", padx=16, pady=(14, 12)
@@ -894,11 +901,12 @@ class DashboardApp(ctk.CTk):
         ctk.CTkButton(action_bar, text="清空任务", command=self._clear_tasks).pack(side="left", padx=6)
         ctk.CTkButton(action_bar, text="恢复分组绑定目录", command=self._fill_binding_source).pack(side="left", padx=6)
 
-        columns = ("tag", "serial", "ypp", "visibility", "category", "kids", "ai", "schedule", "source")
+        columns = ("tag", "serial", "quantity", "ypp", "visibility", "category", "kids", "ai", "schedule", "source")
         self.task_tree = ttk.Treeview(task_frame, columns=columns, show="headings", height=14)
         for key, width in {
             "tag": 180,
             "serial": 80,
+            "quantity": 70,
             "ypp": 60,
             "visibility": 90,
             "category": 130,
@@ -1484,6 +1492,7 @@ class DashboardApp(ctk.CTk):
             "current_group": self.current_group_var.get(),
             "source_dir_override": self.source_dir_override_var.get(),
             "add_ypp": self.add_ypp_var.get(),
+            "add_quantity": self.add_quantity_var.get(),
             "add_title": self.add_title_var.get(),
             "add_visibility": self.add_visibility_var.get(),
             "add_category": self.add_category_var.get(),
@@ -1659,8 +1668,28 @@ class DashboardApp(ctk.CTk):
         self.run_last_log_var.set("任务已启动，等待第一条日志")
         self._apply_run_status()
 
-    def _task_result_key(self, tag: str, serial: int) -> str:
-        return f"{str(tag or '').strip()}/{int(serial)}"
+    def _task_result_key(self, tag: str, serial: int, slot_index: int = 1, total_slots: int = 1) -> str:
+        clean_tag = str(tag or "").strip()
+        base = f"{clean_tag}/{int(serial)}"
+        if int(total_slots or 1) <= 1:
+            return base
+        return f"{base}#{int(slot_index or 1):02d}"
+
+    def _parse_task_label(self, label: str) -> tuple[str, int, int, int] | None:
+        text = str(label or "").strip()
+        if not text or "/" not in text:
+            return None
+        tag_name, right = text.rsplit("/", 1)
+        slot_match = re.fullmatch(r"(\d+)#(\d+)", right)
+        if slot_match:
+            return tag_name.strip(), int(slot_match.group(1)), int(slot_match.group(2)), 2
+        round_match = re.fullmatch(r"(\d+)\[(\d+)/(\d+)\]", right)
+        if round_match:
+            return tag_name.strip(), int(round_match.group(1)), int(round_match.group(2)), int(round_match.group(3))
+        try:
+            return tag_name.strip(), int(right), 1, 1
+        except ValueError:
+            return None
 
     def _lookup_task_tag(self, serial: int) -> str:
         run_plan = self._run_plan_for_summary
@@ -1675,7 +1704,12 @@ class DashboardApp(ctk.CTk):
         result_map: dict[str, dict[str, dict[str, str]]] = {}
         modules = getattr(run_plan, "modules", None)
         for task in getattr(run_plan, "tasks", []) or []:
-            key = self._task_result_key(task.tag, task.serial)
+            key = self._task_result_key(
+                task.tag,
+                task.serial,
+                getattr(task, "slot_index", 1),
+                getattr(task, "total_slots", 1),
+            )
             stages: dict[str, dict[str, str]] = {}
             if getattr(modules, "render", False):
                 stages["render"] = {"status": "pending", "detail": ""}
@@ -1686,8 +1720,18 @@ class DashboardApp(ctk.CTk):
             result_map[key] = stages
         self._run_result_map = result_map
 
-    def _mark_run_stage(self, tag: str, serial: int, stage: str, status: str, detail: str = "") -> None:
-        key = self._task_result_key(tag, serial)
+    def _mark_run_stage(
+        self,
+        tag: str,
+        serial: int,
+        stage: str,
+        status: str,
+        detail: str = "",
+        *,
+        slot_index: int = 1,
+        total_slots: int = 1,
+    ) -> None:
+        key = self._task_result_key(tag, serial, slot_index, total_slots)
         entry = self._run_result_map.setdefault(key, {})
         stage_entry = entry.setdefault(stage, {"status": "pending", "detail": ""})
         stage_entry["status"] = status
@@ -2014,6 +2058,7 @@ class DashboardApp(ctk.CTk):
                 values=(
                     task.tag,
                     task.serial,
+                    max(1, int(getattr(task, "quantity", 1) or 1)),
                     _yes_no_from_bool(task.is_ypp),
                     task.visibility,
                     task.category,
@@ -2128,9 +2173,16 @@ class DashboardApp(ctk.CTk):
         self._refresh_schedule_controls()
 
     def _add_window_task(self, info) -> None:
+        quantity_text = str(self.add_quantity_var.get() or "1").strip()
+        try:
+            quantity = max(1, int(quantity_text or "1"))
+        except ValueError:
+            quantity = 1
+            self.add_quantity_var.set("1")
         task = create_task(
             tag=info.tag,
             serial=info.serial,
+            quantity=quantity,
             is_ypp=_bool_from_yes_no(self.add_ypp_var.get()) or bool(info.is_ypp),
             title=self.add_title_var.get(),
             visibility="schedule" if self.add_schedule_enabled_var.get() else self.add_visibility_var.get(),
@@ -2991,6 +3043,7 @@ class DashboardApp(ctk.CTk):
             cloned = create_task(
                 tag=task.tag,
                 serial=task.serial,
+                quantity=task.quantity,
                 is_ypp=task.is_ypp,
                 title=task.title,
                 description=task.description,
@@ -3003,6 +3056,9 @@ class DashboardApp(ctk.CTk):
                 schedule_timezone=task.schedule_timezone,
                 source_dir=live_source_dir if should_override_source else task.source_dir,
                 channel_name=task.channel_name,
+                slot_index=getattr(task, "slot_index", 1),
+                total_slots=getattr(task, "total_slots", 1),
+                round_index=getattr(task, "round_index", 1),
             )
             cloned.tag_list = [str(item).strip() for item in task.tag_list if str(item).strip()]
             cloned.thumbnails = [str(item).strip() for item in task.thumbnails if str(item).strip()]
@@ -3693,6 +3749,577 @@ class DashboardApp(ctk.CTk):
     def _on_close(self) -> None:
         self._save_state()
         self.destroy()
+
+
+def _patched_refresh_task_tree(self: DashboardApp) -> None:
+    for item in self.task_tree.get_children():
+        self.task_tree.delete(item)
+    bindings = get_group_bindings(self.scheduler_config)
+    for index, task in enumerate(self.window_tasks):
+        source_text = str(task.source_dir or "").strip() or bindings.get(task.tag, "")
+        self.task_tree.insert(
+            "",
+            "end",
+            iid=str(index),
+            values=(
+                task.tag,
+                task.serial,
+                max(1, int(getattr(task, "quantity", 1) or 1)),
+                _yes_no_from_bool(task.is_ypp),
+                task.visibility,
+                task.category,
+                _yes_no_from_bool(task.made_for_kids),
+                _yes_no_from_bool(task.altered_content),
+                task.scheduled_publish_at,
+                source_text,
+            ),
+        )
+    self._save_state()
+
+
+def _patched_add_window_task(self: DashboardApp, info: Any) -> None:
+    quantity_text = str(self.add_quantity_var.get() or "1").strip()
+    try:
+        quantity = max(1, int(quantity_text or "1"))
+    except ValueError:
+        quantity = 1
+        self.add_quantity_var.set("1")
+    task = create_task(
+        tag=info.tag,
+        serial=info.serial,
+        quantity=quantity,
+        is_ypp=_bool_from_yes_no(self.add_ypp_var.get()) or bool(info.is_ypp),
+        title=self.add_title_var.get(),
+        visibility="schedule" if self.add_schedule_enabled_var.get() else self.add_visibility_var.get(),
+        category=self.add_category_var.get(),
+        made_for_kids=_bool_from_yes_no(self.add_kids_var.get()),
+        altered_content=_bool_from_yes_no(self.add_ai_var.get()),
+        notify_subscribers=bool(self.add_notify_var.get()),
+        scheduled_publish_at=self._compose_add_schedule(),
+        schedule_timezone=self.add_schedule_timezone_var.get() if self.add_schedule_enabled_var.get() else "",
+        source_dir=self.source_dir_override_var.get(),
+        channel_name=info.channel_name,
+    )
+    for index, existing in enumerate(self.window_tasks):
+        if existing.tag == task.tag and existing.serial == task.serial:
+            self.window_tasks[index] = task
+            break
+    else:
+        self.window_tasks.append(task)
+    self._refresh_task_tree()
+    self._preview_plan()
+
+
+def _patched_runtime_window_tasks(self: DashboardApp) -> list[WindowTask]:
+    selected_tag = str(self.current_group_var.get() or "").strip()
+    live_source_dir = str(self.source_dir_override_var.get() or "").strip()
+    tags = [str(task.tag or "").strip() for task in self.window_tasks if str(task.tag or "").strip()]
+    unique_tags = list(dict.fromkeys(tags))
+    single_tag_mode = len(unique_tags) == 1
+
+    runtime_tasks: list[WindowTask] = []
+    for task in self.window_tasks:
+        should_override_source = False
+        if single_tag_mode:
+            should_override_source = True
+        elif selected_tag and str(task.tag or "").strip() == selected_tag:
+            should_override_source = True
+
+        cloned = create_task(
+            tag=task.tag,
+            serial=task.serial,
+            quantity=getattr(task, "quantity", 1),
+            is_ypp=task.is_ypp,
+            title=task.title,
+            description=task.description,
+            visibility=task.visibility,
+            category=task.category,
+            made_for_kids=task.made_for_kids,
+            altered_content=task.altered_content,
+            notify_subscribers=task.notify_subscribers,
+            scheduled_publish_at=task.scheduled_publish_at,
+            schedule_timezone=task.schedule_timezone,
+            source_dir=live_source_dir if should_override_source else task.source_dir,
+            channel_name=task.channel_name,
+            slot_index=getattr(task, "slot_index", 1),
+            total_slots=getattr(task, "total_slots", 1),
+            round_index=getattr(task, "round_index", 1),
+        )
+        cloned.tag_list = [str(item).strip() for item in task.tag_list if str(item).strip()]
+        cloned.thumbnails = [str(item).strip() for item in task.thumbnails if str(item).strip()]
+        cloned.ab_titles = [str(item).strip() for item in task.ab_titles if str(item).strip()]
+        runtime_tasks.append(cloned)
+    return runtime_tasks
+
+
+def _patched_run_progress_step_done(self: DashboardApp, step_key: str, step_type: str) -> None:
+    target_set = self._run_render_done if step_type == "render" else self._run_upload_done
+    marker = str(step_key)
+    if marker in target_set:
+        return
+    target_set.add(marker)
+    self._run_completed_steps = min(self._run_total_steps, self._run_completed_steps + 1)
+    self._run_current_ratio = 0.0
+
+
+def _patched_ingest_execution_result(self: DashboardApp, execution: Any) -> None:
+    self._run_execution_result = execution
+    run_plan = getattr(execution, "run_plan", None) if execution else None
+    workflow_result = getattr(execution, "workflow_result", None) if execution else None
+    if not run_plan:
+        return
+    modules = getattr(run_plan, "modules", None)
+    warning_lines = [str(warning or "").strip() for warning in (getattr(workflow_result, "warnings", []) or [])]
+    warning_map: dict[str, str] = {}
+    for task in getattr(run_plan, "tasks", []) or []:
+        task_key = self._task_result_key(task.tag, task.serial, getattr(task, "slot_index", 1), getattr(task, "total_slots", 1))
+        runtime_label = f"{task.tag}/{task_round_label(task)}"
+        for warning in warning_lines:
+            if runtime_label in warning or task_runtime_key(task) in warning:
+                detail = warning.split(":", 1)[-1].strip() if ":" in warning else warning
+                warning_map[task_key] = detail
+                break
+    item_map = {
+        self._task_result_key(
+            item.tag,
+            item.serial,
+            getattr(item, "slot_index", 1),
+            getattr(item, "total_slots", 1),
+        ): item
+        for item in (getattr(workflow_result, "items", []) or [])
+    }
+    for task in getattr(run_plan, "tasks", []) or []:
+        slot_index = getattr(task, "slot_index", 1)
+        total_slots = getattr(task, "total_slots", 1)
+        key = self._task_result_key(task.tag, task.serial, slot_index, total_slots)
+        item = item_map.get(key)
+        if getattr(modules, "render", False):
+            if item and str(getattr(item, "output_video", "")).strip():
+                self._mark_run_stage(task.tag, task.serial, "render", "success", slot_index=slot_index, total_slots=total_slots)
+            else:
+                self._mark_run_stage(task.tag, task.serial, "render", "failed", "no rendered video", slot_index=slot_index, total_slots=total_slots)
+            self._run_progress_step_done(key, "render")
+        elif getattr(modules, "metadata", False):
+            self._run_progress_step_done(key, "render")
+        if getattr(modules, "metadata", False):
+            metadata_error = warning_map.get(key)
+            if metadata_error:
+                self._mark_run_stage(task.tag, task.serial, "metadata", "failed", metadata_error, slot_index=slot_index, total_slots=total_slots)
+                if getattr(modules, "upload", False):
+                    self._mark_run_stage(task.tag, task.serial, "upload", "skipped", "metadata failed", slot_index=slot_index, total_slots=total_slots)
+            elif item:
+                self._mark_run_stage(task.tag, task.serial, "metadata", "success", slot_index=slot_index, total_slots=total_slots)
+        if getattr(modules, "upload", False) and key not in warning_map and key in item_map:
+            current = self._run_result_map.get(key, {}).get("upload", {})
+            if current.get("status") == "pending":
+                self._mark_run_stage(task.tag, task.serial, "upload", "running", "waiting upload result", slot_index=slot_index, total_slots=total_slots)
+
+
+def _patched_sync_upload_results_from_records(self: DashboardApp) -> None:
+    run_plan = self._run_plan_for_summary
+    if not run_plan or not getattr(getattr(run_plan, "modules", None), "upload", False):
+        return
+    date_mmdd = str(getattr(getattr(run_plan, "defaults", None), "date_mmdd", "")).strip()
+    for task in getattr(run_plan, "tasks", []) or []:
+        if int(getattr(task, "total_slots", 1) or 1) > 1:
+            continue
+        record = self._load_upload_record_result(date_mmdd, task.tag, task.serial)
+        if not record:
+            continue
+        if bool(record.get("success")):
+            self._mark_run_stage(task.tag, task.serial, "upload", "success", str(record.get("stage") or "upload success"))
+        else:
+            detail = str(record.get("failure_reason") or record.get("stage") or "upload failed")
+            self._mark_run_stage(task.tag, task.serial, "upload", "failed", detail)
+
+
+def _patched_update_run_status_from_log(self: DashboardApp, message: str) -> None:
+    text = str(message or "").strip()
+    if not text:
+        return
+    self.run_last_log_var.set(text[:120])
+    if not self._run_started_at:
+        return
+    if text.startswith("[任务]"):
+        match = re.search(r"\[任务\]\s+([^/]+)/([0-9]+(?:\[[0-9]+/[0-9]+\])?):", text)
+        if match:
+            self._run_phase = "render"
+            self._run_current_item = f"{match.group(1)} / 窗口 {match.group(2)}"
+            self._run_current_ratio = 0.0
+    elif text.startswith("[渲染]"):
+        self._run_phase = "render"
+        progress_match = re.search(r"进度\s+(\d+)%", text)
+        if progress_match:
+            self._run_current_ratio = max(0.0, min(1.0, int(progress_match.group(1)) / 100.0))
+    elif text.startswith("[清单]"):
+        self._run_phase = "manifest"
+    elif text.startswith("[上传]"):
+        self._run_phase = "upload"
+    elif text.startswith("[Round]"):
+        self._run_phase = "round dispatch"
+
+    upload_match = re.match(r"\[Upload ([^\]]+)\]\s+(.*)$", text)
+    if upload_match:
+        label = upload_match.group(1)
+        upload_text = upload_match.group(2).strip()
+        parsed = self._parse_task_label(label)
+        if parsed:
+            tag_name, serial_value, slot_index, total_slots = parsed
+            fail_match = re.search(r"上传失败\(stage=([^)]+)\)", upload_text)
+            if fail_match:
+                self._mark_run_stage(tag_name, serial_value, "upload", "failed", fail_match.group(1), slot_index=slot_index, total_slots=total_slots)
+                self._run_progress_step_done(label, "upload")
+            elif "发布成功" in upload_text or "上传成功" in upload_text:
+                self._mark_run_stage(tag_name, serial_value, "upload", "success", "upload success", slot_index=slot_index, total_slots=total_slots)
+                self._run_progress_step_done(label, "upload")
+                self._run_phase = "upload done"
+    self._apply_run_status()
+
+
+def _patched_launch_stream_upload_for_task(
+    self: DashboardApp,
+    run_plan,
+    task: WindowTask,
+    output_dir: Path,
+    *,
+    retain_days: str,
+    auto_close: bool,
+) -> None:
+    current_config = dict(run_plan.config or {})
+    single_modules = build_module_selection(metadata=False, render=False, upload=True)
+    single_run_plan = build_run_plan(
+        tasks=[task],
+        defaults=run_plan.defaults,
+        modules=single_modules,
+        config=current_config,
+    )
+    plan = deepcopy(single_run_plan.window_plan)
+    plan["tasks"] = [task.to_plan_dict(1)]
+    plan["groups"] = {task.tag: [int(task.serial)]}
+    plan["tags"] = [task.tag]
+    plan["default_tag"] = task.tag
+    plan["tag_output_dirs"] = {task.tag: str(output_dir)}
+    slot_suffix = f"_{int(getattr(task, 'slot_index', 1)):02d}" if int(getattr(task, "total_slots", 1) or 1) > 1 else ""
+    plan_path = save_window_plan(
+        plan,
+        run_plan.defaults.date_mmdd,
+        path=SCRIPT_DIR / "data" / f"window_upload_plan_{run_plan.defaults.date_mmdd}_{task.serial}{slot_suffix}.json",
+    )
+    runtime_key = task_runtime_key(task)
+    self._mark_run_stage(
+        task.tag,
+        task.serial,
+        "upload",
+        "running",
+        "dispatching upload process",
+        slot_index=getattr(task, "slot_index", 1),
+        total_slots=getattr(task, "total_slots", 1),
+    )
+    self._log(
+        f"[Upload] {runtime_key} 使用单任务上传计划 | output={output_dir} | metadata={single_run_plan.metadata_root}"
+    )
+    cmd = [
+        sys.executable,
+        "-u",
+        str(UPLOAD_SCRIPT),
+        "--tag",
+        task.tag,
+        "--date",
+        run_plan.defaults.date_mmdd,
+        "--channel",
+        str(task.serial),
+        "--auto-confirm",
+        "--window-plan-file",
+        str(plan_path),
+        "--retain-video-days",
+        retain_days,
+    ]
+    if auto_close:
+        cmd.append("--auto-close-browser")
+
+    label = runtime_key
+    self._log("[Upload] Stream dispatch -> " + " ".join(cmd))
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(SCRIPT_DIR),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=_subprocess_utf8_env(),
+    )
+    with self._upload_process_lock:
+        self.worker_processes.append(proc)
+
+    def reader() -> None:
+        error_text = ""
+        completed_ok = False
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                self._log(f"[Upload {label}] {line.rstrip()}")
+            return_code = proc.wait()
+            if return_code != 0 and not self._cancel_requested:
+                error_text = f"{label} exit {return_code}"
+            else:
+                completed_ok = not self._cancel_requested
+        except Exception as exc:
+            if not self._cancel_requested:
+                error_text = f"{label}: {exc}"
+        finally:
+            with self._upload_process_lock:
+                try:
+                    self.worker_processes.remove(proc)
+                except ValueError:
+                    pass
+                if error_text:
+                    self._upload_failures.append(error_text)
+            if error_text:
+                self._post_ui_action(
+                    lambda detail=error_text, task=task: (
+                        self._mark_run_stage(
+                            task.tag,
+                            task.serial,
+                            "upload",
+                            "failed",
+                            detail,
+                            slot_index=getattr(task, "slot_index", 1),
+                            total_slots=getattr(task, "total_slots", 1),
+                        ),
+                        self._run_progress_step_done(task_runtime_key(task), "upload"),
+                    )
+                )
+            elif completed_ok:
+                self._post_ui_action(
+                    lambda task=task: (
+                        self._mark_run_stage(
+                            task.tag,
+                            task.serial,
+                            "upload",
+                            "success",
+                            "upload success",
+                            slot_index=getattr(task, "slot_index", 1),
+                            total_slots=getattr(task, "total_slots", 1),
+                        ),
+                        self._run_progress_step_done(task_runtime_key(task), "upload"),
+                    )
+                )
+
+    thread = threading.Thread(target=reader, daemon=True)
+    with self._upload_process_lock:
+        self.upload_monitor_threads.append(thread)
+    thread.start()
+
+
+def _patched_dispatch_upload_round(
+    self: DashboardApp,
+    run_plan,
+    *,
+    retain_days: str,
+    auto_close: bool,
+) -> list[str]:
+    with self._upload_process_lock:
+        self._upload_failures = []
+    launched = 0
+    output_dirs = dict(run_plan.window_plan.get("tag_output_dirs") or {})
+    for task in run_plan.tasks:
+        output_dir = Path(output_dirs.get(task.tag) or run_plan.output_root)
+        manifest_path = output_dir / "upload_manifest.json"
+        self._assert_manifest_ready_for_upload(manifest_path=manifest_path, task=task, output_dir=output_dir)
+        self._log(f"[Upload] Round dispatch -> {task_runtime_key(task)} | output={output_dir}")
+        self._launch_stream_upload_for_task(
+            run_plan,
+            task,
+            output_dir,
+            retain_days=retain_days,
+            auto_close=auto_close,
+        )
+        launched += 1
+    if launched == 0:
+        return []
+    return self._wait_for_stream_uploads()
+
+
+def _patched_start_real_flow(self: DashboardApp) -> None:
+    saved_config = self._save_paths()
+    self._log(
+        "[Paths] 本次运行使用: "
+        f"metadata={saved_config.get('metadata_root')} | "
+        f"music={saved_config.get('music_dir')} | "
+        f"image={saved_config.get('base_image_dir')} | "
+        f"output={saved_config.get('output_root')}"
+    )
+    module_selection = self._current_module_selection()
+    if not module_selection.any_selected():
+        messagebox.showerror("Cannot Start", "Select at least one module first.")
+        return
+    if not self.window_tasks:
+        messagebox.showerror("Cannot Start", "Add at least one window task first.")
+        return
+    if module_selection.metadata:
+        if not bool(self.generate_text_var.get()):
+            self.generate_text_var.set(True)
+        if not bool(self.generate_thumbnails_var.get()):
+            self.generate_thumbnails_var.set(True)
+        self._log("[Metadata] Quick Start 已勾选文案模块，本次强制走 API 生成标题/简介/标签，缩略图优先走图片 API。")
+    self._persist_prompt_form_for_active_tasks()
+    full_run_plan = self._build_current_run_plan(config=saved_config)
+    self._write_run_snapshot(config=saved_config, run_plan=full_run_plan)
+    self._prepare_run_result_tracking(full_run_plan)
+    task_runtime_rows = [
+        {
+            "tag": str(task.tag or "").strip(),
+            "serial": int(task.serial),
+            "quantity": max(1, int(getattr(task, "quantity", 1) or 1)),
+            "slot_index": int(getattr(task, "slot_index", 1) or 1),
+            "total_slots": int(getattr(task, "total_slots", 1) or 1),
+            "round_index": int(getattr(task, "round_index", 1) or 1),
+            "source_dir": str(task.source_dir or "").strip(),
+            "title": str(task.title or "").strip(),
+            "thumbnails": [str(item).strip() for item in task.thumbnails if str(item).strip()],
+        }
+        for task in full_run_plan.tasks
+    ]
+    self._log(f"[Paths] Runtime tasks: {json.dumps(task_runtime_rows, ensure_ascii=False)}")
+    self._log(f"[Paths] Resolved tag output dirs: {json.dumps(full_run_plan.window_plan.get('tag_output_dirs', {}), ensure_ascii=False)}")
+    self._log(f"[Paths] Resolved tag metadata dirs: {json.dumps(full_run_plan.window_plan.get('tag_metadata_dirs', {}), ensure_ascii=False)}")
+
+    round_groups: dict[int, list[WindowTask]] = {}
+    for task in full_run_plan.tasks:
+        round_groups.setdefault(int(getattr(task, "round_index", 1) or 1), []).append(task)
+    ordered_rounds = [round_groups[idx] for idx in sorted(round_groups)]
+    upload_runtime = {
+        "retain_days": str(self.cleanup_days_var.get().strip() or "5"),
+        "auto_close": bool(self.upload_auto_close_var.get()),
+    }
+
+    def job() -> bool:
+        self._log(
+            f"[Paths] metadata={full_run_plan.metadata_root} | music={full_run_plan.music_root} | "
+            f"image={full_run_plan.image_root} | output={full_run_plan.output_root}"
+        )
+        seen_failures: set[str] = set()
+
+        def collect_round_failures(round_tasks: list[WindowTask]) -> list[str]:
+            failures: list[str] = []
+            for round_task in round_tasks:
+                key = self._task_result_key(
+                    round_task.tag,
+                    round_task.serial,
+                    getattr(round_task, "slot_index", 1),
+                    getattr(round_task, "total_slots", 1),
+                )
+                stages = self._run_result_map.get(key, {})
+                for stage_name in ("render", "metadata", "upload"):
+                    stage = stages.get(stage_name) or {}
+                    if str(stage.get("status") or "") == "failed":
+                        detail = str(stage.get("detail") or stage_name).strip()
+                        failure_key = f"{key}:{stage_name}:{detail}"
+                        if failure_key not in seen_failures:
+                            seen_failures.add(failure_key)
+                            failures.append(f"{key} {stage_name} failed ({detail})")
+                        break
+            return failures
+
+        for round_number, round_tasks in enumerate(ordered_rounds, 1):
+            if self._cancel_requested:
+                return False
+            round_labels = ", ".join(task_runtime_key(task) for task in round_tasks)
+            self._log(f"[Round] {round_number}/{len(ordered_rounds)} -> {round_labels}")
+            round_plan = build_run_plan(
+                tasks=round_tasks,
+                defaults=full_run_plan.defaults,
+                modules=full_run_plan.modules,
+                config=saved_config,
+            )
+            stream_upload = bool(round_plan.modules.upload and (round_plan.modules.render or round_plan.modules.metadata))
+            upload_dispatched = False
+            with self._upload_process_lock:
+                self._upload_failures = []
+
+            def handle_item_ready(task: WindowTask, output_dir: Path, manifest_path: Path) -> None:
+                nonlocal upload_dispatched
+                if not stream_upload:
+                    return
+                self._assert_manifest_ready_for_upload(manifest_path=manifest_path, task=task, output_dir=output_dir)
+                upload_dispatched = True
+                self._log(f"[Upload] Round {round_number}: {task_runtime_key(task)} 已就绪，立即上传")
+                self._launch_stream_upload_for_task(
+                    round_plan,
+                    task,
+                    output_dir,
+                    retain_days=upload_runtime["retain_days"],
+                    auto_close=upload_runtime["auto_close"],
+                )
+
+            if round_plan.modules.render or round_plan.modules.metadata:
+                execution = execute_run_plan(
+                    round_plan,
+                    control=self.execution_control,
+                    on_item_ready=handle_item_ready if stream_upload else None,
+                    log=self._log,
+                )
+                self._ingest_execution_result(execution)
+                if stream_upload:
+                    if upload_dispatched:
+                        failures = self._wait_for_stream_uploads()
+                        if self._cancel_requested:
+                            return False
+                        for failure in failures:
+                            failure_key = f"{round_number}:{failure}"
+                            if failure_key not in seen_failures:
+                                seen_failures.add(failure_key)
+                    else:
+                        self._log(f"[Round] {round_number}: no ready uploads in this round")
+                round_failures = collect_round_failures(round_tasks)
+                if round_failures:
+                    self._log("[Round] Failures -> " + " | ".join(round_failures))
+                continue
+
+            if round_plan.modules.upload:
+                self._log(f"[Start] Upload round {round_number}")
+                failures = self._dispatch_upload_round(
+                    round_plan,
+                    retain_days=upload_runtime["retain_days"],
+                    auto_close=upload_runtime["auto_close"],
+                )
+                if self._cancel_requested:
+                    return False
+                for failure in failures:
+                    failure_key = f"{round_number}:{failure}"
+                    if failure_key not in seen_failures:
+                        seen_failures.add(failure_key)
+                round_failures = collect_round_failures(round_tasks)
+                if round_failures:
+                    self._log("[Round] Failures -> " + " | ".join(round_failures))
+
+        if self._cancel_requested:
+            return False
+        failures = sorted(seen_failures)
+        if failures:
+            raise RuntimeError(" | ".join(item.split(":", 1)[-1] for item in failures[:3]))
+        return False
+
+    task_name = " + ".join(self._selected_module_labels())
+    self._run_background(
+        job,
+        task_name=task_name,
+        total_items=len(full_run_plan.tasks),
+        include_upload=bool(module_selection.upload),
+    )
+
+
+DashboardApp._refresh_task_tree = _patched_refresh_task_tree
+DashboardApp._add_window_task = _patched_add_window_task
+DashboardApp._runtime_window_tasks = _patched_runtime_window_tasks
+DashboardApp._run_progress_step_done = _patched_run_progress_step_done
+DashboardApp._ingest_execution_result = _patched_ingest_execution_result
+DashboardApp._sync_upload_results_from_records = _patched_sync_upload_results_from_records
+DashboardApp._update_run_status_from_log = _patched_update_run_status_from_log
+DashboardApp._launch_stream_upload_for_task = _patched_launch_stream_upload_for_task
+DashboardApp._dispatch_upload_round = _patched_dispatch_upload_round
+DashboardApp._start_real_flow = _patched_start_real_flow
 
 
 def main() -> int:
