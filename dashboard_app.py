@@ -1730,8 +1730,37 @@ class DashboardApp(ctk.CTk):
         key = self._task_result_key(tag, serial, slot_index, total_slots)
         entry = self._run_result_map.setdefault(key, {})
         stage_entry = entry.setdefault(stage, {"status": "pending", "detail": ""})
+        previous_status = str(stage_entry.get("status", "pending") or "pending").strip()
+        previous_detail = str(stage_entry.get("detail", "") or "").strip()
         stage_entry["status"] = status
         stage_entry["detail"] = str(detail or "").strip()
+        if status in {"failed", "skipped"} and (status != previous_status or stage_entry["detail"] != previous_detail):
+            stage_label = {"render": "剪辑", "metadata": "文案/封面", "upload": "上传"}.get(stage, stage)
+            prefix = "失败任务" if status == "failed" else "跳过任务"
+            reason = stage_entry["detail"] or ("已失败" if status == "failed" else "已跳过")
+            self._log(f"[{prefix}] {key} -> {stage_label}: {reason}")
+
+    def _failure_snapshot_text(self, limit: int = 6) -> str:
+        stage_labels = {"render": "剪辑", "metadata": "文案/封面", "upload": "上传"}
+        failed: list[str] = []
+        for key, stages in self._run_result_map.items():
+            for stage_name in ("render", "metadata", "upload"):
+                stage = stages.get(stage_name)
+                if not stage:
+                    continue
+                status = str(stage.get("status", "pending") or "pending").strip()
+                if status != "failed":
+                    continue
+                detail = str(stage.get("detail", "") or "").strip() or "未知原因"
+                failed.append(f"{key} -> {stage_labels.get(stage_name, stage_name)}: {detail}")
+                break
+        if not failed:
+            return ""
+        if len(failed) > limit:
+            shown = failed[:limit]
+            shown.append(f"... 还有 {len(failed) - limit} 条失败")
+            failed = shown
+        return " | ".join(failed)
 
     def _ingest_execution_result(self, execution: Any) -> None:
         self._run_execution_result = execution
@@ -1838,22 +1867,22 @@ class DashboardApp(ctk.CTk):
             else:
                 success_lines.append(line)
 
-        headline = "Batch cancelled" if cancelled else f"Success {len(success_lines)}, Failed {len(failed_lines)}, Skipped {len(skipped_lines)}"
-        lines = ["[Result] Batch execution summary", headline]
+        headline = "已取消" if cancelled else f"成功 {len(success_lines)}，失败 {len(failed_lines)}，跳过 {len(skipped_lines)}"
+        lines = ["[结果总结]", headline]
         if success_lines:
-            lines.append("Success:")
+            lines.append("成功任务：")
             lines.extend(success_lines)
         if failed_lines:
-            lines.append("Failed:")
+            lines.append("失败任务：")
             lines.extend(failed_lines)
         if skipped_lines:
-            lines.append("Skipped:")
+            lines.append("跳过任务：")
             lines.extend(skipped_lines)
         if pending_lines:
-            lines.append("Pending:")
+            lines.append("未完成任务：")
             lines.extend(pending_lines)
         if summary and summary not in headline:
-            lines.append(f"Note: {summary}")
+            lines.append(f"补充说明：{summary}")
         report = chr(10).join(lines)
         return headline or summary, report
 
@@ -1994,6 +2023,9 @@ class DashboardApp(ctk.CTk):
             f"预计剩余: {self.run_eta_var.get()}",
             f"最近日志: {self.run_last_log_var.get()}",
         ]
+        failure_snapshot = self._failure_snapshot_text()
+        if failure_snapshot:
+            parts.append(f"失败清单: {failure_snapshot}")
         if self._has_active_background_work():
             parts.append("说明: 你可以继续切换其他页面查看或修改配置；新的开始任务会等当前流程结束。")
         return "\n".join(parts)
