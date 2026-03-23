@@ -165,6 +165,7 @@ class WindowInfo:
 class WindowTask:
     tag: str
     serial: int
+    quantity: int = 1
     is_ypp: bool = False
     title: str = ""
     description: str = ""
@@ -180,12 +181,16 @@ class WindowTask:
     tag_list: list[str] = field(default_factory=list)
     thumbnails: list[str] = field(default_factory=list)
     ab_titles: list[str] = field(default_factory=list)
+    slot_index: int = 1
+    total_slots: int = 1
+    round_index: int = 1
 
     def to_plan_dict(self, index: int) -> dict[str, Any]:
         row = {
             "index": index,
             "tag": self.tag,
             "serial": int(self.serial),
+            "quantity": max(1, int(self.quantity or 1)),
             "is_ypp": bool(self.is_ypp),
             "visibility": self.visibility,
             "category": self.category,
@@ -193,6 +198,10 @@ class WindowTask:
             "altered_content": bool(self.altered_content),
             "notify_subscribers": bool(self.notify_subscribers),
         }
+        if int(self.total_slots or 1) > 1:
+            row["slot_index"] = int(self.slot_index or 1)
+            row["total_slots"] = int(self.total_slots or 1)
+            row["round_index"] = int(self.round_index or self.slot_index or 1)
         if self.title.strip():
             row["title"] = self.title.strip()
         if self.description.strip():
@@ -308,15 +317,91 @@ class SimulationOptions:
 class RenderedItem:
     tag: str
     serial: int
-    output_video: str
-    source_image: str
-    source_audio: str
-    title: str
-    description: str
-    thumbnails: list[str]
-    tag_list: list[str]
-    ab_titles: list[str]
-    effect_desc: str
+    slot_index: int = 1
+    total_slots: int = 1
+    round_index: int = 1
+    output_video: str = ""
+    source_image: str = ""
+    source_audio: str = ""
+    title: str = ""
+    description: str = ""
+    thumbnails: list[str] = field(default_factory=list)
+    tag_list: list[str] = field(default_factory=list)
+    ab_titles: list[str] = field(default_factory=list)
+    effect_desc: str = ""
+
+
+def task_slot_token(task: WindowTask) -> str:
+    if int(task.total_slots or 1) <= 1:
+        return ""
+    return f"_{int(task.slot_index or 1):02d}"
+
+
+def task_runtime_key(task: WindowTask) -> str:
+    base = f"{str(task.tag or '').strip()}/{int(task.serial)}"
+    if int(task.total_slots or 1) <= 1:
+        return base
+    return f"{base}#{int(task.slot_index or 1):02d}"
+
+
+def task_round_label(task: WindowTask) -> str:
+    if int(task.total_slots or 1) <= 1:
+        return f"{int(task.serial)}"
+    return f"{int(task.serial)}[{int(task.slot_index or 1)}/{int(task.total_slots or 1)}]"
+
+
+def _task_output_dir(base_dir: Path, date_mmdd: str, task: WindowTask) -> Path:
+    if int(task.total_slots or 1) <= 1:
+        return base_dir
+    return base_dir / f"{date_mmdd}_{int(task.serial)}_{int(task.slot_index or 1):02d}"
+
+
+def _task_video_filename(date_mmdd: str, task: WindowTask) -> str:
+    return f"{date_mmdd}_{int(task.serial)}{task_slot_token(task)}.mp4"
+
+
+def _task_metadata_dir(base_dir: Path, date_mmdd: str, task: WindowTask) -> Path:
+    return _task_output_dir(base_dir, date_mmdd, task)
+
+
+def _expand_window_tasks_by_round(tasks: list[WindowTask]) -> list[WindowTask]:
+    expanded: list[WindowTask] = []
+    for task in tasks:
+        requested_quantity = max(1, int(getattr(task, "quantity", 1) or 1))
+        # Already-expanded tasks should pass through unchanged.
+        if int(getattr(task, "total_slots", 1) or 1) > 1 or int(getattr(task, "slot_index", 1) or 1) > 1:
+            expanded.append(task)
+            continue
+        for slot_index in range(1, requested_quantity + 1):
+            cloned = create_task(
+                tag=task.tag,
+                serial=task.serial,
+                quantity=1,
+                is_ypp=task.is_ypp,
+                title=task.title,
+                description=task.description,
+                visibility=task.visibility,
+                category=task.category,
+                made_for_kids=task.made_for_kids,
+                altered_content=task.altered_content,
+                notify_subscribers=task.notify_subscribers,
+                scheduled_publish_at=task.scheduled_publish_at,
+                schedule_timezone=task.schedule_timezone,
+                source_dir=task.source_dir,
+                channel_name=task.channel_name,
+                slot_index=slot_index,
+                total_slots=requested_quantity,
+                round_index=slot_index,
+            )
+            cloned.tag_list = [str(item).strip() for item in task.tag_list if str(item).strip()]
+            cloned.thumbnails = [str(item).strip() for item in task.thumbnails if str(item).strip()]
+            cloned.ab_titles = [str(item).strip() for item in task.ab_titles if str(item).strip()]
+            expanded.append(cloned)
+    return expanded
+
+
+def expand_window_tasks_by_round(tasks: list[WindowTask]) -> list[WindowTask]:
+    return _expand_window_tasks_by_round(tasks)
 
 
 @dataclass(slots=True)
@@ -488,15 +573,24 @@ def build_window_plan(tasks: list[WindowTask], defaults: WorkflowDefaults) -> di
     groups: dict[str, list[int]] = {}
     ordered: list[dict[str, Any]] = []
     preview_lines: list[str] = []
+    round_groups: dict[int, list[str]] = {}
 
     for index, task in enumerate(tasks, 1):
         row = task.to_plan_dict(index)
         ordered.append(row)
         groups.setdefault(task.tag, []).append(int(task.serial))
+        round_groups.setdefault(int(getattr(task, "round_index", 1) or 1), []).append(
+            f"[{task.tag}] {task_round_label(task)}"
+        )
 
     for tag in groups:
         groups[tag] = sorted(groups[tag])
-        preview_lines.append(f"[{tag}] {', '.join(str(item) for item in groups[tag])}")
+    if len(round_groups) > 1:
+        for round_index in sorted(round_groups):
+            preview_lines.append(f"Round {round_index}: " + " | ".join(round_groups[round_index]))
+    else:
+        for tag in groups:
+            preview_lines.append(f"[{tag}] {', '.join(str(item) for item in groups[tag])}")
 
     if defaults.schedule_enabled and defaults.visibility == "schedule" and defaults.schedule_start.strip():
         start = _parse_schedule_time(defaults.schedule_start)
@@ -1138,19 +1232,77 @@ def _force_unique_text(
     return base
 
 
-def _find_existing_video(output_dir: Path, date_mmdd: str, serial: int, channel: dict[str, Any] | None = None) -> Path | None:
+def _find_existing_video(
+    output_dir: Path,
+    date_mmdd: str,
+    serial: int,
+    channel: dict[str, Any] | None = None,
+    task: WindowTask | None = None,
+) -> Path | None:
     channel = channel or {}
     preferred = _resolve_manifest_media_path(output_dir, channel.get("video"))
     if preferred and preferred.exists():
         return preferred
-    candidates = [
-        output_dir / f"{date_mmdd}_{serial}.mp4",
-        output_dir / f"{serial}.mp4",
-    ]
+    candidates: list[Path] = []
+    if task is not None:
+        slot_suffix = task_slot_token(task)
+        candidates.extend(
+            [
+                output_dir / _task_video_filename(date_mmdd, task),
+                output_dir / f"{serial}{slot_suffix}.mp4",
+            ]
+        )
+        if slot_suffix:
+            candidates.extend(sorted(output_dir.glob(f"*_{serial}{slot_suffix}.mp4")))
+            candidates.extend(sorted(output_dir.glob(f"*_{serial}_{int(task.slot_index or 1):02d}.mp4")))
+    candidates.extend(
+        [
+            output_dir / f"{date_mmdd}_{serial}.mp4",
+            output_dir / f"{serial}.mp4",
+        ]
+    )
     candidates.extend(sorted(output_dir.glob(f"*_{serial}.mp4")))
     for candidate in candidates:
         if candidate.exists():
             return candidate
+    return None
+
+
+def _claim_bootstrap_source_video(
+    *,
+    task: WindowTask,
+    output_dir: Path,
+    date_mmdd: str,
+    serial: int,
+    claimed_videos: dict[str, set[str]],
+) -> Path | None:
+    folder_text = str(task.source_dir or "").strip()
+    if not folder_text:
+        return None
+    source_dir = Path(folder_text)
+    if not source_dir.exists() or not source_dir.is_dir():
+        return None
+    source_key = str(source_dir.resolve(strict=False)).lower()
+    claimed = claimed_videos.setdefault(source_key, set())
+    preferred_candidates: list[Path] = [
+        source_dir / f"{date_mmdd}_{serial}.mp4",
+        source_dir / f"{serial}.mp4",
+    ]
+    preferred_candidates.extend(sorted(source_dir.glob(f"*_{serial}.mp4")))
+    all_candidates = preferred_candidates + _list_folder_media(source_dir, VIDEO_EXTENSIONS)
+    seen: set[str] = set()
+    for candidate in all_candidates:
+        resolved = str(candidate.resolve(strict=False)).lower()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if not candidate.exists() or not candidate.is_file():
+            continue
+        if resolved in claimed:
+            continue
+        claimed.add(resolved)
+        target = output_dir / f"{date_mmdd}_{serial}{task_slot_token(task)}{candidate.suffix.lower()}"
+        return _copy_if_needed(candidate, target)
     return None
 
 
@@ -1998,6 +2150,7 @@ def create_task(
     *,
     tag: str,
     serial: int,
+    quantity: int = 1,
     is_ypp: bool = False,
     title: str = "",
     description: str = "",
@@ -2010,10 +2163,14 @@ def create_task(
     schedule_timezone: str = "",
     source_dir: str = "",
     channel_name: str = "",
+    slot_index: int = 1,
+    total_slots: int = 1,
+    round_index: int = 1,
 ) -> WindowTask:
     return WindowTask(
         tag=str(tag).strip(),
         serial=int(serial),
+        quantity=max(1, int(quantity or 1)),
         is_ypp=bool(is_ypp),
         title=str(title or "").strip(),
         description=str(description or "").strip(),
@@ -2026,6 +2183,9 @@ def create_task(
         schedule_timezone=str(schedule_timezone or "").strip(),
         source_dir=str(source_dir or "").strip(),
         channel_name=str(channel_name or "").strip(),
+        slot_index=max(1, int(slot_index or 1)),
+        total_slots=max(1, int(total_slots or 1)),
+        round_index=max(1, int(round_index or 1)),
     )
 
 
@@ -2196,6 +2356,7 @@ def execute_metadata_only_workflow(
     log(f"[计划] 已写入窗口计划: {plan_path}")
 
     tag_states: dict[str, dict[str, Any]] = {}
+    claimed_videos: dict[str, set[str]] = {}
     unique_tags = [str(task.tag or "").strip() for task in tasks if str(task.tag or "").strip()]
     unique_tags = list(dict.fromkeys(unique_tags))
     single_tag_mode = len(unique_tags) == 1
@@ -2219,6 +2380,7 @@ def execute_metadata_only_workflow(
             output_dir = output_root
         else:
             output_dir = output_root / f"{defaults.date_mmdd}_{tag}"
+        output_dir.mkdir(parents=True, exist_ok=True)
         existing_channels: dict[str, Any] = {}
         if output_dir.exists():
             manifest_data = _read_json(output_dir / "upload_manifest.json", {})
@@ -2254,28 +2416,53 @@ def execute_metadata_only_workflow(
             raise ValueError(f"{tag} 当前任务的现成视频目录不存在: {output_dir}")
 
         for task in tag_tasks:
+            task_label = task_round_label(task)
             if control:
                 control.check_cancelled()
-                control.wait_if_paused(log=log, label=f"{tag}/{task.serial}")
-            channel = state["channels"].get(str(task.serial), {})
-            existing_video = _find_existing_video(output_dir, defaults.date_mmdd, task.serial, channel)
-            if not existing_video:
-                raise ValueError(f"{tag}/{task.serial} 缺少现成视频文件: {output_dir}")
+                control.wait_if_paused(log=log, label=f"{tag}/{task_label}")
+            task_output_dir = _task_output_dir(output_dir, defaults.date_mmdd, task)
+            task_output_dir.mkdir(parents=True, exist_ok=True)
+            task_metadata_dir = _task_metadata_dir(Path(state["metadata_dir"]), defaults.date_mmdd, task)
+            task_metadata_dir.mkdir(parents=True, exist_ok=True)
+            generation_map_path = task_metadata_dir / "generation_map.json"
+            if str(task_output_dir) not in result.output_dirs:
+                result.output_dirs.append(str(task_output_dir))
 
-            source_image = _resolve_manifest_media_path(output_dir, channel.get("source_image"))
+            channel = state["channels"].get(str(task.serial), {})
+            existing_video = _find_existing_video(task_output_dir, defaults.date_mmdd, task.serial, channel, task=task)
+            if not existing_video and task_output_dir != output_dir:
+                fallback_video = _find_existing_video(output_dir, defaults.date_mmdd, task.serial, channel, task=task)
+                if fallback_video:
+                    existing_video = _copy_if_needed(fallback_video, task_output_dir / fallback_video.name)
+            if not existing_video:
+                existing_video = _claim_bootstrap_source_video(
+                    task=task,
+                    output_dir=task_output_dir,
+                    date_mmdd=defaults.date_mmdd,
+                    serial=task.serial,
+                    claimed_videos=claimed_videos,
+                )
+            if not existing_video:
+                raise ValueError(f"{tag}/{task_label} 缺少现成视频文件: {task_output_dir}")
+
+            source_image = _resolve_manifest_media_path(task_output_dir, channel.get("source_image"))
+            if not source_image or not source_image.exists():
+                source_image = _resolve_manifest_media_path(output_dir, channel.get("source_image"))
             if not source_image or not source_image.exists():
                 source_image = _find_bootstrap_source_image(
                     task=task,
-                    output_dir=output_dir,
+                    output_dir=task_output_dir if task_output_dir.exists() else output_dir,
                     date_mmdd=defaults.date_mmdd,
                     serial=task.serial,
                 )
 
-            source_audio = _resolve_manifest_media_path(output_dir, channel.get("source_audio"))
+            source_audio = _resolve_manifest_media_path(task_output_dir, channel.get("source_audio"))
+            if not source_audio or not source_audio.exists():
+                source_audio = _resolve_manifest_media_path(output_dir, channel.get("source_audio"))
             if not source_audio or not source_audio.exists():
                 source_audio = _find_bootstrap_source_audio(
                     task=task,
-                    output_dir=output_dir,
+                    output_dir=task_output_dir if task_output_dir.exists() else output_dir,
                     date_mmdd=defaults.date_mmdd,
                     serial=task.serial,
                 )
@@ -2295,7 +2482,7 @@ def execute_metadata_only_workflow(
             ab_titles = [item for item in task.ab_titles if str(item).strip()]
             cover_paths, cover_source = _pick_preferred_cover_paths(
                 task=task,
-                metadata_dir=Path(state["metadata_dir"]),
+                metadata_dir=task_metadata_dir,
                 date_mmdd=defaults.date_mmdd,
                 serial=task.serial,
                 channel=channel,
@@ -2311,7 +2498,7 @@ def execute_metadata_only_workflow(
                 if defaults.metadata_mode == "prompt_api" and (defaults.generate_text or defaults.generate_thumbnails):
                     if control:
                         control.check_cancelled()
-                        control.wait_if_paused(log=log, label=f"{tag}/{task.serial} 文案生成")
+                        control.wait_if_paused(log=log, label=f"{tag}/{task_label} 文案生成")
                     generated = _generate_prompt_metadata(
                         tag=tag,
                         task=task,
@@ -2328,7 +2515,7 @@ def execute_metadata_only_workflow(
                     )
                     bundle = generated["bundle"]
                     log(
-                        f"[文案] {tag}/{task.serial}: API={bundle['api_preset'].get('name', '')} | "
+                        f"[文案] {tag}/{task_label}: API={bundle['api_preset'].get('name', '')} | "
                         f"模板={bundle['content_template'].get('name', '')} | "
                         f"来源={bundle.get('generation_source', 'unknown')} | 重试={generated['attempts']}"
                     )
@@ -2342,7 +2529,7 @@ def execute_metadata_only_workflow(
                     thumbnail_prompts = list(generated["thumbnail_prompts"])
 
                 if defaults.generate_text and not bundle:
-                    raise RuntimeError(f"{tag}/{task.serial} text generation requires API result, but no API bundle is available.")
+                    raise RuntimeError(f"{tag}/{task_label} text generation requires API result, but no API bundle is available.")
 
                 if defaults.generate_thumbnails:
                     cover_count = 3 if task.is_ypp else 1
@@ -2350,7 +2537,7 @@ def execute_metadata_only_workflow(
                         bundle=bundle,
                         thumbnail_prompts=thumbnail_prompts,
                         source_image=source_image,
-                        target_dir=Path(state["metadata_dir"]),
+                        target_dir=task_metadata_dir,
                         date_mmdd=defaults.date_mmdd,
                         serial=task.serial,
                         cover_count=cover_count,
@@ -2362,14 +2549,14 @@ def execute_metadata_only_workflow(
 
                 if cover_paths:
                     thumb_preview = ", ".join(str(path) for path in cover_paths[:3])
-                    log(f"[thumb] {tag}/{task.serial}: source={cover_source or 'existing'} | {thumb_preview}")
+                    log(f"[thumb] {tag}/{task_label}: source={cover_source or 'existing'} | {thumb_preview}")
 
                 if defaults.generate_text or defaults.generate_thumbnails:
                     _save_daily_entry(
-                        state["generation_map_path"],
+                        generation_map_path,
                         date_mmdd=defaults.date_mmdd,
-                    serial=task.serial,
-                    is_ypp=task.is_ypp,
+                        serial=task.serial,
+                        is_ypp=task.is_ypp,
                     title=title,
                     description=description,
                     covers=[path.name for path in cover_paths],
@@ -2420,12 +2607,11 @@ def execute_metadata_only_workflow(
                         updated_channel["source_image"] = str(source_image)
                     if source_audio:
                         updated_channel["source_audio"] = str(source_audio)
-                    state["channels"][str(task.serial)] = updated_channel
                     manifest_path = _write_manifest(
-                        output_dir=Path(state["output_dir"]),
+                        output_dir=task_output_dir,
                         date_mmdd=defaults.date_mmdd,
                         tag=str(state["tag"]),
-                        channels=dict(state["channels"]),
+                        channels={str(task.serial): updated_channel},
                         source_label="metadata_only",
                     )
                     manifest_path_text = str(manifest_path)
@@ -2433,10 +2619,10 @@ def execute_metadata_only_workflow(
                         result.manifest_paths.append(manifest_path_text)
                     log(f"[清单] {state['tag']} metadata manifest 已更新: {manifest_path}")
                     if on_item_ready:
-                        on_item_ready(task, Path(state["output_dir"]), manifest_path)
+                        on_item_ready(task, task_output_dir, manifest_path)
             except Exception as exc:
                 item_failed = True
-                warning = f"{tag}/{task.serial} 文案/封面阶段失败，已跳过当前视频，其它视频继续处理: {exc}"
+                warning = f"{tag}/{task_label} 文案/封面阶段失败，已跳过当前视频，其它视频继续处理: {exc}"
                 result.warnings.append(warning)
                 log(f"[错误] {warning}")
 
@@ -2444,6 +2630,9 @@ def execute_metadata_only_workflow(
                 RenderedItem(
                     tag=tag,
                     serial=task.serial,
+                    slot_index=task.slot_index,
+                    total_slots=task.total_slots,
+                    round_index=task.round_index,
                     output_video=str(existing_video or ""),
                     source_image=str(source_image or ""),
                     source_audio=str(source_audio or ""),
@@ -2458,22 +2647,6 @@ def execute_metadata_only_workflow(
 
             if item_failed:
                 continue
-
-    for state in tag_states.values():
-        output_dir = Path(state["output_dir"])
-        channels = dict(state["channels"])
-        if output_dir.exists() and channels:
-            manifest_path = _write_manifest(
-                output_dir=output_dir,
-                date_mmdd=defaults.date_mmdd,
-                tag=str(state["tag"]),
-                channels=channels,
-                source_label="metadata_only",
-            )
-            manifest_path_text = str(manifest_path)
-            if manifest_path_text not in result.manifest_paths:
-                result.manifest_paths.append(manifest_path_text)
-            log(f"[清单] {state['tag']} metadata manifest 已更新: {manifest_path}")
 
     return result
 
@@ -2535,15 +2708,12 @@ def execute_direct_media_workflow(
             "tag": tag,
             "output_dir": output_dir,
             "metadata_dir": metadata_dir,
-            "generation_map_path": metadata_dir / "generation_map.json",
-            "manifest_channels": {},
             "titles": [],
             "descriptions": [],
             "thumbnail_prompts": [],
             "tag_signatures": [],
         }
         tag_states[tag] = state
-        result.output_dirs.append(str(output_dir))
         return state
 
     for scope in _group_tasks_by_media_scope(tasks, config):
@@ -2568,9 +2738,10 @@ def execute_direct_media_workflow(
             log(f"[警告] {warning}")
 
         for task, source_image, source_audio in paired:
+            task_label = task_round_label(task)
             if control:
                 control.check_cancelled()
-                control.wait_if_paused(log=log, label=f"{tag}/{task.serial}")
+                control.wait_if_paused(log=log, label=f"{tag}/{task_label}")
             unique_seed = _build_unique_seed(
                 defaults.date_mmdd,
                 tag,
@@ -2578,7 +2749,14 @@ def execute_direct_media_workflow(
                 source_audio.stem,
                 source_image.stem,
             )
-            output_video = Path(state["output_dir"]) / f"{defaults.date_mmdd}_{task.serial}.mp4"
+            task_output_dir = _task_output_dir(Path(state["output_dir"]), defaults.date_mmdd, task)
+            task_output_dir.mkdir(parents=True, exist_ok=True)
+            task_metadata_dir = _task_metadata_dir(Path(state["metadata_dir"]), defaults.date_mmdd, task)
+            task_metadata_dir.mkdir(parents=True, exist_ok=True)
+            generation_map_path = task_metadata_dir / "generation_map.json"
+            if str(task_output_dir) not in result.output_dirs:
+                result.output_dirs.append(str(task_output_dir))
+            output_video = task_output_dir / _task_video_filename(defaults.date_mmdd, task)
             clean_incomplete(output_video)
             output_video.unlink(missing_ok=True)
             Path(str(output_video) + ".done").unlink(missing_ok=True)
@@ -2588,9 +2766,9 @@ def execute_direct_media_workflow(
             effect_kwargs = build_effect_kwargs(render_options, rng=effect_rng)
             duration = get_audio_duration(source_audio)
             filter_complex, effect_desc, extra_inputs = get_effect(duration, rng=effect_rng, **effect_kwargs)
-            log(f"[任务] {tag}/{task.serial}: {source_image.name} + {source_audio.name} -> {output_video.name}")
+            log(f"[任务] {tag}/{task_label}: {source_image.name} + {source_audio.name} -> {output_video.name}")
             log(f"[渲染] 编码器={VIDEO_CODEC} | 码率 {VIDEO_BITRATE} | 特效 {effect_desc}")
-            log(f"[视觉] {tag}/{task.serial}: {_describe_effect_kwargs(effect_kwargs)}")
+            log(f"[视觉] {tag}/{task_label}: {_describe_effect_kwargs(effect_kwargs)}")
             _render_with_progress(
                 image_path=source_image,
                 audio_path=source_audio,
@@ -2609,7 +2787,7 @@ def execute_direct_media_workflow(
             ab_titles = [item for item in task.ab_titles if str(item).strip()]
             cover_paths, cover_source = _pick_preferred_cover_paths(
                 task=task,
-                metadata_dir=Path(state["metadata_dir"]),
+                metadata_dir=task_metadata_dir,
                 date_mmdd=defaults.date_mmdd,
                 serial=task.serial,
             )
@@ -2624,7 +2802,7 @@ def execute_direct_media_workflow(
                 if defaults.metadata_mode == "prompt_api" and (defaults.generate_text or defaults.generate_thumbnails):
                     if control:
                         control.check_cancelled()
-                        control.wait_if_paused(log=log, label=f"{tag}/{task.serial} 文案生成")
+                        control.wait_if_paused(log=log, label=f"{tag}/{task_label} 文案生成")
                     generated = _generate_prompt_metadata(
                         tag=tag,
                         task=task,
@@ -2641,7 +2819,7 @@ def execute_direct_media_workflow(
                     )
                     bundle = generated["bundle"]
                     log(
-                        f"[文案] {tag}/{task.serial}: API={bundle['api_preset'].get('name', '')} | "
+                        f"[文案] {tag}/{task_label}: API={bundle['api_preset'].get('name', '')} | "
                         f"模板={bundle['content_template'].get('name', '')} | "
                         f"来源={bundle.get('generation_source', 'unknown')} | 重试={generated['attempts']}"
                     )
@@ -2656,7 +2834,7 @@ def execute_direct_media_workflow(
 
                 if defaults.generate_text:
                     if not bundle:
-                        raise RuntimeError(f"{tag}/{task.serial} text generation requires API result, but no API bundle is available.")
+                        raise RuntimeError(f"{tag}/{task_label} text generation requires API result, but no API bundle is available.")
                 elif not title:
                     title = output_video.stem
 
@@ -2666,7 +2844,7 @@ def execute_direct_media_workflow(
                         bundle=bundle,
                         thumbnail_prompts=thumbnail_prompts,
                         source_image=source_image,
-                        target_dir=Path(state["metadata_dir"]),
+                        target_dir=task_metadata_dir,
                         date_mmdd=defaults.date_mmdd,
                         serial=task.serial,
                         cover_count=cover_count,
@@ -2678,17 +2856,17 @@ def execute_direct_media_workflow(
 
                 if cover_paths:
                     log(
-                        f"[封面] {tag}/{task.serial}: 来源={cover_source or 'existing'} | "
+                        f"[封面] {tag}/{task_label}: 来源={cover_source or 'existing'} | "
                         f"{', '.join(str(path) for path in cover_paths[:3])}"
                     )
 
                 thumb_preview = ", ".join(str(path) for path in cover_paths[:3]) if cover_paths else ""
                 if thumb_preview:
-                    log(f"[thumb] {tag}/{task.serial}: source={cover_source or 'existing'} | {thumb_preview}")
+                    log(f"[thumb] {tag}/{task_label}: source={cover_source or 'existing'} | {thumb_preview}")
 
                 if defaults.generate_text or defaults.generate_thumbnails:
                     _save_daily_entry(
-                        Path(state["generation_map_path"]),
+                        generation_map_path,
                         date_mmdd=defaults.date_mmdd,
                         serial=task.serial,
                         is_ypp=task.is_ypp,
@@ -2717,7 +2895,7 @@ def execute_direct_media_workflow(
                 if tag_list:
                     state["tag_signatures"].append(" | ".join(tag_list))
 
-                state["manifest_channels"][str(task.serial)] = {
+                channel_payload = {
                     "video": output_video.name,
                     "source_image": str(source_image),
                     "source_audio": str(source_audio),
@@ -2742,10 +2920,10 @@ def execute_direct_media_workflow(
                 }
                 if simulation is None or simulation.save_manifest:
                     manifest_path = _write_manifest(
-                        output_dir=Path(state["output_dir"]),
+                        output_dir=task_output_dir,
                         date_mmdd=defaults.date_mmdd,
                         tag=str(state["tag"]),
-                        channels=dict(state["manifest_channels"]),
+                        channels={str(task.serial): channel_payload},
                         source_label="group_bound_media",
                     )
                     manifest_path_text = str(manifest_path)
@@ -2753,11 +2931,11 @@ def execute_direct_media_workflow(
                         result.manifest_paths.append(manifest_path_text)
                     log(f"[清单] {state['tag']} manifest 已写入: {manifest_path}")
                     if on_item_ready:
-                        on_item_ready(task, Path(state["output_dir"]), manifest_path)
+                        on_item_ready(task, task_output_dir, manifest_path)
             except Exception as exc:
                 metadata_failed = True
                 metadata_error = str(exc)
-                warning = f"{tag}/{task.serial} 文案/封面阶段失败，已保留渲染成品并跳过该视频上传: {exc}"
+                warning = f"{tag}/{task_label} 文案/封面阶段失败，已保留渲染成品并跳过该视频上传: {exc}"
                 result.warnings.append(warning)
                 log(f"[错误] {warning}")
                 if not title:
@@ -2766,6 +2944,9 @@ def execute_direct_media_workflow(
                 RenderedItem(
                     tag=tag,
                     serial=task.serial,
+                    slot_index=task.slot_index,
+                    total_slots=task.total_slots,
+                    round_index=task.round_index,
                     output_video=str(output_video),
                     source_image=str(source_image),
                     source_audio=str(source_audio),
@@ -2787,19 +2968,5 @@ def execute_direct_media_workflow(
             if simulation and simulation.consume_sources:
                 _move_to_used(source_image, used_media_root, tag=tag, kind="images")
                 _move_to_used(source_audio, used_media_root, tag=tag, kind="audio")
-
-    if simulation is None or simulation.save_manifest:
-        for state in tag_states.values():
-            manifest_path = _write_manifest(
-                output_dir=Path(state["output_dir"]),
-                date_mmdd=defaults.date_mmdd,
-                tag=str(state["tag"]),
-                channels=dict(state["manifest_channels"]),
-                source_label="group_bound_media",
-            )
-            manifest_path_text = str(manifest_path)
-            if manifest_path_text not in result.manifest_paths:
-                result.manifest_paths.append(manifest_path_text)
-            log(f"[清单] {state['tag']} manifest 已写入: {manifest_path}")
 
     return result

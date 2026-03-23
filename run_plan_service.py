@@ -13,6 +13,7 @@ from workflow_core import (
     WorkflowDefaults,
     WorkflowResult,
     build_window_plan,
+    expand_window_tasks_by_round,
     execute_direct_media_workflow,
     execute_metadata_only_workflow,
     _find_existing_video,
@@ -22,6 +23,7 @@ from workflow_core import (
     refresh_existing_output_metadata,
     resolve_task_audio_dir,
     resolve_task_image_dir,
+    task_runtime_key,
     validate_existing_output_dirs,
     validate_group_sources,
 )
@@ -70,6 +72,7 @@ class MediaScope:
 
 @dataclass(slots=True)
 class RunPlan:
+    logical_tasks: list[WindowTask]
     tasks: list[WindowTask]
     defaults: WorkflowDefaults
     modules: ModuleSelection
@@ -120,17 +123,29 @@ def _resolve_task_plan_dirs(
     metadata_root = get_metadata_root(config)
     clean_tag = str(task.tag or "").strip()
     source_override = str(task.source_dir or "").strip()
+    round_suffix = ""
+    if int(getattr(task, "total_slots", 1) or 1) > 1:
+        round_suffix = f"_r{int(getattr(task, 'round_index', 1) or 1):02d}"
 
     # In metadata/upload flows that operate on existing videos, the user-selected
     # folder on the upload page must win. We should create/read manifests directly
     # in that folder instead of silently drifting back to stale global roots.
     if source_override and not modules.render and (modules.metadata or modules.upload):
         source_root = Path(source_override)
+        if round_suffix:
+            round_folder = source_root / f"{defaults.date_mmdd}{round_suffix}"
+            return round_folder, round_folder
         return source_root, source_root
 
     if single_tag_mode:
+        if round_suffix:
+            return output_root / f"round_{int(getattr(task, 'round_index', 1) or 1):02d}", metadata_root / f"round_{int(getattr(task, 'round_index', 1) or 1):02d}"
         return output_root, metadata_root
-    return output_root / f"{defaults.date_mmdd}_{clean_tag}", metadata_root / clean_tag
+    output_dir = output_root / f"{defaults.date_mmdd}_{clean_tag}"
+    metadata_dir = metadata_root / clean_tag
+    if round_suffix:
+        return Path(str(output_dir) + round_suffix), Path(str(metadata_dir) + round_suffix)
+    return output_dir, metadata_dir
 
 
 def reconcile_run_plan_directories(run_plan: RunPlan) -> RunPlan:
@@ -149,6 +164,8 @@ def reconcile_run_plan_directories(run_plan: RunPlan) -> RunPlan:
     single_tag_mode = len(unique_tags) == 1
     tag_output_dirs: dict[str, str] = {}
     tag_metadata_dirs: dict[str, str] = {}
+    task_output_dirs: dict[str, str] = {}
+    task_metadata_dirs: dict[str, str] = {}
     for task in run_plan.tasks:
         clean_tag = str(task.tag or "").strip()
         if not clean_tag:
@@ -160,12 +177,16 @@ def reconcile_run_plan_directories(run_plan: RunPlan) -> RunPlan:
             config=cfg,
             single_tag_mode=single_tag_mode,
         )
+        task_output_dirs[task_runtime_key(task)] = str(resolved_output)
+        task_metadata_dirs[task_runtime_key(task)] = str(resolved_metadata)
         tag_output_dirs.setdefault(clean_tag, str(resolved_output))
         tag_metadata_dirs.setdefault(clean_tag, str(resolved_metadata))
 
     plan = deepcopy(run_plan.window_plan)
     plan["tag_output_dirs"] = tag_output_dirs
     plan["tag_metadata_dirs"] = tag_metadata_dirs
+    plan["task_output_dirs"] = task_output_dirs
+    plan["task_metadata_dirs"] = task_metadata_dirs
     cfg["output_root"] = output_root_text
     cfg["metadata_root"] = metadata_root_text
     cfg["music_dir"] = music_root_text
@@ -211,13 +232,17 @@ def build_run_plan(
     config: dict[str, Any] | None = None,
 ) -> RunPlan:
     cfg = deepcopy(config or load_scheduler_settings())
-    plan = build_window_plan(tasks, defaults)
-    unique_tags = [str(task.tag or "").strip() for task in tasks if str(task.tag or "").strip()]
+    logical_tasks = list(tasks)
+    expanded_tasks = expand_window_tasks_by_round(logical_tasks)
+    plan = build_window_plan(expanded_tasks, defaults)
+    unique_tags = [str(task.tag or "").strip() for task in expanded_tasks if str(task.tag or "").strip()]
     unique_tags = list(dict.fromkeys(unique_tags))
     single_tag_mode = len(unique_tags) == 1
     tag_output_dirs: dict[str, str] = {}
     tag_metadata_dirs: dict[str, str] = {}
-    for task in tasks:
+    task_output_dirs: dict[str, str] = {}
+    task_metadata_dirs: dict[str, str] = {}
+    for task in expanded_tasks:
         clean_tag = str(task.tag or "").strip()
         if not clean_tag:
             continue
@@ -228,14 +253,21 @@ def build_run_plan(
             config=cfg,
             single_tag_mode=single_tag_mode,
         )
+        task_output_dirs[task_runtime_key(task)] = str(resolved_output)
+        task_metadata_dirs[task_runtime_key(task)] = str(resolved_metadata)
         tag_output_dirs.setdefault(clean_tag, str(resolved_output))
         tag_metadata_dirs.setdefault(clean_tag, str(resolved_metadata))
     if tag_output_dirs:
         plan["tag_output_dirs"] = tag_output_dirs
     if tag_metadata_dirs:
         plan["tag_metadata_dirs"] = tag_metadata_dirs
+    if task_output_dirs:
+        plan["task_output_dirs"] = task_output_dirs
+    if task_metadata_dirs:
+        plan["task_metadata_dirs"] = task_metadata_dirs
     run_plan = RunPlan(
-        tasks=list(tasks),
+        logical_tasks=logical_tasks,
+        tasks=expanded_tasks,
         defaults=defaults,
         modules=modules,
         config=cfg,
@@ -250,8 +282,6 @@ def build_run_plan(
 
 
 def _visual_mode_line(defaults: WorkflowDefaults) -> str:
-    if defaults.randomize_effects:
-        return "Visual mode: Random"
     settings = defaults.visual_settings or {}
     return (
         "Visual mode: Manual | "
@@ -263,10 +293,13 @@ def _visual_mode_line(defaults: WorkflowDefaults) -> str:
 
 def preview_run_plan(run_plan: RunPlan) -> list[str]:
     run_plan = reconcile_run_plan_directories(run_plan)
+    max_round = max((int(getattr(task, "round_index", 1) or 1) for task in run_plan.tasks), default=1)
     lines = [
         f"Selected modules: {', '.join(run_plan.modules.labels())}",
         f"Date: {run_plan.defaults.date_mmdd}",
-        f"Window count: {len(run_plan.tasks)}",
+        f"Window count: {len(run_plan.logical_tasks)}",
+        f"Total items: {len(run_plan.tasks)}",
+        f"Rounds: {max_round}",
         f"Metadata root: {run_plan.metadata_root}",
         f"Music root: {run_plan.music_root}",
         f"Image root: {run_plan.image_root}",
@@ -370,9 +403,9 @@ def _validate_explicit_output_dirs(
         if not ok and allow_bootstrap:
             bootstrap_errors: list[str] = []
             for task in tag_tasks:
-                video = _find_existing_video(folder, run_plan.defaults.date_mmdd, task.serial, {})
+                video = _find_existing_video(folder, run_plan.defaults.date_mmdd, task.serial, {}, task=task)
                 if not video:
-                    bootstrap_errors.append(f"窗口 {task.serial} 缺少现成视频文件")
+                    bootstrap_errors.append(f"{task_runtime_key(task)} 缺少现成视频文件")
             if not bootstrap_errors:
                 resolved_dirs[tag] = str(folder)
                 warning = f"{tag} 将从现成视频目录自举 metadata/manifest: {folder}"

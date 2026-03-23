@@ -2760,32 +2760,64 @@ class DashboardApp(ctk.CTk):
         tags, skip_channels = derive_tags_and_skip_channels(plan, lambda tag: get_tag_info(tag) or {})
         retain_days = str(retain_days or "5")
         auto_close = bool(auto_close)
-        ordered_targets: list[tuple[str, int]] = []
-        seen_targets: set[tuple[str, int]] = set()
+        task_output_dirs = dict(plan.get("task_output_dirs") or {})
+        ordered_targets: list[WindowTask] = []
+        seen_targets: set[str] = set()
         for task in run_plan.tasks:
-            clean_tag = str(task.tag or "").strip()
-            key = (clean_tag, int(task.serial))
-            if not clean_tag or key in seen_targets:
+            runtime_key = task_runtime_key(task)
+            if runtime_key in seen_targets:
                 continue
-            seen_targets.add(key)
-            ordered_targets.append(key)
+            seen_targets.add(runtime_key)
+            ordered_targets.append(task)
 
         if len(ordered_targets) > 1 and detach:
             processes: list[tuple[str, subprocess.Popen[str]]] = []
-            for tag_name, serial in ordered_targets:
+            for task in ordered_targets:
+                runtime_key = task_runtime_key(task)
+                output_dir = Path(
+                    task_output_dirs.get(runtime_key)
+                    or plan.get("tag_output_dirs", {}).get(task.tag)
+                    or run_plan.output_root
+                )
+                single_modules = build_module_selection(metadata=False, render=False, upload=True)
+                single_run_plan = build_run_plan(
+                    tasks=[task],
+                    defaults=run_plan.defaults,
+                    modules=single_modules,
+                    config=dict(run_plan.config or {}),
+                )
+                single_plan = deepcopy(single_run_plan.window_plan)
+                single_plan["tasks"] = [task.to_plan_dict(1)]
+                single_plan["groups"] = {task.tag: [int(task.serial)]}
+                single_plan["tags"] = [task.tag]
+                single_plan["default_tag"] = task.tag
+                single_plan["tag_output_dirs"] = {task.tag: str(output_dir)}
+                single_plan["task_output_dirs"] = {runtime_key: str(output_dir)}
+                slot_suffix = (
+                    f"_{int(getattr(task, 'slot_index', 1)):02d}"
+                    if int(getattr(task, "total_slots", 1) or 1) > 1
+                    else ""
+                )
+                single_plan_path = save_window_plan(
+                    single_plan,
+                    run_plan.defaults.date_mmdd,
+                    path=SCRIPT_DIR
+                    / "data"
+                    / f"window_upload_plan_{run_plan.defaults.date_mmdd}_{task.serial}{slot_suffix}.json",
+                )
                 per_cmd = [
                     sys.executable,
                     "-u",
                     str(UPLOAD_SCRIPT),
                     "--tag",
-                    tag_name,
+                    task.tag,
                     "--date",
                     run_plan.defaults.date_mmdd,
                     "--channel",
-                    str(serial),
+                    str(task.serial),
                     "--auto-confirm",
                     "--window-plan-file",
-                    str(plan_path),
+                    str(single_plan_path),
                     "--retain-video-days",
                     retain_days,
                 ]
@@ -2802,7 +2834,7 @@ class DashboardApp(ctk.CTk):
                     errors="replace",
                     env=_subprocess_utf8_env(),
                 )
-                processes.append((f"{tag_name}/{serial}", proc))
+                processes.append((runtime_key, proc))
 
             self.worker_process = None
             self.upload_monitor_thread = None
@@ -4021,19 +4053,20 @@ def _patched_launch_stream_upload_for_task(
         modules=single_modules,
         config=current_config,
     )
+    runtime_key = task_runtime_key(task)
     plan = deepcopy(single_run_plan.window_plan)
     plan["tasks"] = [task.to_plan_dict(1)]
     plan["groups"] = {task.tag: [int(task.serial)]}
     plan["tags"] = [task.tag]
     plan["default_tag"] = task.tag
     plan["tag_output_dirs"] = {task.tag: str(output_dir)}
+    plan["task_output_dirs"] = {runtime_key: str(output_dir)}
     slot_suffix = f"_{int(getattr(task, 'slot_index', 1)):02d}" if int(getattr(task, "total_slots", 1) or 1) > 1 else ""
     plan_path = save_window_plan(
         plan,
         run_plan.defaults.date_mmdd,
         path=SCRIPT_DIR / "data" / f"window_upload_plan_{run_plan.defaults.date_mmdd}_{task.serial}{slot_suffix}.json",
     )
-    runtime_key = task_runtime_key(task)
     self._mark_run_stage(
         task.tag,
         task.serial,
@@ -4147,26 +4180,28 @@ def _patched_dispatch_upload_round(
     retain_days: str,
     auto_close: bool,
 ) -> list[str]:
-    with self._upload_process_lock:
-        self._upload_failures = []
-    launched = 0
-    output_dirs = dict(run_plan.window_plan.get("tag_output_dirs") or {})
-    for task in run_plan.tasks:
-        output_dir = Path(output_dirs.get(task.tag) or run_plan.output_root)
-        manifest_path = output_dir / "upload_manifest.json"
-        self._assert_manifest_ready_for_upload(manifest_path=manifest_path, task=task, output_dir=output_dir)
-        self._log(f"[Upload] Round dispatch -> {task_runtime_key(task)} | output={output_dir}")
-        self._launch_stream_upload_for_task(
-            run_plan,
-            task,
-            output_dir,
-            retain_days=retain_days,
-            auto_close=auto_close,
-        )
-        launched += 1
-    if launched == 0:
-        return []
-    return self._wait_for_stream_uploads()
+        with self._upload_process_lock:
+            self._upload_failures = []
+        launched = 0
+        output_dirs = dict(run_plan.window_plan.get("tag_output_dirs") or {})
+        task_output_dirs = dict(run_plan.window_plan.get("task_output_dirs") or {})
+        for task in run_plan.tasks:
+            runtime_key = task_runtime_key(task)
+            output_dir = Path(task_output_dirs.get(runtime_key) or output_dirs.get(task.tag) or run_plan.output_root)
+            manifest_path = output_dir / "upload_manifest.json"
+            self._assert_manifest_ready_for_upload(manifest_path=manifest_path, task=task, output_dir=output_dir)
+            self._log(f"[Upload] Round dispatch -> {runtime_key} | output={output_dir}")
+            self._launch_stream_upload_for_task(
+                run_plan,
+                task,
+                output_dir,
+                retain_days=retain_days,
+                auto_close=auto_close,
+            )
+            launched += 1
+        if launched == 0:
+            return []
+        return self._wait_for_stream_uploads()
 
 
 def _patched_start_real_flow(self: DashboardApp) -> None:
