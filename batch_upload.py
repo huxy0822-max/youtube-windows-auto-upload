@@ -3105,12 +3105,47 @@ async def _safe_accept_dialog(dialog) -> None:
 
 
 async def reload_with_optional_dialog(page, timeout: int = 15000) -> None:
-    """刷新页面时安全处理可能出现的 beforeunload 对话框。"""
+    """刷新页面时尽量避免 beforeunload 弹窗遗留影响后续页面操作。"""
     try:
-        page.once("dialog", lambda dialog: asyncio.create_task(_safe_accept_dialog(dialog)))
+        await page.evaluate(
+            """
+            () => {
+                try { window.onbeforeunload = null; } catch (e) {}
+                try {
+                    document.querySelectorAll('form').forEach(form => {
+                        try { form.onbeforeunload = null; } catch (e) {}
+                    });
+                } catch (e) {}
+            }
+            """
+        )
     except Exception:
         pass
-    await page.reload(timeout=timeout)
+
+    dialog_task = None
+
+    def _dialog_handler(dialog) -> None:
+        nonlocal dialog_task
+        dialog_task = asyncio.create_task(_safe_accept_dialog(dialog))
+
+    try:
+        page.on("dialog", _dialog_handler)
+    except Exception:
+        _dialog_handler = None
+
+    try:
+        await page.reload(timeout=timeout, wait_until="domcontentloaded")
+        if dialog_task:
+            try:
+                await asyncio.wait_for(dialog_task, timeout=3)
+            except Exception:
+                pass
+    finally:
+        if _dialog_handler:
+            try:
+                page.remove_listener("dialog", _dialog_handler)
+            except Exception:
+                pass
 
 
 async def human_fill(page, locator, text, desc=""):
@@ -7386,6 +7421,16 @@ async def batch_upload(
         
         container_code = str(container["containerCode"])
         is_ypp = serial in ypp_serials
+        window_task = find_window_task(window_plan, tag, serial)
+        manifest_channel = None
+        if manifest_data and isinstance(manifest_data.get("channels"), dict):
+            raw_manifest_channel = manifest_data["channels"].get(str(serial))
+            if isinstance(raw_manifest_channel, dict):
+                manifest_channel = merge_manifest_with_window_task(
+                    raw_manifest_channel,
+                    window_task,
+                    default_upload_options=plan_default_options,
+                )
         
         # 获取视频（按容器号精确匹配文件名）
         # AutoTask 格式: {MMDD}_{容器号}.mp4
@@ -7396,7 +7441,25 @@ async def batch_upload(
             if v_match and int(v_match.group(1)) == serial:
                 video = v
                 break
-        
+
+        if not video and manifest_channel:
+            preferred_names: List[str] = []
+            manifest_video_name = str(manifest_channel.get("video") or "").strip()
+            if manifest_video_name:
+                preferred_names.append(Path(manifest_video_name).name)
+            if window_task:
+                slot_index = int(getattr(window_task, "slot_index", 1) or 1)
+                total_slots = int(getattr(window_task, "total_slots", 1) or 1)
+                if total_slots > 1:
+                    preferred_names.append(f"{date_key}_{serial}_{slot_index:02d}.mp4")
+            for preferred_name in preferred_names:
+                for v in videos:
+                    if v.name == preferred_name:
+                        video = v
+                        break
+                if video:
+                    break
+
         if not video:
             log(f"序号 {serial}: 未找到匹配的视频文件", "WARN")
             continue
