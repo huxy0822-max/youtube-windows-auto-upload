@@ -3534,6 +3534,7 @@ class DashboardApp(ctk.CTk):
             )
             stream_upload = bool(run_plan.modules.render and run_plan.modules.upload)
             upload_dispatched = False
+            upload_launched = 0
 
             def handle_item_ready(task: WindowTask, output_dir: Path, _manifest_path: Path) -> None:
                 nonlocal upload_dispatched
@@ -4201,6 +4202,7 @@ def _patched_dispatch_upload_round(
             launched += 1
         if launched == 0:
             return []
+        self._log(f"[Upload] Round parallel upload started for {launched} windows")
         return self._wait_for_stream_uploads()
 
 
@@ -4298,15 +4300,17 @@ def _patched_start_real_flow(self: DashboardApp) -> None:
             )
             stream_upload = bool(round_plan.modules.upload and (round_plan.modules.render or round_plan.modules.metadata))
             upload_dispatched = False
+            upload_launched = 0
             with self._upload_process_lock:
                 self._upload_failures = []
 
             def handle_item_ready(task: WindowTask, output_dir: Path, manifest_path: Path) -> None:
-                nonlocal upload_dispatched
+                nonlocal upload_dispatched, upload_launched
                 if not stream_upload:
                     return
                 self._assert_manifest_ready_for_upload(manifest_path=manifest_path, task=task, output_dir=output_dir)
                 upload_dispatched = True
+                upload_launched += 1
                 self._log(f"[Upload] Round {round_number}: {task_runtime_key(task)} 已就绪，立即上传")
                 self._launch_stream_upload_for_task(
                     round_plan,
@@ -4326,6 +4330,7 @@ def _patched_start_real_flow(self: DashboardApp) -> None:
                 self._ingest_execution_result(execution)
                 if stream_upload:
                     if upload_dispatched:
+                        self._log(f"[Upload] Round {round_number}: parallel uploads already launched for {upload_launched} windows")
                         failures = self._wait_for_stream_uploads()
                         if self._cancel_requested:
                             return False
