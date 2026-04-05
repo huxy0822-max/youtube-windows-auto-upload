@@ -38,5 +38,15 @@
     "used_materials_dir": "F:\\已用素材",
     "used_videos_dir": "F:\\已用视频",
     "auto_delete_days": 3
+  },
+  "0405mega": {
+    "description": "通用默认路径配置",
+    "source_root": "F:\\Mega Bass\\0405",
+    "copywriting_output": "F:\\Mega Bass\\0405",
+    "thumbnail_output": "F:\\Mega Bass\\0405",
+    "render_output": "F:\\Mega Bass\\0405",
+    "used_materials_dir": "F:\\已用素材",
+    "used_videos_dir": "F:\\已用视频",
+    "auto_delete_days": 3
   }
 }
