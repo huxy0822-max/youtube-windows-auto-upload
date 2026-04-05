@@ -156,6 +156,17 @@ def list_tint_names() -> list[str]:
     return list(TINT_FILTERS.keys())
 
 
+def get_random_effects() -> dict[str, str]:
+    rng = random.Random()
+    return {
+        "spectrum": rng.choice(list_effects()),
+        "tint": rng.choice(list_tint_names()),
+        "zoom": rng.choice(list_zoom_modes()),
+        "timeline": rng.choice(["on", "off"]),
+        "letterbox": rng.choice(["on", "off"]),
+    }
+
+
 def list_particle_effects() -> list[str]:
     return ["none", *discover_particle_files().keys()]
 
@@ -207,7 +218,8 @@ def _overlay_needs_colorkey(path: Path) -> bool:
 
 
 def _particle_overlay_plan(name: str, *, visual_preset: str = "none", rng=None) -> dict[str, float]:
-    rng = rng or random
+    """粒子覆盖层参数规划，使用本地随机实例避免污染全局随机状态。"""
+    rng = rng or random.Random()
     lower = name.lower()
     if visual_preset == "mega_bass":
         if "light_waves" in lower:
@@ -295,7 +307,15 @@ def _escape_drawtext(text: str) -> str:
 
 
 def _escape_font_path(path: Path) -> str:
-    return str(path.resolve(strict=False)).replace("\\", "/").replace(":", r"\:")
+    """转义字体路径供 FFmpeg drawtext 使用，正确处理 Windows 盘符和反斜杠。"""
+    try:
+        resolved = str(path.resolve(strict=False))
+    except OSError:
+        # Windows 上 resolve 偶尔会因权限或路径格式失败
+        resolved = str(path.absolute())
+    raw = resolved.replace("\\", "/")
+    # FFmpeg drawtext 要求转义冒号（包括 Windows 盘符中的冒号）
+    return raw.replace(":", r"\:")
 
 
 def _coerce_int(value, default: int) -> int:

@@ -14,6 +14,7 @@ import base64
 import difflib
 import hashlib
 import json
+import logging
 import re
 import time
 import urllib.parse
@@ -34,6 +35,8 @@ from prompt_studio import (
     render_master_prompt,
 )
 
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT_SECONDS = 70
 AUDIENCE_ANALYSIS_MAX_TOKENS = 1400
@@ -68,7 +71,8 @@ def _read_json(path: Path, fallback: Any) -> Any:
         return fallback
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as exc:
+        print(f"[content_generation] JSON读取失败 {path}: {exc}")
         return fallback
 
 
@@ -1227,7 +1231,8 @@ def _call_openai_compatible(api_preset: dict, user_prompt: str, image_data_url: 
                 )
                 try:
                     data = response.json()
-                except Exception:
+                except Exception as e:
+                    logger.warning(f"API 响应 JSON 解析失败，保留原始文本: {e}")
                     data = {"raw_text": response.text}
                 if response.ok:
                     text = _extract_openai_response_text(data)
@@ -1387,7 +1392,8 @@ def analyze_audience_screenshot(api_preset: dict, image_data_url: str) -> dict[s
     raw = call_text_model(analysis_preset, prompt, image_data_url=image_data_url)
     try:
         payload = _parse_audience_json(raw)
-    except Exception:
+    except Exception as e:
+        logger.warning(f"受众分析 JSON 解析失败，尝试修复: {e}")
         payload = _repair_audience_json(raw, analysis_preset)
 
     return {
@@ -1490,8 +1496,8 @@ def generate_content_bundle(
         if log:
             try:
                 log(message)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"日志回调失败: {e}")
 
     _, api_preset, content_template = load_generation_context(
         prompt_studio_path,
@@ -1716,7 +1722,10 @@ def call_image_model(api_preset: dict, prompt: str) -> dict[str, Any]:
         timeout=DEFAULT_TIMEOUT_SECONDS,
     )
     raw = response.text
-    data = response.json()
+    try:
+        data = response.json()
+    except (ValueError, Exception):
+        raise RuntimeError(f"图片接口返回非JSON响应 HTTP {response.status_code}: {raw[:200]}")
     if not response.ok:
         raise RuntimeError(data.get("error", {}).get("message") or f"图片接口 HTTP {response.status_code}")
     content = data.get("choices", [{}])[0].get("message", {}).get("content")

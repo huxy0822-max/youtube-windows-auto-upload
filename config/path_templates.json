@@ -1,0 +1,42 @@
+{
+  "默认路径": {
+    "description": "通用默认路径配置",
+    "source_root": "F:\\Mega Bass",
+    "copywriting_output": "",
+    "thumbnail_output": "",
+    "render_output": "",
+    "used_materials_dir": "F:\\已用素材",
+    "used_videos_dir": "F:\\已用视频",
+    "auto_delete_days": 7
+  },
+  "0325mega": {
+    "description": "通用默认路径配置",
+    "source_root": "F:\\Mega Bass\\0326",
+    "copywriting_output": "F:\\Mega Bass\\0326",
+    "thumbnail_output": "F:\\Mega Bass\\0326",
+    "render_output": "F:\\Mega Bass\\0326",
+    "used_materials_dir": "F:\\已用素材",
+    "used_videos_dir": "F:\\已用视频",
+    "auto_delete_days": 3
+  },
+  "0326古风": {
+    "description": "通用默认路径配置",
+    "source_root": "F:\\古风\\0326\\0322_94_02",
+    "copywriting_output": "F:\\古风\\0326\\0322_94_02",
+    "thumbnail_output": "F:\\古风\\0326\\0322_94_02",
+    "render_output": "F:\\古风\\0326\\0322_94_02",
+    "used_materials_dir": "F:\\已用素材",
+    "used_videos_dir": "F:\\已用视频",
+    "auto_delete_days": 3
+  },
+  "0404mega": {
+    "description": "通用默认路径配置",
+    "source_root": "F:\\Mega Bass\\0403",
+    "copywriting_output": "F:\\Mega Bass\\0403",
+    "thumbnail_output": "F:\\Mega Bass\\0403",
+    "render_output": "F:\\Mega Bass\\0403",
+    "used_materials_dir": "F:\\已用素材",
+    "used_videos_dir": "F:\\已用视频",
+    "auto_delete_days": 3
+  }
+}

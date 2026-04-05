@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 YouTube 批量上传脚本
 根据标签组自动上传视频到对应的频道
@@ -10,6 +11,7 @@ YouTube 批量上传脚本
 
 import asyncio
 import argparse
+import contextvars
 import json
 import os
 import re
@@ -19,12 +21,19 @@ import random
 import subprocess
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Callable
 import platform
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+from archive_manager import ArchiveManager
 from browser_api import list_browser_envs, start_browser_debug_port, stop_browser_container
 from metadata_service import archive_uploaded_metadata
 from path_helpers import resolve_config_file
+from path_templates import get_path_template, load_path_templates
+from run_queue import GroupJob, UploadDefaults, WindowOverride
+from human_interaction import (
+    human_click, random_delay, scroll_dialog,
+    clear_blocking_overlays, scroll_to_element
+)
 from upload_window_planner import (
     find_window_task,
     load_window_upload_plan,
@@ -58,7 +67,6 @@ from utils import (
     parse_metadata as utils_parse_metadata,
     get_thumbnail_by_container,
     get_next_thumbnail_set,
-    load_config as utils_load_config,
     get_inventory_status
 )
 
@@ -81,11 +89,20 @@ RETRYABLE_NETWORK_ERROR_MARKERS = (
 )
 SUPPORTED_VIDEO_EXTENSIONS = (".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm")
 
-# 详细上传记录目录 (平台自适应)
-if IS_MAC:
-    UPLOAD_RECORDS_DIR = Path("/Users/dazhilv/Downloads/youtube automation/3.实测复盘/04_上传记录")
-else:
-    UPLOAD_RECORDS_DIR = SCRIPT_DIR / "upload_records"
+# ── 超时常量（毫秒） ──
+TIMEOUT_ELEMENT_VISIBLE = 15000
+TIMEOUT_UPLOAD_DETAILS = 150000
+TIMEOUT_UPLOAD_DETAILS_RETRY = 45000
+TIMEOUT_CLICK = 5000
+TIMEOUT_PAGE_LOAD = 120000
+TIMEOUT_WAIT_DOM = 10000
+TIMEOUT_PUBLISH_BUTTON = 25000
+
+# ── 描述长度限制 ──
+MAX_DESCRIPTION_LENGTH = 5000
+
+# 详细上传记录目录
+UPLOAD_RECORDS_DIR = SCRIPT_DIR / "upload_records"
 
 # ============ 播放列表名称映射 (方案三: 自动生成) ============
 # 特殊映射: tag → 播放列表名称 (如果不在这里, 自动生成 "超好聽的{tag}音樂")
@@ -190,7 +207,7 @@ def _count_matching_output_videos(folder: Path, date_key: str) -> int:
     for item in folder.iterdir():
         if not item.is_file() or item.suffix.lower() not in SUPPORTED_VIDEO_EXTENSIONS:
             continue
-        if re.match(rf"^{re.escape(date_key)}_(\\d+)\\.[^.]+$", item.name):
+        if re.match(rf"^{re.escape(date_key)}_(\d+)\.[^.]+$", item.name):
             count += 1
     return count
 
@@ -240,17 +257,100 @@ def _resolve_plan_output_dir(window_plan: Optional[Dict[str, Any]], tag: str, da
     candidates.sort(key=lambda item: (-item[0], str(item[1]).lower()))
     return candidates[0][1]
 
-def get_playlist_name(tag: str) -> str:
-    """根据标签获取播放列表名称"""
-    if tag in TAG_TO_PLAYLIST:
-        return TAG_TO_PLAYLIST[tag]
-    # 默认生成
-    return f"超好聽的{tag}音樂"
+# 内容模板 → 播放列表名称映射（优先级高于TAG_TO_PLAYLIST）
+CONTENT_TEMPLATE_TO_PLAYLIST: dict[str, str] = {
+    "MEGABASS": "超好聽的Mega Bass重低音音樂",
+    "木吉他": "超好聽的木吉他音樂",
+    "钢琴类": "超好聽的鋼琴音樂",
+    "弦乐琴类": "超好聽的弦樂音樂",
+    "Soft Rock&Power Ballad": "超好聽的Soft Rock & Power Ballad音樂",
+    "古风": "超好聽的古風音樂",
+    "disco": "超好聽的Disco音樂",
+}
+
+
+def get_playlist_name(tag: str, *, content_template: str = "", manifest_playlist: str = "") -> str:
+    """根据标签/内容模板获取播放列表名称。
+
+    优先级：
+    1. manifest中手动指定的playlist_name
+    2. 内容模板名称映射（CONTENT_TEMPLATE_TO_PLAYLIST）
+    3. TAG_TO_PLAYLIST标签映射
+    4. 内容模板名自动生成
+    5. 标签自动生成（但跳过明显的分组名，如含数字前缀的）
+    """
+    # 优先1: 手动指定
+    clean_manifest = str(manifest_playlist or "").strip()
+    if clean_manifest:
+        return clean_manifest
+
+    # 优先2: 内容模板映射
+    clean_template = str(content_template or "").strip()
+    if clean_template and clean_template in CONTENT_TEMPLATE_TO_PLAYLIST:
+        return CONTENT_TEMPLATE_TO_PLAYLIST[clean_template]
+
+    # 优先3: TAG映射
+    clean_tag = str(tag or "").strip()
+    if clean_tag and clean_tag in TAG_TO_PLAYLIST:
+        return TAG_TO_PLAYLIST[clean_tag]
+
+    # 优先4: 内容模板自动生成（如果有模板名且不是默认）
+    if clean_template and clean_template not in ("default", "默认", "默认模板"):
+        return f"超好聽的{clean_template}音樂"
+
+    # 优先5: 标签自动生成，但跳过明显的分组名（如"0127木吉他老号"、"测试111"等）
+    import re as _re
+    if clean_tag and not _re.match(r"^\d{2,}", clean_tag) and not _re.match(r".*\d{2,}$", clean_tag):
+        return f"超好聽的{clean_tag}音樂"
+
+    # 最后兜底: 如果tag看起来是分组名，不用它生成播放列表
+    return ""
 
 # ============ 日志 ============
 def log(msg, level="INFO"):
     timestamp = datetime.now().strftime("%H:%M:%S")
     icons = {"INFO": "ℹ️", "OK": "✅", "ERR": "❌", "WARN": "⚠️", "ACT": "🖱️", "WAIT": "⏳"}
+    icon = icons.get(level, "")
+    print(f"[{timestamp}] {icon} {msg}")
+
+
+_LOG_CONTEXT: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "batch_upload_log_context",
+    default=None,
+)
+
+
+def _emit_console_log(msg: str, level: str = "INFO") -> None:
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    icons = {"INFO": "[INFO]", "OK": "[OK]", "ERR": "[ERR]", "WARN": "[WARN]", "ACT": "[ACT]", "WAIT": "[WAIT]"}
+    icon = icons.get(level, "")
+    print(f"[{timestamp}] {icon} {msg}")
+
+
+def log(msg, level="INFO"):
+    context = _LOG_CONTEXT.get() or {}
+    prefix = str(context.get("prefix") or "").strip()
+    rendered = f"{prefix} {msg}".strip() if prefix else str(msg)
+    sink = context.get("sink")
+    if callable(sink):
+        try:
+            sink(rendered, level)
+            return
+        except Exception:
+            pass
+    _emit_console_log(rendered, level)
+
+
+def _emit_console_log(msg: str, level: str = "INFO") -> None:
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    icons = {
+        "INFO": "[INFO]",
+        "OK": "[OK]",
+        "ERR": "[ERR]",
+        "WARN": "[WARN]",
+        "ACT": "[ACT]",
+        "WAIT": "[WAIT]",
+    }
     icon = icons.get(level, "")
     print(f"[{timestamp}] {icon} {msg}")
 
@@ -370,69 +470,7 @@ def build_direct_upload_url(current_url: Optional[str] = None) -> str:
 
     return urlunparse(parsed._replace(path=upload_path, query=urlencode(query)))
 
-# ============ 人性化交互 ============
-async def random_delay(min_s=0.5, max_s=1.5, msg=""):
-    """人性化随机延迟"""
-    delay = random.uniform(min_s, max_s)
-    if msg:
-        log(f"{msg} ({delay:.1f}s)", "WAIT")
-    await asyncio.sleep(delay)
-
-async def clear_blocking_overlays(page, reason: str = ""):
-    """清理会拦截点击的 YouTube overlay/backdrop。"""
-    try:
-        removed = await page.evaluate(
-            """
-            () => {
-                const visible = (el) => !!el && (
-                    el.offsetParent !== null ||
-                    el.offsetWidth > 0 ||
-                    el.offsetHeight > 0
-                );
-                let count = 0;
-                document.querySelectorAll("tp-yt-iron-overlay-backdrop").forEach((el) => {
-                    if (visible(el) || el.hasAttribute("opened")) {
-                        el.style.display = "none";
-                        el.style.pointerEvents = "none";
-                        count += 1;
-                    }
-                });
-                return count;
-            }
-            """
-        )
-        if removed:
-            suffix = f" ({reason})" if reason else ""
-            log(f"已清理遮罩层 {removed} 个{suffix}", "WARN")
-    except Exception:
-        pass
-
-async def human_click(page, locator, desc=""):
-    """人性化点击 - 随机位置点击"""
-    log(f"点击: {desc}", "ACT")
-    try:
-        await clear_blocking_overlays(page, "pre-click")
-        await locator.wait_for(state="visible", timeout=15000)
-        box = await locator.bounding_box()
-        if box:
-            x = box['x'] + box['width'] * random.uniform(0.3, 0.7)
-            y = box['y'] + box['height'] * random.uniform(0.3, 0.7)
-            await page.mouse.move(x, y)
-            await asyncio.sleep(0.15)
-            await page.mouse.click(x, y)
-        else:
-            await locator.click()
-        return True
-    except Exception as e:
-        if "intercepts pointer events" in str(e) or "overlay-backdrop" in str(e):
-            try:
-                await clear_blocking_overlays(page, "click-retry")
-                await locator.click(force=True, timeout=5000)
-                return True
-            except Exception:
-                pass
-        log(f"点击失败: {e}", "WARN")
-        return False
+# ============ 人性化交互（已移到 human_interaction.py，通过 import 引入） ============
 
 
 async def _legacy_wait_for_upload_details_ready_shadow(page, timeout_ms: int = 90000) -> bool:
@@ -518,42 +556,12 @@ async def _legacy_wait_for_upload_details_ready_shadow(page, timeout_ms: int = 9
             )
             if ready:
                 return True
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"上传详情页就绪检测异常: {e}", "DEBUG")
 
         await asyncio.sleep(1)
 
     return False
-
-
-async def has_pending_upload_context(page, expected_filename: str = "") -> bool:
-    try:
-        return bool(
-            await page.evaluate(
-                """
-                ({ expectedFilename }) => {
-                    const bodyText = (document.body && document.body.innerText) ? document.body.innerText : '';
-                    const pageTitle = (document.title || '').trim();
-                    const hasUploadUrl = String(location.href || '').includes('/upload');
-                    const fileReady = !!Array.from(document.querySelectorAll("input[type='file']")).find(
-                        input => input.files && input.files.length > 0
-                    );
-                    const normalizedExpected = String(expectedFilename || '').trim().toLowerCase();
-                    const normalizedBody = bodyText.toLowerCase();
-                    const normalizedTitle = pageTitle.toLowerCase();
-                    const hasExpectedName = normalizedExpected && (normalizedBody.includes(normalizedExpected) || normalizedTitle.includes(normalizedExpected));
-                    const hasUploadShell = !!document.querySelector(
-                        "ytcp-uploads-dialog, ytcp-video-upload-progress, ytcp-video-thumbnail-with-info, #scrollable-content, #next-button"
-                    );
-                    const hasSaveBadge = /saved as private|saved as draft|uploading video|upload complete|filename|video link|details|visibility|视频链接|檔名|文件名/i.test(bodyText);
-                    return fileReady || hasExpectedName || hasUploadShell || hasSaveBadge || hasUploadUrl;
-                }
-                """,
-                {"expectedFilename": str(expected_filename or "").strip()},
-            )
-        )
-    except Exception:
-        return False
 
 
 async def is_phone_verification_required_for_upload(page) -> bool:
@@ -651,7 +659,7 @@ def _upload_context_probe_script() -> str:
             while (node) {
                 try {
                     if (node.innerText) {
-                        combinedText += '\n' + String(node.innerText);
+                        combinedText += '\\n' + String(node.innerText);
                     }
                     if (node.files && node.files.length > 0) {
                         fileReady = true;
@@ -718,8 +726,8 @@ async def wait_for_upload_details_ready(page, timeout_ms: int = 90000) -> bool:
             )
             if isinstance(probe, dict) and probe.get("ready"):
                 return True
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"上传上下文探测异常: {e}", "DEBUG")
         for selector in (
             "ytcp-uploads-dialog #next-button",
             "ytcp-uploads-dialog ytcp-button#next-button",
@@ -758,8 +766,8 @@ async def wait_for_upload_details_ready(page, timeout_ms: int = 90000) -> bool:
                 flags=re.I,
             ):
                 return True
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"上传上下文文本检查异常: {e}", "DEBUG")
         await asyncio.sleep(1)
     return False
 
@@ -1115,8 +1123,8 @@ async def ensure_upload_radio_selected(
                 await page.keyboard.press("Space")
                 clicked = True
                 log(f"{description} 点击成功 (keyboard_space)", "INFO")
-            except Exception:
-                pass
+            except Exception as e:
+                log(f"键盘Space点击失败: {e}", "DEBUG")
 
         await asyncio.sleep(0.9)
         for idx in visible_indices:
@@ -2694,8 +2702,8 @@ async def ensure_public_visibility_selected(page) -> bool:
             )
             if result.get("selected"):
                 return True
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"播放列表选择异常: {e}", "DEBUG")
 
         await asyncio.sleep(1)
 
@@ -2830,8 +2838,8 @@ async def wait_for_monetization_section(page, timeout_ms: int = 15000) -> bool:
             locator = page.locator("ytcp-video-monetization").first
             if await locator.count() > 0 and await locator.is_visible():
                 return True
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"收益化定位器检测异常: {e}", "DEBUG")
 
         try:
             ready = await page.evaluate(
@@ -2844,8 +2852,8 @@ async def wait_for_monetization_section(page, timeout_ms: int = 15000) -> bool:
             )
             if ready:
                 return True
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"收益化文本检测异常: {e}", "DEBUG")
 
         await asyncio.sleep(1)
 
@@ -3078,8 +3086,8 @@ async def ensure_monetization_enabled(page) -> bool:
         if await on_locator.count() > 0 and await on_locator.is_visible():
             await human_click(page, on_locator, "Monetization On")
             await asyncio.sleep(1)
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"收益化开关点击异常: {e}", "DEBUG")
 
     await try_click_monetization_on(page)
     await asyncio.sleep(1)
@@ -3105,47 +3113,12 @@ async def _safe_accept_dialog(dialog) -> None:
 
 
 async def reload_with_optional_dialog(page, timeout: int = 15000) -> None:
-    """刷新页面时尽量避免 beforeunload 弹窗遗留影响后续页面操作。"""
+    """刷新页面时安全处理可能出现的 beforeunload 对话框。"""
     try:
-        await page.evaluate(
-            """
-            () => {
-                try { window.onbeforeunload = null; } catch (e) {}
-                try {
-                    document.querySelectorAll('form').forEach(form => {
-                        try { form.onbeforeunload = null; } catch (e) {}
-                    });
-                } catch (e) {}
-            }
-            """
-        )
+        page.once("dialog", lambda dialog: asyncio.create_task(_safe_accept_dialog(dialog)))
     except Exception:
         pass
-
-    dialog_task = None
-
-    def _dialog_handler(dialog) -> None:
-        nonlocal dialog_task
-        dialog_task = asyncio.create_task(_safe_accept_dialog(dialog))
-
-    try:
-        page.on("dialog", _dialog_handler)
-    except Exception:
-        _dialog_handler = None
-
-    try:
-        await page.reload(timeout=timeout, wait_until="domcontentloaded")
-        if dialog_task:
-            try:
-                await asyncio.wait_for(dialog_task, timeout=3)
-            except Exception:
-                pass
-    finally:
-        if _dialog_handler:
-            try:
-                page.remove_listener("dialog", _dialog_handler)
-            except Exception:
-                pass
+    await page.reload(timeout=timeout)
 
 
 async def human_fill(page, locator, text, desc=""):
@@ -3170,8 +3143,8 @@ async def human_fill(page, locator, text, desc=""):
                 await locator.fill(text)
                 await asyncio.sleep(0.6)
                 return True
-            except Exception:
-                pass
+            except Exception as e:
+                log(f"填写重试异常: {e}", "DEBUG")
         log(f"填写失败: {e}", "WARN")
         return False
 
@@ -3378,8 +3351,8 @@ async def click_next_button(page, desc: str = "Next", timeout_ms: int = 25000) -
             host_disabled = await next_btn.get_attribute("aria-disabled")
             if host_disabled == "true":
                 return False
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"下一步按钮禁用检测异常: {e}", "DEBUG")
 
         try:
             inner = next_btn.locator("button").first
@@ -3455,8 +3428,8 @@ async def click_next_button(page, desc: str = "Next", timeout_ms: int = 25000) -
                     await next_btn.scroll_into_view_if_needed()
                     await next_btn.click(timeout=3000, force=True)
                     return True
-                except Exception:
-                    pass
+                except Exception as e:
+                    log(f"下一步按钮强制点击失败: {e}", "DEBUG")
 
                 try:
                     inner = next_btn.locator("button").first
@@ -3464,8 +3437,8 @@ async def click_next_button(page, desc: str = "Next", timeout_ms: int = 25000) -
                         await inner.scroll_into_view_if_needed()
                         await inner.click(timeout=3000, force=True)
                         return True
-                except Exception:
-                    pass
+                except Exception as e:
+                    log(f"内部按钮强制点击失败: {e}", "DEBUG")
 
         state = await get_visible_upload_dialog_button_state(
             page,
@@ -3511,17 +3484,6 @@ async def click_next_button(page, desc: str = "Next", timeout_ms: int = 25000) -
 
     return False
 
-
-async def scroll_dialog(page, pixels):
-    """在对话框内滚动 (验证成功 2026-01-30)
-    使用 #scrollable-content 而不是鼠标滚轮，更可靠
-    """
-    content = page.locator('ytcp-uploads-dialog #scrollable-content').first
-    if await content.count() > 0:
-        await content.evaluate(f'el => el.scrollTop += {pixels}')
-    else:
-        # 备用: 用鼠标滚轮
-        await page.mouse.wheel(0, pixels)
 
 
 async def handle_publish_anyway_dialog(
@@ -4530,7 +4492,7 @@ def select_file_with_clipboard(file_path: str):
     
     if IS_WINDOWS:
         # Windows: 用 PowerShell 复制路径到剪贴板
-        file_path_win = file_path.replace('/', '\\')
+        file_path_win = str(Path(file_path))
         subprocess.run(
             ['powershell', '-Command', f'Set-Clipboard -Value "{file_path_win}"'],
             check=True, timeout=5
@@ -4577,8 +4539,8 @@ async def ensure_upload_picker_open(page) -> bool:
     try:
         if await page.locator("input[type='file']").count() > 0:
             return True
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"文件输入框检测异常: {e}", "DEBUG")
 
     # 1) 若 Create 菜单已展开，先点 Upload videos
     try:
@@ -4630,8 +4592,8 @@ async def ensure_upload_picker_open(page) -> bool:
                     )
                     if clicked_upload:
                         await asyncio.sleep(2)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log(f"上传视频按钮点击异常: {e}", "DEBUG")
 
                 if await page.locator("input[type='file']").count() > 0:
                     return True
@@ -5770,8 +5732,9 @@ async def set_playlist(page, playlist_name: str) -> bool:
     从 test_playlist_final.py 提取的经验证逻辑
     """
     if not playlist_name:
+        log("播放列表名称为空，跳过设置", "WARN")
         return True
-    
+
     log(f"设置播放列表: '{playlist_name}'")
     
     # --- 打开播放列表面板 ---
@@ -6102,7 +6065,7 @@ async def upload_single(
     
     if not browser_already_running:
         log("等待浏览器完全启动...", "WAIT")
-        time.sleep(8)
+        await asyncio.sleep(8)
     
     async with async_playwright() as p:
         try:
@@ -6117,7 +6080,7 @@ async def upload_single(
                 except Exception as e:
                     if attempt < connect_retries - 1:
                         log(f"连接失败，重试 ({attempt + 1}/{connect_retries})...", "WARN")
-                        time.sleep(3)
+                        await asyncio.sleep(3)
                     else:
                         raise e
             
@@ -6368,7 +6331,7 @@ async def upload_single(
                 log(f"文件 {video_path.name} 已被上传输入框接收，跳过 file_select_failed 误判，继续做长等待", "WARN")
                 file_selected = True
             elif not file_selected and had_any_cdp_success:
-                log(f"鏂囦欢 {video_path.name} 宸插畬鎴?CDP 閫夋嫨锛屼氦缁欏悗缁暱绛夊緟閫昏緫缁х画鍒ゆ柇", "WARN")
+                log(f"文件 {video_path.name} 已完成 CDP 连接，交给后续长等待逻辑继续判断", "WARN")
                 file_selected = True
 
             if not file_selected:
@@ -6752,7 +6715,7 @@ async def upload_single(
                 except Exception:
                     actual_is_ypp = False
 
-            needs_monetization = bool(is_ypp or actual_is_ypp)
+            needs_monetization = _coerce_yes_no_bool(is_ypp, default=False) or bool(actual_is_ypp)
             
             if needs_monetization:
                 log("检测到/期望 YPP 频道，必须完成 Monetization", "OK")
@@ -7114,6 +7077,12 @@ async def upload_single(
         except Exception as e:
             log(f"上传失败: {e}", "ERR")
             return make_upload_result(False, True, f"上传失败: {e}", "upload_exception")
+        finally:
+            if browser:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
 
 # ============ 批量上传 ============
 async def batch_upload(
@@ -7301,7 +7270,10 @@ async def batch_upload(
                     find_window_task(window_plan, tag, serial),
                     default_upload_options=plan_default_options,
                 )
-                is_ypp = bool(ch_manifest.get("is_ypp", serial in ypp_serials))
+                is_ypp = _coerce_yes_no_bool(
+                    ch_manifest.get("is_ypp", serial in ypp_serials),
+                    default=serial in ypp_serials,
+                )
                 thumbnails = [Path(p) for p in ch_manifest.get("thumbnails", []) if Path(p).exists()]
                 title = ch_manifest.get("title", "默认")
                 channel_name = ch_manifest.get("channel_name") or serial_to_channel_name.get(serial, "未知")
@@ -7421,16 +7393,6 @@ async def batch_upload(
         
         container_code = str(container["containerCode"])
         is_ypp = serial in ypp_serials
-        window_task = find_window_task(window_plan, tag, serial)
-        manifest_channel = None
-        if manifest_data and isinstance(manifest_data.get("channels"), dict):
-            raw_manifest_channel = manifest_data["channels"].get(str(serial))
-            if isinstance(raw_manifest_channel, dict):
-                manifest_channel = merge_manifest_with_window_task(
-                    raw_manifest_channel,
-                    window_task,
-                    default_upload_options=plan_default_options,
-                )
         
         # 获取视频（按容器号精确匹配文件名）
         # AutoTask 格式: {MMDD}_{容器号}.mp4
@@ -7441,25 +7403,7 @@ async def batch_upload(
             if v_match and int(v_match.group(1)) == serial:
                 video = v
                 break
-
-        if not video and manifest_channel:
-            preferred_names: List[str] = []
-            manifest_video_name = str(manifest_channel.get("video") or "").strip()
-            if manifest_video_name:
-                preferred_names.append(Path(manifest_video_name).name)
-            if window_task:
-                slot_index = int(getattr(window_task, "slot_index", 1) or 1)
-                total_slots = int(getattr(window_task, "total_slots", 1) or 1)
-                if total_slots > 1:
-                    preferred_names.append(f"{date_key}_{serial}_{slot_index:02d}.mp4")
-            for preferred_name in preferred_names:
-                for v in videos:
-                    if v.name == preferred_name:
-                        video = v
-                        break
-                if video:
-                    break
-
+        
         if not video:
             log(f"序号 {serial}: 未找到匹配的视频文件", "WARN")
             continue
@@ -7473,7 +7417,10 @@ async def batch_upload(
                 find_window_task(window_plan, tag, serial),
                 default_upload_options=plan_default_options,
             )
-            is_ypp = bool(ch_manifest.get("is_ypp", serial in ypp_serials))
+            is_ypp = _coerce_yes_no_bool(
+                ch_manifest.get("is_ypp", serial in ypp_serials),
+                default=serial in ypp_serials,
+            )
             title = ch_manifest.get("title", "Video Title")
             description = ch_manifest.get("description", "")
             tag_list = [str(item).strip() for item in ch_manifest.get("tag_list", []) if str(item).strip()]
@@ -7482,8 +7429,8 @@ async def batch_upload(
             visibility = str(upload_options.get("visibility") or "public").strip().lower()
             scheduled_publish_at = str(upload_options.get("scheduled_publish_at") or "").strip() or None
             schedule_timezone = str(upload_options.get("schedule_timezone") or "").strip() or None
-            made_for_kids = bool(upload_options.get("made_for_kids", False))
-            altered_content = bool(upload_options.get("altered_content", True))
+            made_for_kids = _coerce_yes_no_bool(upload_options.get("made_for_kids", False), default=False)
+            altered_content = _coerce_yes_no_bool(upload_options.get("altered_content", True), default=True)
             category = str(upload_options.get("category") or "Music").strip() or "Music"
             # 【空标题阻断】标题为空时跳过，避免浪费浏览器资源
             if not title or title == "Video Title":
@@ -7532,7 +7479,11 @@ async def batch_upload(
         
         # 上传
         await wait_for_window_slot()
-        playlist_name = get_playlist_name(tag)
+        playlist_name = get_playlist_name(
+            tag,
+            content_template=str(ch_manifest.get("content_template_name") or ""),
+            manifest_playlist=str(ch_manifest.get("playlist_name") or ""),
+        )
         if thumbnails:
             thumb_preview = ", ".join(str(path) for path in thumbnails[:3])
             log(f"序号 {serial}: 本次上传缩略图 -> {thumb_preview}", "INFO")
@@ -7557,7 +7508,7 @@ async def batch_upload(
                 schedule_timezone=schedule_timezone,
                 made_for_kids=made_for_kids,
                 altered_content=altered_content,
-                notify_subscribers=bool(ch_manifest.get("notify_subscribers", False)),
+                notify_subscribers=_coerce_yes_no_bool(ch_manifest.get("notify_subscribers", False), default=False),
                 category=category,
             )
         except Exception as e:
@@ -8521,7 +8472,7 @@ def load_channel_mapping_registry() -> Dict[int, Dict[str, Any]]:
         with open(CHANNEL_MAPPING_PATH, "r", encoding="utf-8") as f:
             mapping_data = json.load(f)
     except Exception as e:
-        log(f"璇诲彇 channel_mapping.json 澶辫触: {e}", "WARN")
+        log(f"读取 channel_mapping.json 失败: {e}", "WARN")
         return registry
 
     for container_code, info in (mapping_data.get("channels", {}) or {}).items():
@@ -8563,11 +8514,11 @@ def get_all_containers() -> List[Dict]:
         except Exception as e:
             last_error = e
             if attempt < 3:
-                log(f"鑾峰彇鐜鍒楄〃澶辫触锛岀 {attempt} 娆￠噸璇? {e}", "WARN")
+                log(f"获取环境列表失败，第 {attempt} 次重试: {e}", "WARN")
                 time.sleep(min(1.5 * attempt, 4.0))
                 continue
     if last_error is not None:
-        log(f"鑾峰彇鐜鍒楄〃澶辫触: {last_error}", "ERR")
+        log(f"获取环境列表失败: {last_error}", "ERR")
     return []
 
 
@@ -8639,6 +8590,997 @@ def resolve_containers_for_tag(
             return mapped, "channel_mapping_fallback", serial_to_channel_name
 
     return [], "missing", serial_to_channel_name
+
+
+ProgressCallback = Callable[[dict[str, Any]], None]
+
+
+def _emit_progress(progress_callback: ProgressCallback | None, payload: dict[str, Any]) -> None:
+    if not callable(progress_callback):
+        return
+    try:
+        progress_callback(dict(payload))
+    except Exception:
+        pass
+
+
+def _normalize_job_modules(job: GroupJob) -> set[str]:
+    legacy_modules = {
+        str(module_name or "").strip().lower()
+        for module_name in (job.modules or [])
+        if str(module_name or "").strip()
+    }
+    step_names = {
+        str(step_name or "").strip().lower()
+        for step_name in (getattr(job, "steps", None) or [])
+        if str(step_name or "").strip()
+    }
+    step_modules: set[str] = set()
+    if "generate" in step_names:
+        step_modules.add("metadata")
+    if "render" in step_names:
+        step_modules.add("render")
+    if "upload" in step_names:
+        step_modules.add("upload")
+    if legacy_modules and legacy_modules != {"metadata", "render", "upload"}:
+        return legacy_modules
+    if step_modules:
+        return step_modules
+    return legacy_modules or {"metadata", "render", "upload"}
+
+
+def _coerce_yes_no_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    if not text:
+        return default
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _compose_job_schedule_text(defaults: UploadDefaults) -> Optional[str]:
+    schedule_date = str(defaults.schedule_date or "").strip()
+    schedule_time = str(defaults.schedule_time or "").strip()
+    if not schedule_date or not schedule_time:
+        return None
+    return f"{schedule_date} {schedule_time}"
+
+
+def _safe_load_upload_runtime_config() -> dict[str, Any]:
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _resolve_manifest_media_path(source_dir: Path, raw_value: Any) -> Optional[Path]:
+    text = str(raw_value or "").strip()
+    if not text:
+        return None
+    path = Path(text)
+    if not path.is_absolute():
+        path = source_dir / path
+    return path
+
+
+def _folder_matches_serial(folder: Path, serial_number: int) -> bool:
+    text = str(folder.name or "").strip()
+    if not text:
+        return False
+    return bool(re.search(rf"(^|[_\-\s]){int(serial_number)}($|[_\-\s])", text))
+
+
+def _iter_media_search_dirs(source_dir: Path, serial_number: int) -> list[Path]:
+    if not source_dir.exists() or not source_dir.is_dir():
+        return []
+    ordered: list[Path] = []
+    seen: set[str] = set()
+
+    def register(folder: Path) -> None:
+        try:
+            key = str(folder.resolve(strict=False)).lower()
+        except Exception:
+            key = str(folder).lower()
+        if key in seen or not folder.exists() or not folder.is_dir():
+            return
+        seen.add(key)
+        ordered.append(folder)
+
+    register(source_dir)
+    for child in sorted(
+        (item for item in source_dir.iterdir() if item.is_dir() and _folder_matches_serial(item, serial_number)),
+        key=lambda item: item.name.lower(),
+    ):
+        register(child)
+    for child in sorted(
+        (
+            item
+            for item in source_dir.rglob("*")
+            if item.is_dir() and _folder_matches_serial(item, serial_number)
+        ),
+        key=lambda item: (len(item.relative_to(source_dir).parts), item.name.lower()),
+    ):
+        register(child)
+    return ordered
+
+
+def _resolve_job_video_path(source_dir: Path, metadata_dict: dict[str, Any], serial_number: int) -> Path:
+    direct = _resolve_manifest_media_path(source_dir, metadata_dict.get("video"))
+    if direct and direct.exists():
+        return direct
+    pattern = re.compile(rf"^\d{{4}}_{int(serial_number)}(?:_[0-9]{{2}})?\.[^.]+$", re.IGNORECASE)
+    for folder in _iter_media_search_dirs(source_dir, serial_number) or [source_dir]:
+        for item in sorted(folder.iterdir(), key=lambda path: path.name.lower()):
+            if item.is_file() and item.suffix.lower() in SUPPORTED_VIDEO_EXTENSIONS and pattern.match(item.name):
+                return item
+        for item in sorted(folder.iterdir(), key=lambda path: path.name.lower()):
+            if item.is_file() and item.suffix.lower() in SUPPORTED_VIDEO_EXTENSIONS:
+                return item
+    raise FileNotFoundError(f"missing video for serial {serial_number} in {source_dir}")
+
+
+def _resolve_job_thumbnails(source_dir: Path, metadata_dict: dict[str, Any]) -> list[Path]:
+    thumbnails: list[Path] = []
+    for raw_path in metadata_dict.get("thumbnails", []) or []:
+        path = _resolve_manifest_media_path(source_dir, raw_path)
+        if path and path.exists():
+            thumbnails.append(path)
+    return thumbnails
+
+
+def _resolve_job_date_key(video_path: Path) -> str:
+    match = re.match(r"^(\d{4})_\d+", video_path.name)
+    if match:
+        return match.group(1)
+    return datetime.now().strftime("%m%d")
+
+
+def _load_container_registry_for_serials(group_tag: str, serial_numbers: list[int]) -> dict[int, dict[str, Any]]:
+    wanted = {int(serial) for serial in serial_numbers if int(serial)}
+    registry: dict[int, dict[str, Any]] = {}
+    containers, _, _ = resolve_containers_for_tag(group_tag, None, globals().get("ACTIVE_WINDOW_PLAN"))
+    for container in containers:
+        try:
+            serial = int(container.get("serialNumber") or 0)
+        except (TypeError, ValueError):
+            continue
+        if serial in wanted:
+            registry[serial] = dict(container)
+    if wanted.difference(registry):
+        for serial, container in load_channel_mapping_registry().items():
+            if serial in wanted and serial not in registry:
+                registry[serial] = dict(container)
+    return registry
+
+
+def _build_group_upload_options(metadata_dict: dict[str, Any], defaults: UploadDefaults) -> dict[str, Any]:
+    upload_options = metadata_dict.get("upload_options") if isinstance(metadata_dict.get("upload_options"), dict) else {}
+    default_kids = bool(defaults.is_for_kids)
+    default_altered = _coerce_yes_no_bool(defaults.altered_content, default=True)
+    default_notify = _coerce_yes_no_bool(metadata_dict.get("notify_subscribers", False), default=False)
+    default_auto_close = _coerce_yes_no_bool(defaults.auto_close_after, default=False)
+    visibility = str(upload_options.get("visibility") or defaults.visibility or "private").strip().lower() or "private"
+    scheduled_publish_at = str(upload_options.get("scheduled_publish_at") or "").strip() or _compose_job_schedule_text(defaults)
+    schedule_timezone = str(upload_options.get("schedule_timezone") or defaults.timezone or "Asia/Taipei").strip() or "Asia/Taipei"
+    return {
+        "visibility": visibility,
+        "scheduled_publish_at": scheduled_publish_at or None,
+        "schedule_timezone": schedule_timezone or None,
+        "made_for_kids": _coerce_yes_no_bool(
+            upload_options.get("made_for_kids", defaults.is_for_kids),
+            default=default_kids,
+        ),
+        "altered_content": _coerce_yes_no_bool(upload_options.get("altered_content", defaults.altered_content), default=default_altered),
+        "notify_subscribers": _coerce_yes_no_bool(
+            upload_options.get("notify_subscribers", metadata_dict.get("notify_subscribers", False)),
+            default=default_notify,
+        ),
+        "category": str(upload_options.get("category") or defaults.category or "Music").strip() or "Music",
+        "auto_close_after": _coerce_yes_no_bool(
+            upload_options.get("auto_close_after", defaults.auto_close_after),
+            default=default_auto_close,
+        ),
+    }
+
+
+def _find_window_override(job: GroupJob, serial_number: int) -> WindowOverride | None:
+    for override in job.window_overrides:
+        if int(override.serial) == int(serial_number):
+            return override
+    return None
+
+
+def _resolve_schedule_for_override(
+    override: WindowOverride | None,
+    defaults: UploadDefaults,
+    visibility: str,
+) -> str:
+    if visibility != "schedule":
+        return ""
+    schedule_mode = str((override.schedule_mode if override else "") or "").strip().lower()
+    override_date = str((override.schedule_date if override else "") or "").strip()
+    override_time = str((override.schedule_time if override else "") or "").strip()
+    default_date = str(defaults.schedule_date or "").strip()
+    default_time = str(defaults.schedule_time or "").strip()
+    if schedule_mode == "none":
+        return ""
+    if schedule_mode == "custom":
+        date_text = override_date or default_date
+        time_text = override_time or default_time
+        if date_text and time_text:
+            return f"{date_text} {time_text}"
+        return _compose_job_schedule_text(defaults) or ""
+    if override_date and override_time:
+        return f"{override_date} {override_time}"
+    if override_time and default_date:
+        return f"{default_date} {override_time}"
+    if override_date and default_time:
+        return f"{override_date} {default_time}"
+    return _compose_job_schedule_text(defaults) or ""
+
+
+def _build_upload_options_for_serial(
+    job: GroupJob,
+    metadata_dict: dict[str, Any],
+    defaults: UploadDefaults,
+    serial_number: int,
+) -> dict[str, Any]:
+    upload_options = _build_group_upload_options(metadata_dict, defaults)
+    override = _find_window_override(job, serial_number)
+    if override is None:
+        return upload_options
+
+    if str(override.visibility or "").strip():
+        upload_options["visibility"] = str(override.visibility).strip().lower()
+    if str(override.category or "").strip():
+        upload_options["category"] = str(override.category).strip()
+    if str(override.kids_content or "").strip():
+        upload_options["made_for_kids"] = _coerce_yes_no_bool(override.kids_content, default=False)
+    if str(override.ai_content or "").strip():
+        upload_options["altered_content"] = _coerce_yes_no_bool(override.ai_content, default=True)
+    schedule_text = _resolve_schedule_for_override(override, defaults, str(upload_options.get("visibility") or "").strip().lower())
+    upload_options["scheduled_publish_at"] = schedule_text or None
+    return upload_options
+
+
+def _apply_window_override_to_metadata(
+    job: GroupJob,
+    metadata_dict: dict[str, Any],
+    defaults: UploadDefaults,
+    serial_number: int,
+) -> dict[str, Any]:
+    payload = dict(metadata_dict)
+    override = _find_window_override(job, serial_number)
+    if override is None:
+        return payload
+    if str(override.ypp or "").strip():
+        payload["is_ypp"] = _coerce_yes_no_bool(
+            override.ypp,
+            default=_coerce_yes_no_bool(payload.get("is_ypp", False), default=False),
+        )
+    upload_options = payload.get("upload_options")
+    base_upload_options = dict(upload_options) if isinstance(upload_options, dict) else {}
+    base_upload_options.update(_build_upload_options_for_serial(job, payload, defaults, serial_number))
+    payload["upload_options"] = base_upload_options
+    return payload
+
+
+def _collect_archive_material_paths(source_dir: Path, metadata_dict: dict[str, Any]) -> list[str]:
+    candidates: list[str] = []
+    for key in ("source_audio", "source_image"):
+        path = _resolve_manifest_media_path(source_dir, metadata_dict.get(key))
+        if path and path.exists():
+            candidates.append(str(path))
+    for raw_thumb in metadata_dict.get("thumbnails", []) or []:
+        path = _resolve_manifest_media_path(source_dir, raw_thumb)
+        if path and path.exists():
+            candidates.append(str(path))
+    for name in ("upload_manifest.json", "generation_map.json"):
+        candidate = source_dir / name
+        if candidate.exists():
+            candidates.append(str(candidate))
+    return candidates
+
+
+def _slot_upload_label(group_tag: str, serial_number: int, slot_index: int, total_slots: int) -> str:
+    base = f"{group_tag}/{int(serial_number)}" if str(group_tag or "").strip() else str(int(serial_number))
+    if int(total_slots or 1) <= 1:
+        return base
+    return f"{base}#{int(slot_index or 1):02d}"
+
+
+def _discover_manifest_directories(job: GroupJob) -> list[Path]:
+    source_dir = Path(job.source_dir)
+    discovered: list[Path] = []
+    seen: set[str] = set()
+
+    def register(path_value: str | Path | None) -> None:
+        if path_value is None:
+            return
+        candidate = Path(path_value)
+        manifest_path = candidate / "upload_manifest.json"
+        if not manifest_path.exists():
+            return
+        key = str(candidate.resolve(strict=False)).lower()
+        if key in seen:
+            return
+        seen.add(key)
+        discovered.append(candidate)
+
+    for raw_dir in getattr(job, "_prepared_manifest_dirs", []) or []:
+        register(raw_dir)
+    register(source_dir)
+
+    expected_slots = max(1, int(job.videos_per_window or 1))
+    if source_dir.exists() and len(discovered) < expected_slots:
+        for manifest_path in sorted(source_dir.rglob("upload_manifest.json")):
+            register(manifest_path.parent)
+    return discovered
+
+
+def _load_manifest_channels(manifest_dir: Path) -> dict[str, dict[str, Any]]:
+    manifest_path = manifest_dir / "upload_manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    channels = payload.get("channels") if isinstance(payload, dict) else {}
+    if not isinstance(channels, dict):
+        raise RuntimeError(f"invalid upload manifest: {manifest_path}")
+    normalized: dict[str, dict[str, Any]] = {}
+    for key, value in channels.items():
+        if isinstance(value, dict):
+            normalized[str(key)] = dict(value)
+    return normalized
+
+
+async def _upload_window_slots(
+    *,
+    job: GroupJob,
+    defaults: UploadDefaults,
+    serial_number: int,
+    entries: list[tuple[Path, dict[str, Any]]],
+    archive_manager: ArchiveManager | None,
+    progress_callback: ProgressCallback | None,
+    has_prepare_step: bool,
+) -> list[dict[str, Any]]:
+    total_slots = max(1, int(job.videos_per_window or 1))
+    results: list[dict[str, Any]] = []
+    for slot_index in range(1, total_slots + 1):
+        if slot_index > len(entries):
+            results.append(
+                await _return_failed_window_result(
+                    group_tag=str(job.group_tag or "").strip(),
+                    serial_number=serial_number,
+                    detail=f"missing prepared manifest for serial {serial_number} slot {slot_index}/{total_slots}",
+                    progress_callback=progress_callback,
+                    has_prepare_step=has_prepare_step,
+                    slot_index=slot_index,
+                    total_slots=total_slots,
+                )
+            )
+            continue
+        source_dir, channel_payload = entries[slot_index - 1]
+        effective_payload = _apply_window_override_to_metadata(job, dict(channel_payload), defaults, int(serial_number))
+        upload_options = _build_upload_options_for_serial(job, effective_payload, defaults, int(serial_number))
+        result = await upload_single_window(
+            int(serial_number),
+            effective_payload,
+            str(source_dir),
+            upload_options,
+            group_tag=str(job.group_tag or "").strip(),
+            progress_callback=progress_callback,
+            has_prepare_step=has_prepare_step,
+            slot_index=slot_index,
+            total_slots=total_slots,
+        )
+        results.append(result)
+        if archive_manager is None or not bool(result.get("success")):
+            continue
+        try:
+            moved_materials = archive_manager.archive_materials(
+                str(source_dir),
+                _collect_archive_material_paths(source_dir, effective_payload),
+            )
+            moved_video = archive_manager.archive_video(str(result.get("video_path") or ""))
+            label = _slot_upload_label(str(job.group_tag or "").strip(), serial_number, slot_index, total_slots)
+            if moved_materials:
+                _emit_progress(
+                    progress_callback,
+                    {
+                        "type": "log",
+                        "message": f"[Archive {label}] 素材已归档 {len(moved_materials)} 个",
+                        "level": "INFO",
+                        "group_tag": str(job.group_tag or "").strip(),
+                        "serial": int(serial_number),
+                        "label": label,
+                        "slot_index": slot_index,
+                        "total_slots": total_slots,
+                    },
+                )
+            if moved_video:
+                _emit_progress(
+                    progress_callback,
+                    {
+                        "type": "log",
+                        "message": f"[Archive {label}] 视频已归档 -> {moved_video}",
+                        "level": "INFO",
+                        "group_tag": str(job.group_tag or "").strip(),
+                        "serial": int(serial_number),
+                        "label": label,
+                        "slot_index": slot_index,
+                        "total_slots": total_slots,
+                    },
+                )
+        except Exception as exc:
+            _emit_progress(
+                progress_callback,
+                {
+                    "type": "log",
+                    "message": f"[Archive {_slot_upload_label(str(job.group_tag or '').strip(), serial_number, slot_index, total_slots)}] 归档失败: {exc}",
+                    "level": "WARN",
+                    "group_tag": str(job.group_tag or "").strip(),
+                    "serial": int(serial_number),
+                    "label": _slot_upload_label(str(job.group_tag or "").strip(), serial_number, slot_index, total_slots),
+                    "slot_index": slot_index,
+                    "total_slots": total_slots,
+                },
+            )
+    return results
+
+
+async def upload_single_window(
+    serial_number: int,
+    metadata_dict: dict[str, Any],
+    source_dir: str,
+    upload_options: dict[str, Any],
+    *,
+    group_tag: str = "",
+    progress_callback: ProgressCallback | None = None,
+    has_prepare_step: bool = True,
+    slot_index: int = 1,
+    total_slots: int = 1,
+) -> dict[str, Any]:
+    label = _slot_upload_label(group_tag, serial_number, slot_index, total_slots)
+    source_path = Path(source_dir)
+    upload_result = make_upload_result(False, True, "not_started", "not_started")
+    video_path: Optional[Path] = None
+    thumbnails: list[Path] = []
+    container_code = ""
+    channel_name = str(metadata_dict.get("channel_name") or "").strip()
+    title = str(metadata_dict.get("title") or "").strip()
+    description = str(metadata_dict.get("description") or "").strip()
+    tag_list = [str(item).strip() for item in metadata_dict.get("tag_list", []) if str(item).strip()]
+    thumbnail_prompts = [str(item).strip() for item in metadata_dict.get("thumbnail_prompts", []) if str(item).strip()]
+    ab_titles = [str(item).strip() for item in metadata_dict.get("ab_titles", []) if str(item).strip()] or None
+    is_ypp = _coerce_yes_no_bool(metadata_dict.get("is_ypp", False), default=False)
+    date_key = datetime.now().strftime("%m%d")
+    config = _safe_load_upload_runtime_config()
+
+    def sink(message: str, level: str = "INFO") -> None:
+        _emit_progress(
+            progress_callback,
+            {
+                "type": "log",
+                "message": message,
+                "level": level,
+                "group_tag": group_tag,
+                "serial": int(serial_number),
+                "label": label,
+            },
+        )
+
+    try:
+        container_registry = _load_container_registry_for_serials(group_tag, [serial_number])
+        container_info = dict(container_registry.get(int(serial_number)) or {})
+        container_code = str(container_info.get("containerCode") or "").strip()
+        if not container_code:
+            raise RuntimeError(f"missing container mapping for serial {serial_number}")
+        if not channel_name:
+            channel_name = str(container_info.get("name") or f"频道{serial_number}").strip()
+        if not title:
+            raise RuntimeError(f"{label} missing title in upload_manifest.json")
+        video_path = _resolve_job_video_path(source_path, metadata_dict, serial_number)
+        date_key = _resolve_job_date_key(video_path)
+        thumbnails = _resolve_job_thumbnails(source_path, metadata_dict)
+        playlist_name = get_playlist_name(
+            group_tag or str(metadata_dict.get("tag") or ""),
+            content_template=str(metadata_dict.get("content_template_name") or ""),
+            manifest_playlist=str(metadata_dict.get("playlist_name") or ""),
+        )
+
+        _emit_progress(
+            progress_callback,
+            {
+                "type": "window_started",
+                "group_tag": group_tag,
+                "serial": int(serial_number),
+                "label": label,
+                "has_prepare_step": bool(has_prepare_step),
+                "window_count": 1,
+                "slot_index": int(slot_index or 1),
+                "total_slots": int(total_slots or 1),
+            },
+        )
+        token = _LOG_CONTEXT.set({"prefix": f"[Upload {label}]", "sink": sink})
+        try:
+            upload_result = await upload_single_with_browser_recovery(
+                container_code=container_code,
+                serial=serial_number,
+                video_path=video_path,
+                thumbnails=thumbnails,
+                title=title,
+                description=description,
+                is_ypp=is_ypp,
+                ab_test_titles=ab_titles,
+                playlist_name=playlist_name,
+                tags=tag_list,
+                visibility=str(upload_options.get("visibility") or "private"),
+                scheduled_publish_at=upload_options.get("scheduled_publish_at"),
+                schedule_timezone=upload_options.get("schedule_timezone"),
+                made_for_kids=_coerce_yes_no_bool(upload_options.get("made_for_kids", False), default=False),
+                altered_content=_coerce_yes_no_bool(upload_options.get("altered_content", True), default=True),
+                notify_subscribers=_coerce_yes_no_bool(upload_options.get("notify_subscribers", False), default=False),
+                category=str(upload_options.get("category") or "Music"),
+            )
+            success = bool(upload_result.get("success"))
+            close_browser_now = bool(upload_result.get("close_browser", True))
+            stage = str(upload_result.get("stage") or "").strip()
+            if _coerce_yes_no_bool(upload_options.get("auto_close_after"), default=False):
+                if success and close_browser_now:
+                    stop_browser(container_code)
+                elif not success and stage == "publish_pending_monitor" and not close_browser_now:
+                    launch_tail_close_watcher(
+                        serial=serial_number,
+                        container_code=container_code,
+                        debug_port=upload_result.get("debug_port"),
+                    )
+        finally:
+            _LOG_CONTEXT.reset(token)
+
+        if bool(upload_result.get("success")) and video_path is not None:
+            try:
+                archive_uploaded_metadata(
+                    tag=group_tag,
+                    serial=serial_number,
+                    date_mmdd=date_key,
+                    title=title,
+                    description=description,
+                    tag_list=tag_list,
+                    thumbnail_prompts=thumbnail_prompts,
+                    thumbnails=thumbnails,
+                    config=config,
+                    move_files=True,
+                    log=lambda message: sink(message, "INFO"),
+                )
+            except Exception as exc:
+                sink(f"[Metadata] archive failed: {exc}", "WARN")
+    except Exception as exc:
+        upload_result = make_upload_result(False, True, str(exc), "group_job_exception")
+        _emit_progress(
+            progress_callback,
+            {
+                "type": "log",
+                "message": f"[Upload {label}] exception: {exc}",
+                "level": "ERR",
+                "group_tag": group_tag,
+                "serial": int(serial_number),
+                "label": label,
+                "slot_index": int(slot_index or 1),
+                "total_slots": int(total_slots or 1),
+            },
+        )
+
+    success = bool(upload_result.get("success"))
+    stage = str(upload_result.get("stage") or "").strip() or ("success" if success else "upload_failed")
+    detail = "" if success else str(upload_result.get("reason") or stage).strip()
+
+    if video_path is not None:
+        try:
+            save_upload_record(
+                tag=group_tag,
+                date=date_key,
+                serial=serial_number,
+                channel_name=channel_name or f"频道{serial_number}",
+                video_path=video_path,
+                thumbnails=thumbnails,
+                title=title,
+                description=description,
+                is_ypp=is_ypp,
+                ab_test_titles=ab_titles,
+                success=success,
+                stage=stage,
+                failure_reason="" if success else detail,
+            )
+        except Exception:
+            pass
+
+    result = {
+        "group_tag": group_tag,
+        "serial": int(serial_number),
+        "label": label,
+        "success": success,
+        "stage": stage,
+        "detail": detail,
+        "container_code": container_code,
+        "video_path": str(video_path) if video_path else "",
+        "slot_index": int(slot_index or 1),
+        "total_slots": int(total_slots or 1),
+    }
+    _emit_progress(
+        progress_callback,
+        {
+            "type": "window_finished",
+            **result,
+            "has_prepare_step": bool(has_prepare_step),
+        },
+    )
+    return result
+
+
+async def _return_failed_window_result(
+    *,
+    group_tag: str,
+    serial_number: int,
+    detail: str,
+    progress_callback: ProgressCallback | None,
+    has_prepare_step: bool,
+    slot_index: int = 1,
+    total_slots: int = 1,
+) -> dict[str, Any]:
+    label = _slot_upload_label(group_tag, serial_number, slot_index, total_slots)
+    _emit_progress(
+        progress_callback,
+        {
+            "type": "window_finished",
+            "group_tag": group_tag,
+            "serial": int(serial_number),
+            "label": label,
+            "success": False,
+            "stage": "manifest_error",
+            "detail": detail,
+            "has_prepare_step": bool(has_prepare_step),
+            "slot_index": int(slot_index or 1),
+            "total_slots": int(total_slots or 1),
+        },
+    )
+    return {
+        "group_tag": group_tag,
+        "serial": int(serial_number),
+        "label": label,
+        "success": False,
+        "stage": "manifest_error",
+        "detail": detail,
+        "slot_index": int(slot_index or 1),
+        "total_slots": int(total_slots or 1),
+    }
+
+
+async def execute_group_job(
+    job: GroupJob,
+    defaults: UploadDefaults,
+    progress_callback: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    modules = _normalize_job_modules(job)
+    has_prepare_step = bool({"metadata", "render"} & modules)
+    summary = {
+        "group_tag": str(job.group_tag or "").strip(),
+        "window_count": len(job.window_serials),
+        "success_count": 0,
+        "failed_count": 0,
+        "results": [],
+    }
+    _emit_progress(
+        progress_callback,
+        {
+            "type": "group_started",
+            "group_tag": summary["group_tag"],
+            "window_count": summary["window_count"],
+            "window_serials": [int(serial) for serial in job.window_serials],
+            "modules": sorted(modules),
+            "has_prepare_step": has_prepare_step,
+        },
+    )
+    if "upload" not in modules:
+        _emit_progress(
+            progress_callback,
+            {
+                "type": "group_finished",
+                **summary,
+                "skipped": True,
+            },
+        )
+        return summary
+
+    source_dir = Path(job.source_dir)
+    manifest_path = source_dir / "upload_manifest.json"
+    if not manifest_path.exists():
+        message = f"upload_manifest.json not found: {manifest_path}"
+        results = [
+            await _return_failed_window_result(
+                group_tag=summary["group_tag"],
+                serial_number=serial,
+                detail=message,
+                progress_callback=progress_callback,
+                has_prepare_step=has_prepare_step,
+            )
+            for serial in job.window_serials
+        ]
+        summary["results"] = results
+        summary["failed_count"] = len(results)
+        _emit_progress(progress_callback, {"type": "group_finished", **summary})
+        return summary
+
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    channels = payload.get("channels") if isinstance(payload, dict) else {}
+    if not isinstance(channels, dict):
+        message = f"invalid upload manifest: {manifest_path}"
+        results = [
+            await _return_failed_window_result(
+                group_tag=summary["group_tag"],
+                serial_number=serial,
+                detail=message,
+                progress_callback=progress_callback,
+                has_prepare_step=has_prepare_step,
+            )
+            for serial in job.window_serials
+        ]
+        summary["results"] = results
+        summary["failed_count"] = len(results)
+        _emit_progress(progress_callback, {"type": "group_finished", **summary})
+        return summary
+
+    coroutines: list[Any] = []
+    for serial in job.window_serials:
+        channel_payload = channels.get(str(serial))
+        if not isinstance(channel_payload, dict):
+            coroutines.append(
+                _return_failed_window_result(
+                    group_tag=summary["group_tag"],
+                    serial_number=serial,
+                    detail=f"missing channel payload for serial {serial}",
+                    progress_callback=progress_callback,
+                    has_prepare_step=has_prepare_step,
+                )
+            )
+            continue
+        effective_payload = _apply_window_override_to_metadata(job, dict(channel_payload), defaults, int(serial))
+        upload_options = _build_upload_options_for_serial(job, effective_payload, defaults, int(serial))
+        coroutines.append(
+            upload_single_window(
+                int(serial),
+                effective_payload,
+                str(source_dir),
+                upload_options,
+                group_tag=summary["group_tag"],
+                progress_callback=progress_callback,
+                has_prepare_step=has_prepare_step,
+            )
+        )
+
+    results: list[dict[str, Any]] = []
+    for item in await asyncio.gather(*coroutines, return_exceptions=True):
+        if isinstance(item, Exception):
+            results.append(
+                {
+                    "group_tag": summary["group_tag"],
+                    "serial": 0,
+                    "label": summary["group_tag"],
+                    "success": False,
+                    "stage": "group_job_exception",
+                    "detail": str(item),
+                }
+            )
+            continue
+        results.append(dict(item))
+
+    summary["results"] = results
+    summary["success_count"] = len([item for item in results if bool(item.get("success"))])
+    summary["failed_count"] = len(results) - summary["success_count"]
+
+    if summary["success_count"]:
+        _, path_template = get_path_template(job.path_template, templates=load_path_templates())
+        archive_manager = ArchiveManager(path_template)
+        result_by_serial = {
+            int(item.get("serial") or 0): item
+            for item in results
+            if bool(item.get("success")) and int(item.get("serial") or 0) > 0
+        }
+        for serial in job.window_serials:
+            serial_number = int(serial)
+            if serial_number not in result_by_serial:
+                continue
+            channel_payload = channels.get(str(serial_number))
+            if not isinstance(channel_payload, dict):
+                continue
+            effective_payload = _apply_window_override_to_metadata(job, dict(channel_payload), defaults, serial_number)
+            try:
+                moved_materials = archive_manager.archive_materials(
+                    str(source_dir),
+                    _collect_archive_material_paths(source_dir, effective_payload),
+                )
+                moved_video = archive_manager.archive_video(str(result_by_serial[serial_number].get("video_path") or ""))
+                if moved_materials:
+                    _emit_progress(
+                        progress_callback,
+                        {
+                            "type": "log",
+                            "message": f"[Archive {summary['group_tag']}/{serial_number}] 素材已归档 {len(moved_materials)} 个",
+                            "level": "INFO",
+                            "group_tag": summary["group_tag"],
+                            "serial": serial_number,
+                            "label": f"{summary['group_tag']}/{serial_number}",
+                        },
+                    )
+                if moved_video:
+                    _emit_progress(
+                        progress_callback,
+                        {
+                            "type": "log",
+                            "message": f"[Archive {summary['group_tag']}/{serial_number}] 视频已归档 -> {moved_video}",
+                            "level": "INFO",
+                            "group_tag": summary["group_tag"],
+                            "serial": serial_number,
+                            "label": f"{summary['group_tag']}/{serial_number}",
+                        },
+                    )
+            except Exception as exc:
+                _emit_progress(
+                    progress_callback,
+                    {
+                        "type": "log",
+                        "message": f"[Archive {summary['group_tag']}/{serial_number}] 归档失败: {exc}",
+                        "level": "WARN",
+                        "group_tag": summary["group_tag"],
+                        "serial": serial_number,
+                        "label": f"{summary['group_tag']}/{serial_number}",
+                    },
+                )
+    _emit_progress(progress_callback, {"type": "group_finished", **summary})
+    return summary
+
+
+async def _execute_group_job_v2(
+    job: GroupJob,
+    defaults: UploadDefaults,
+    progress_callback: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    modules = _normalize_job_modules(job)
+    has_prepare_step = bool({"metadata", "render"} & modules)
+    summary = {
+        "group_tag": str(job.group_tag or "").strip(),
+        "window_count": len(job.window_serials),
+        "videos_per_window": max(1, int(job.videos_per_window or 1)),
+        "success_count": 0,
+        "failed_count": 0,
+        "results": [],
+    }
+    _emit_progress(
+        progress_callback,
+        {
+            "type": "group_started",
+            "group_tag": summary["group_tag"],
+            "window_count": summary["window_count"],
+            "window_serials": [int(serial) for serial in job.window_serials],
+            "modules": sorted(modules),
+            "has_prepare_step": has_prepare_step,
+        },
+    )
+    if "upload" not in modules:
+        _emit_progress(
+            progress_callback,
+            {
+                "type": "group_finished",
+                **summary,
+                "skipped": True,
+            },
+        )
+        return summary
+
+    manifest_dirs = _discover_manifest_directories(job)
+    if not manifest_dirs:
+        source_dir = Path(job.source_dir)
+        message = f"upload_manifest.json not found in {source_dir}"
+        results = [
+            await _return_failed_window_result(
+                group_tag=summary["group_tag"],
+                serial_number=int(serial),
+                detail=message,
+                progress_callback=progress_callback,
+                has_prepare_step=has_prepare_step,
+            )
+            for serial in job.window_serials
+        ]
+        summary["results"] = results
+        summary["failed_count"] = len(results)
+        _emit_progress(progress_callback, {"type": "group_finished", **summary})
+        return summary
+
+    entries_by_serial: dict[int, list[tuple[Path, dict[str, Any]]]] = {
+        int(serial): []
+        for serial in job.window_serials
+    }
+    manifest_error = ""
+    for manifest_dir in manifest_dirs:
+        try:
+            channels = _load_manifest_channels(manifest_dir)
+        except Exception as exc:
+            manifest_error = str(exc)
+            break
+        for serial in job.window_serials:
+            channel_payload = channels.get(str(int(serial)))
+            if isinstance(channel_payload, dict):
+                entries_by_serial[int(serial)].append((manifest_dir, dict(channel_payload)))
+    if manifest_error:
+        results = [
+            await _return_failed_window_result(
+                group_tag=summary["group_tag"],
+                serial_number=int(serial),
+                detail=manifest_error,
+                progress_callback=progress_callback,
+                has_prepare_step=has_prepare_step,
+            )
+            for serial in job.window_serials
+        ]
+        summary["results"] = results
+        summary["failed_count"] = len(results)
+        _emit_progress(progress_callback, {"type": "group_finished", **summary})
+        return summary
+
+    archive_manager: ArchiveManager | None = None
+    try:
+        _, path_template = get_path_template(job.path_template, templates=load_path_templates())
+        archive_manager = ArchiveManager(path_template)
+    except Exception:
+        archive_manager = None
+
+    coroutines: list[Any] = []
+    for serial in job.window_serials:
+        serial_number = int(serial)
+        coroutines.append(
+            _upload_window_slots(
+                job=job,
+                defaults=defaults,
+                serial_number=serial_number,
+                entries=entries_by_serial.get(serial_number, []),
+                archive_manager=archive_manager,
+                progress_callback=progress_callback,
+                has_prepare_step=has_prepare_step,
+            )
+        )
+
+    results: list[dict[str, Any]] = []
+    for item in await asyncio.gather(*coroutines, return_exceptions=True):
+        if isinstance(item, Exception):
+            results.append(
+                {
+                    "group_tag": summary["group_tag"],
+                    "serial": 0,
+                    "label": summary["group_tag"],
+                    "success": False,
+                    "stage": "group_job_exception",
+                    "detail": str(item),
+                    "slot_index": 1,
+                    "total_slots": 1,
+                }
+            )
+            continue
+        if isinstance(item, list):
+            results.extend(dict(row) for row in item)
+            continue
+        results.append(dict(item))
+
+    summary["results"] = results
+    summary["success_count"] = len([item for item in results if bool(item.get("success"))])
+    summary["failed_count"] = len(results) - summary["success_count"]
+    _emit_progress(progress_callback, {"type": "group_finished", **summary})
+    return summary
+
+
+execute_group_job = _execute_group_job_v2
 
 
 def main():

@@ -1,13 +1,24 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import json
+import logging
 import shutil
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
 from prompt_studio import normalize_tag_key
+
+logger = logging.getLogger(__name__)
+
+# 缓存锁，保证线程安全
+_CACHE_LOCK = threading.RLock()
+
+# 元数据行数上限
+MAX_METADATA_ROWS = 20000
 
 SCRIPT_DIR = Path(__file__).parent
 UPLOAD_RECORDS_ROOT = SCRIPT_DIR / "upload_records"
@@ -21,12 +32,35 @@ def _noop_log(_message: str) -> None:
     return
 
 
-def _read_json(path: Path, fallback: Any) -> Any:
-    if not path.exists():
-        return fallback
+class BatchDedup:
+    """同批次文案去重 — 仅在内存中，不做历史持久化"""
+
+    def __init__(self) -> None:
+        self.used_titles: set[str] = set()
+        self.used_descriptions: set[str] = set()
+
+    def is_duplicate(self, title: str, description: str) -> bool:
+        return title in self.used_titles or description in self.used_descriptions
+
+    def record(self, title: str, description: str) -> None:
+        self.used_titles.add(title)
+        self.used_descriptions.add(description)
+
+    def reset(self) -> None:
+        self.used_titles.clear()
+        self.used_descriptions.clear()
+
+
+def _read_json(path: Path, fallback: Any = None) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    except FileNotFoundError:
+        return fallback
+    except json.JSONDecodeError as e:
+        logger.warning(f"JSON 解析失败 {path}: {e}")
+        return fallback
+    except Exception as e:
+        logger.warning(f"读取文件失败 {path}: {e}")
         return fallback
 
 
@@ -217,7 +251,8 @@ def sync_uploaded_history_into_used_metadata(
 ) -> bool:
     cache_key = _cache_key_for_history_sync(config, tag)
     now = time.time()
-    last_sync = _UPLOAD_HISTORY_SYNC_CACHE.get(cache_key, 0.0)
+    with _CACHE_LOCK:
+        last_sync = _UPLOAD_HISTORY_SYNC_CACHE.get(cache_key, 0.0)
     if min_interval_seconds > 0 and now - last_sync < min_interval_seconds:
         return False
 
@@ -282,10 +317,11 @@ def sync_uploaded_history_into_used_metadata(
     if changed:
         for tag_key, rows in list(tags.items()):
             if isinstance(rows, list):
-                tags[tag_key] = rows[-20000:]
+                tags[tag_key] = rows[-MAX_METADATA_ROWS:]
         _write_json(get_used_metadata_history_path(config), data)
 
-    _UPLOAD_HISTORY_SYNC_CACHE[cache_key] = now
+    with _CACHE_LOCK:
+        _UPLOAD_HISTORY_SYNC_CACHE[cache_key] = now
     return changed
 
 

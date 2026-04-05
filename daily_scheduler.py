@@ -11,6 +11,7 @@
 - 这次整理后，路径会优先解析到当前仓库内的 `config/`，不再默认写死 macOS 目录。
 """
 
+import logging
 import os
 import sys
 import json
@@ -35,6 +36,8 @@ from path_helpers import (
     normalize_scheduler_config,
     resolve_upload_script,
 )
+
+logger = logging.getLogger(__name__)
 
 # ============ 平台检测 ============
 IS_WINDOWS = platform.system() == "Windows"
@@ -360,8 +363,8 @@ def read_done_duration(filepath: Path) -> float:
         text = marker.read_text(encoding='utf-8').strip()
         if '|dur=' in text:
             return float(text.split('|dur=')[1])
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"读取 .done 标记文件失败 {marker}: {e}")
     return 0.0
 
 def is_complete(filepath: Path) -> bool:
@@ -457,8 +460,8 @@ def get_audio_duration(filepath) -> float:
             dur = float(out_val)
             if dur > 0:
                 return dur
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"ffprobe 获取时长失败，尝试 ffmpeg 全解码: {e}")
 
     # 方法 2: ffmpeg 全解码 (最可靠，对任何格式都准确)
     try:
@@ -482,9 +485,9 @@ def get_audio_duration(filepath) -> float:
                 dur = float(h) * 3600 + float(m) * 60 + float(s)
                 if dur > 0:
                     return dur
-    except Exception:
-        pass
-    
+    except Exception as e:
+        logger.warning(f"ffmpeg 全解码获取时长失败 {Path(filepath).name}: {e}")
+
     print(f"  ⚠️ 无法获取时长 {Path(filepath).name}, 默认180s")
     return 180.0
 
@@ -591,7 +594,8 @@ def build_master_audio_task(tag: str, mp3_pool: list, output_path: Path, task_id
         list_file.unlink(missing_ok=True)
         for lnk in temp_links:
             try: lnk.unlink(missing_ok=True)
-            except: pass
+            except Exception as e:
+                logger.warning(f"清理临时链接失败: {e}")
         actual_dur = get_audio_duration(output_path)
         elapsed = time.time() - start_time
         print(f"  ✅ [{tag}] 母带 #{task_id} 完成: 实际时长 {actual_dur:.0f}s ({actual_dur/60:.1f}min), 耗时 {elapsed:.1f}s")
@@ -670,7 +674,8 @@ def render_video_task(tag: str, image_path, audio_path, output_path, filter_comp
         for tmp in [tmp_img, tmp_aud]:
             if tmp:
                 try: tmp.unlink(missing_ok=True)
-                except: pass
+                except Exception as e:
+                    logger.warning(f"清理临时文件失败: {e}")
         
         # 冷却: 让 CPU 短暂喘息，防止持续满载导致热功耗过高
         # 特别是在多并行时，这能给电池充电的机会
@@ -1116,7 +1121,8 @@ def detect_audio_bpm_profile(audio_path: str) -> tuple[float, float]:
         first_peak_time = first_peak_idx / env_rate
         phase = (math.pi / 2.0) - (2.0 * math.pi * (bpm / 60.0) * first_peak_time)
         return round(float(bpm), 2), float(phase)
-    except Exception:
+    except Exception as e:
+        logger.warning(f"BPM 分析失败，使用默认值 128.0: {e}")
         return 128.0, 0.0
 
 def phase2_build_master_audios(active_projects: list) -> dict:
@@ -1471,7 +1477,16 @@ def save_render_history(opts: RenderOptions, active_projects: list, total_render
         history = []
         if HISTORY_FILE.exists():
             with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
-                history = json.load(f)
+                raw_text = f.read().strip()
+            if raw_text:
+                loaded = json.loads(raw_text)
+                if isinstance(loaded, list):
+                    history = loaded
+                elif isinstance(loaded, dict):
+                    maybe_history = loaded.get("history")
+                    history = maybe_history if isinstance(maybe_history, list) else []
+            else:
+                history = []
         
         history.append({
             "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1521,8 +1536,8 @@ def deep_clean_old_images():
                     if img_date < cutoff:
                         img.unlink()
                         old_count += 1
-                except:
-                    pass
+                except Exception as e:
+                    logger.warning(f"清理旧图片失败 {img.name}: {e}")
     if old_count:
         print(f"  🧹 清理了 {old_count} 张旧图片")
     else:

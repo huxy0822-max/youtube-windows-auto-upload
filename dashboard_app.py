@@ -1,14 +1,18 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import asyncio
 import base64
 from copy import deepcopy
 import io
 import json
 import os
+import platform
 import queue
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -16,8 +20,11 @@ from typing import Any, Callable
 
 import customtkinter as ctk
 from PIL import Image, ImageGrab
-from tkinter import filedialog, messagebox, ttk
+import tkinter as tk
+import tkinter.font as tkfont
+from tkinter import filedialog, messagebox, simpledialog
 
+from browser_api import list_browser_envs, set_runtime_provider, get_runtime_provider, probe_browser_providers
 from content_generation import _parse_json_like, analyze_audience_screenshot, call_image_model, call_text_model
 from effects_library import (
     list_effects,
@@ -32,27 +39,39 @@ from effects_library import (
 from prompt_studio import (
     find_explicit_api_preset_name,
     find_explicit_content_template_name,
-    load_prompt_studio_config,
     pick_api_preset_name,
     pick_content_template_name,
 )
 from path_helpers import normalize_scheduler_config
+from path_templates import (
+    DEFAULT_PATH_TEMPLATE_NAME,
+    PATH_TEMPLATES_FILE,
+    build_runtime_config,
+    get_path_template,
+    load_path_templates,
+    normalize_path_template,
+    resolve_source_dir,
+    save_path_templates,
+)
 from run_plan_service import (
     build_module_selection,
     build_run_plan,
     execute_run_plan,
+    execute_run_queue,
     execute_simulation_plan,
     preview_run_plan,
     validate_run_plan,
 )
+from run_queue import GroupJob, RunQueue, UploadDefaults, WindowOverride
 from group_upload_workflow import normalize_mmdd
 from upload_window_planner import derive_tags_and_skip_channels
-from utils import get_all_tags, get_tag_info
+from utils import get_tag_info
 from workflow_core import (
     CHANNEL_MAPPING_FILE,
     ExecutionControl,
     PROMPT_STUDIO_FILE,
     SCHEDULER_CONFIG_FILE,
+    WindowInfo,
     WindowTask,
     WorkflowDefaults,
     WorkflowCancelledError,
@@ -75,6 +94,8 @@ SCRIPT_DIR = Path(__file__).parent
 STATE_FILE = SCRIPT_DIR / "dashboard_state.json"
 UPLOAD_SCRIPT = SCRIPT_DIR / "batch_upload.py"
 RUN_SNAPSHOT_FILE = SCRIPT_DIR / "data" / "last_run_snapshot.json"
+UPLOAD_CONFIG_FILE = SCRIPT_DIR / "config" / "upload_config.json"
+VISUAL_PRESETS_FILE = SCRIPT_DIR / "config" / "visual_presets.json"
 
 TASK_MODE_VALUES = {
     "本日只上传": "upload_only",
@@ -107,9 +128,21 @@ METADATA_MODE_LABELS = {
 }
 METADATA_MODE_VALUES = list(METADATA_MODE_LABELS.keys())
 SCHEDULE_TIMEZONE_VALUES = ["Asia/Taipei (+08:00)"]
+WINDOW_SCHEDULE_MODE_LABELS = {
+    "不定时": "none",
+    "使用默认规则": "default",
+    "自定义": "custom",
+}
+WINDOW_SCHEDULE_MODE_VALUES = list(WINDOW_SCHEDULE_MODE_LABELS.keys())
+WINDOW_SCHEDULE_MODE_CHOICES = {value: key for key, value in WINDOW_SCHEDULE_MODE_LABELS.items()}
+QUEUE_VIDEOS_PER_WINDOW_VALUES = ["1", "2", "3", "4", "5", "6"]
 WINDOW_BUTTONS_PER_ROW = 6
 VISUAL_TOGGLE_VALUES = ["yes", "no"]
 RANDOM_OPTION = "random"
+QUEUE_VISUAL_RANDOM = "随机"
+QUEUE_VISUAL_MANUAL = "手动"
+VISUAL_PRESET_NONE = "无预设"
+VISUAL_PRESET_HINT_TEMPLATE = "当前使用预设: {name} — 取消预设后可手动编辑"
 
 
 ctk.set_appearance_mode("dark")
@@ -227,6 +260,48 @@ def _compose_schedule_text(date_value: str, time_value: str) -> str:
     return f"{date_text} {time_text}"
 
 
+def _window_schedule_mode_to_value(choice: str) -> str:
+    clean_choice = str(choice or "").strip()
+    return WINDOW_SCHEDULE_MODE_LABELS.get(clean_choice, clean_choice if clean_choice in WINDOW_SCHEDULE_MODE_CHOICES else "default")
+
+
+def _window_schedule_mode_to_choice(value: str) -> str:
+    clean_value = str(value or "").strip().lower()
+    return WINDOW_SCHEDULE_MODE_CHOICES.get(clean_value, "使用默认规则")
+
+
+def _resolve_window_schedule_override(
+    override: WindowOverride | None,
+    defaults: UploadDefaults,
+    visibility: str,
+) -> tuple[str, str, str, str]:
+    clean_visibility = str(visibility or "").strip().lower()
+    default_date = str(defaults.schedule_date or "").strip()
+    default_time = str(defaults.schedule_time or "").strip()
+    if clean_visibility != "schedule":
+        return "none", "", "", ""
+
+    schedule_mode = str((override.schedule_mode if override else "") or "").strip().lower()
+    override_date = str((override.schedule_date if override else "") or "").strip()
+    override_time = str((override.schedule_time if override else "") or "").strip()
+
+    if not schedule_mode and (override_date or override_time):
+        schedule_mode = "custom"
+    if not schedule_mode:
+        schedule_mode = "default"
+
+    if schedule_mode == "none":
+        return "none", "", "", ""
+    if schedule_mode == "custom":
+        date_value = override_date or default_date or _default_schedule_date()
+        time_value = override_time or default_time or "06:00"
+        return "custom", date_value, time_value, _compose_schedule_text(date_value, time_value)
+
+    date_value = default_date or _default_schedule_date()
+    time_value = default_time or "06:00"
+    return "default", date_value, time_value, _compose_schedule_text(date_value, time_value)
+
+
 def _format_runtime_duration(seconds: float | int | None) -> str:
     total = max(0, int(seconds or 0))
     hours, remainder = divmod(total, 3600)
@@ -236,8 +311,290 @@ def _format_runtime_duration(seconds: float | int | None) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
+def _load_json_object(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _write_json_object(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _load_group_specs_from_upload_config(
+    upload_config_path: Path = UPLOAD_CONFIG_FILE,
+) -> dict[str, dict[str, Any]]:
+    raw_config = _load_json_object(upload_config_path)
+    raw_groups = raw_config.get("tag_to_project") or {}
+    group_specs: dict[str, dict[str, Any]] = {}
+    for raw_tag, raw_value in raw_groups.items():
+        clean_tag = str(raw_tag or "").strip()
+        if not clean_tag or not isinstance(raw_value, dict):
+            continue
+        ypp_serials = {_int_or_none(item) for item in (raw_value.get("ypp_serials") or [])}
+        non_ypp_serials = {_int_or_none(item) for item in (raw_value.get("non_ypp_serials") or [])}
+        serials = sorted(
+            serial
+            for serial in (ypp_serials | non_ypp_serials)
+            if serial is not None
+        )
+        group_specs[clean_tag] = {
+            "serials": serials,
+            "ypp_serials": {serial for serial in ypp_serials if serial is not None},
+        }
+    return group_specs
+
+
+def _load_channel_mapping_lookup(
+    channel_mapping_path: Path = CHANNEL_MAPPING_FILE,
+) -> tuple[dict[str, dict[str, Any]], dict[int, dict[str, Any]]]:
+    raw_mapping = _load_json_object(channel_mapping_path)
+    raw_channels = raw_mapping.get("channels") or {}
+    by_container: dict[str, dict[str, Any]] = {}
+    by_serial: dict[int, dict[str, Any]] = {}
+    for container_code, info in raw_channels.items():
+        if not isinstance(info, dict):
+            continue
+        serial = _int_or_none(info.get("serial_number"))
+        if serial is None:
+            continue
+        entry = {
+            "serial": serial,
+            "tag": str(info.get("tag") or "").strip(),
+            "channel_name": str(info.get("channel_name") or "").strip(),
+        }
+        clean_container = str(container_code or "").strip()
+        if clean_container:
+            by_container[clean_container] = entry
+        by_serial[serial] = entry
+    return by_container, by_serial
+
+
+def _build_group_catalog_from_config(
+    upload_config_path: Path = UPLOAD_CONFIG_FILE,
+    channel_mapping_path: Path = CHANNEL_MAPPING_FILE,
+) -> tuple[dict[str, list[WindowInfo]], Exception | None]:
+    group_specs = _load_group_specs_from_upload_config(upload_config_path)
+    catalog: dict[str, list[WindowInfo]] = {tag: [] for tag in group_specs}
+    if not group_specs:
+        return catalog, None
+
+    by_container, by_serial = _load_channel_mapping_lookup(channel_mapping_path)
+    serial_to_group: dict[int, str] = {}
+    for tag, spec in group_specs.items():
+        for serial in spec["serials"]:
+            serial_to_group.setdefault(serial, tag)
+
+    browser_error: Exception | None = None
+    try:
+        live_envs = list_browser_envs(upload_config_path)
+    except Exception as exc:
+        browser_error = exc
+        live_envs = None
+
+    if live_envs is not None:
+        for env in live_envs:
+            mapped = by_container.get(str(env.get("containerCode") or "").strip())
+            serial = mapped.get("serial") if mapped else _int_or_none(env.get("serialNumber"))
+            if serial is None:
+                continue
+
+            target_tag = serial_to_group.get(serial)
+            if not target_tag:
+                mapped_tag = str((mapped or {}).get("tag") or "").strip()
+                env_tag = str(env.get("tag") or "").strip()
+                if mapped_tag in group_specs and serial in group_specs[mapped_tag]["serials"]:
+                    target_tag = mapped_tag
+                elif env_tag in group_specs and serial in group_specs[env_tag]["serials"]:
+                    target_tag = env_tag
+            if not target_tag:
+                continue
+
+            if any(item.serial == serial for item in catalog[target_tag]):
+                continue
+
+            fallback_entry = by_serial.get(serial) or {}
+            channel_name = str(
+                (mapped or {}).get("channel_name")
+                or env.get("name")
+                or fallback_entry.get("channel_name")
+                or ""
+            ).strip()
+            catalog[target_tag].append(
+                WindowInfo(
+                    tag=target_tag,
+                    serial=serial,
+                    channel_name=channel_name,
+                    is_ypp=serial in group_specs[target_tag]["ypp_serials"],
+                )
+            )
+
+        for rows in catalog.values():
+            rows.sort(key=lambda item: item.serial)
+        return catalog, None
+
+    for tag, spec in group_specs.items():
+        windows: list[WindowInfo] = []
+        for serial in spec["serials"]:
+            fallback_entry = by_serial.get(serial) or {}
+            windows.append(
+                WindowInfo(
+                    tag=tag,
+                    serial=serial,
+                    channel_name=str(fallback_entry.get("channel_name") or "").strip(),
+                    is_ypp=serial in spec["ypp_serials"],
+                )
+            )
+        catalog[tag] = windows
+    return catalog, browser_error
+
+
+def _build_live_group_catalog_from_browser(
+    upload_config_path: Path = UPLOAD_CONFIG_FILE,
+    channel_mapping_path: Path = CHANNEL_MAPPING_FILE,
+) -> tuple[dict[str, list[WindowInfo]], dict[str, list[str]], Exception | None]:
+    group_specs = _load_group_specs_from_upload_config(upload_config_path)
+    by_container, by_serial = _load_channel_mapping_lookup(channel_mapping_path)
+    try:
+        live_envs = list_browser_envs()
+    except Exception as exc:
+        fallback_catalog, _ = _build_group_catalog_from_config(upload_config_path, channel_mapping_path)
+        fallback_groups = {
+            tag: [str(int(item.serial)) for item in rows]
+            for tag, rows in fallback_catalog.items()
+        }
+        return fallback_catalog, fallback_groups, exc
+
+    catalog: dict[str, list[WindowInfo]] = {}
+    live_groups: dict[str, list[str]] = {}
+    for env in live_envs:
+        serial = _int_or_none(
+            env.get("seq")
+            or env.get("serialNumber")
+            or env.get("serial_number")
+            or env.get("browserSeq")
+        )
+        if serial is None:
+            continue
+        container_code = str(env.get("containerCode") or "").strip()
+        mapped = by_container.get(container_code) or {}
+        raw_payload = env.get("_raw") if isinstance(env.get("_raw"), dict) else {}
+        group_name = str(
+            env.get("groupName")
+            or env.get("group")
+            or env.get("tag")
+            or raw_payload.get("groupName")
+            or mapped.get("tag")
+            or "未分组"
+        ).strip() or "未分组"
+        channel_name = str(
+            env.get("name")
+            or env.get("remark")
+            or raw_payload.get("browserName")
+            or mapped.get("channel_name")
+            or (by_serial.get(serial) or {}).get("channel_name")
+            or ""
+        ).strip()
+        ypp_serials = set((group_specs.get(group_name) or {}).get("ypp_serials") or set())
+        info = WindowInfo(
+            tag=group_name,
+            serial=int(serial),
+            channel_name=channel_name,
+            is_ypp=int(serial) in ypp_serials,
+        )
+        catalog.setdefault(group_name, [])
+        if not any(int(item.serial) == int(serial) for item in catalog[group_name]):
+            catalog[group_name].append(info)
+        live_groups.setdefault(group_name, [])
+        serial_text = str(int(serial))
+        if serial_text not in live_groups[group_name]:
+            live_groups[group_name].append(serial_text)
+
+    for rows in catalog.values():
+        rows.sort(key=lambda item: int(item.serial))
+    for group_name, serials in live_groups.items():
+        live_groups[group_name] = sorted(serials, key=lambda item: int(item))
+        if group_name in catalog:
+            catalog[group_name].sort(key=lambda item: int(item.serial))
+    if catalog:
+        return catalog, live_groups, None
+    fallback_catalog, _ = _build_group_catalog_from_config(upload_config_path, channel_mapping_path)
+    fallback_groups = {
+        tag: [str(int(item.serial)) for item in rows]
+        for tag, rows in fallback_catalog.items()
+    }
+    return fallback_catalog, fallback_groups, RuntimeError("BitBrowser live groups unavailable")
+
+
+def _load_visual_presets(path: Path = VISUAL_PRESETS_FILE) -> dict[str, dict[str, Any]]:
+    raw = _load_json_object(path)
+    presets: dict[str, dict[str, Any]] = {}
+    for name, payload in raw.items():
+        clean_name = str(name or "").strip()
+        if clean_name and isinstance(payload, dict):
+            presets[clean_name] = dict(payload)
+    return presets
+
+
+def _visual_preset_value_to_choice(value: str) -> str:
+    clean_value = str(value or "").strip()
+    if not clean_value or clean_value == "none":
+        return VISUAL_PRESET_NONE
+    return clean_value
+
+
+def _visual_preset_choice_to_value(choice: str) -> str:
+    clean_choice = str(choice or "").strip()
+    if not clean_choice or clean_choice == VISUAL_PRESET_NONE:
+        return "none"
+    return clean_choice
+
+
+def _visual_preset_menu_values(presets: dict[str, dict[str, Any]]) -> list[str]:
+    return [VISUAL_PRESET_NONE, *sorted(presets.keys(), key=str.lower)]
+
+
+def _bool_to_toggle(value: Any) -> str:
+    return "yes" if bool(value) else "no"
+
+
+def _visual_mode_to_label(value: str) -> str:
+    clean_value = str(value or "").strip()
+    if clean_value == "manual":
+        return QUEUE_VISUAL_MANUAL
+    if not clean_value or clean_value == "random":
+        return QUEUE_VISUAL_RANDOM
+    return clean_value
+
+
+def _visual_mode_to_value(label: str) -> str:
+    clean_label = str(label or "").strip()
+    if clean_label == QUEUE_VISUAL_MANUAL:
+        return "manual"
+    if not clean_label or clean_label == QUEUE_VISUAL_RANDOM:
+        return "random"
+    return clean_label
+
+
 def _suspend_windows_process(pid: int) -> None:
-    if pid <= 0 or os.name != "nt":
+    if pid <= 0:
+        return
+    if os.name != "nt":
+        # macOS / Linux: 用 SIGSTOP 暂停进程
+        import signal
+        os.kill(pid, signal.SIGSTOP)
         return
     import ctypes
     from ctypes import wintypes
@@ -255,7 +612,12 @@ def _suspend_windows_process(pid: int) -> None:
 
 
 def _resume_windows_process(pid: int) -> None:
-    if pid <= 0 or os.name != "nt":
+    if pid <= 0:
+        return
+    if os.name != "nt":
+        # macOS / Linux: 用 SIGCONT 恢复进程
+        import signal
+        os.kill(pid, signal.SIGCONT)
         return
     import ctypes
     from ctypes import wintypes
@@ -301,6 +663,7 @@ class DashboardApp(ctk.CTk):
         self.worker_processes: list[subprocess.Popen[str]] = []
         self.upload_monitor_threads: list[threading.Thread] = []
         self._upload_process_lock = threading.Lock()
+        self._state_lock = threading.RLock()  # 保护共享状态的线程锁
         self._upload_failures: list[str] = []
         self._run_result_map: dict[str, dict[str, dict[str, str]]] = {}
         self._run_plan_for_summary: Any = None
@@ -309,11 +672,12 @@ class DashboardApp(ctk.CTk):
         self._audience_data_url: str = ""
         self._state = self._load_state()
         self.window_tasks: list[WindowTask] = []
+        self.visual_presets = _load_visual_presets()
         if self._state.pop("window_tasks", None) is not None:
             try:
                 STATE_FILE.write_text(json.dumps(self._state, ensure_ascii=False, indent=2), encoding="utf-8")
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"[警告] 清理旧状态写入失败: {exc}")
         self.scheduler_config = load_scheduler_settings()
         self.prompt_config = load_prompt_settings()
         self.group_catalog = get_group_catalog()
@@ -417,7 +781,11 @@ class DashboardApp(ctk.CTk):
         self.visual_text_size_min_var = ctk.StringVar(value=text_size_min)
         self.visual_text_size_max_var = ctk.StringVar(value=text_size_max)
         self.visual_text_style_var = ctk.StringVar(value=str(state.get("visual_text_style", visual_cfg.get("text_style", "Classic"))))
-        self.visual_preset_var = ctk.StringVar(value=str(state.get("visual_preset", visual_cfg.get("preset", "none"))))
+        self.visual_preset_var = ctk.StringVar(
+            value=_visual_preset_value_to_choice(str(state.get("visual_preset", visual_cfg.get("preset", "none"))))
+        )
+        self.visual_preset_hint_var = ctk.StringVar(value="")
+        self._visual_setting_widgets: dict[str, list[Any]] = {}
         self.visual_bass_pulse_var = ctk.StringVar(
             value=str(state.get("visual_bass_pulse", "yes" if visual_cfg.get("bass_pulse", False) else "no"))
         )
@@ -443,8 +811,22 @@ class DashboardApp(ctk.CTk):
 
         first_group = next(iter(self.group_catalog.keys()), "")
         current_group = state.get("current_group") or first_group
+        self.run_queue = RunQueue.from_dict(state.get("run_queue") or {})
         self.current_group_var = ctk.StringVar(value=current_group)
         self.source_dir_override_var = ctk.StringVar(value=state.get("source_dir_override", ""))
+        self.queue_prompt_template_var = ctk.StringVar(value=str(state.get("queue_prompt_template", "default")))
+        self.queue_api_template_var = ctk.StringVar(value=str(state.get("queue_api_template", "default")))
+        self.queue_visual_mode_var = ctk.StringVar(
+            value=_visual_mode_to_label(str(state.get("queue_visual_mode", "random")))
+        )
+        selected_serials: set[int] = set()
+        for item in state.get("selected_window_serials", []):
+            try:
+                selected_serials.add(int(item))
+            except (TypeError, ValueError):
+                continue
+        self._selected_window_serials = selected_serials
+        self._window_button_widgets: dict[int, Any] = {}
         self.add_ypp_var = ctk.StringVar(value=state.get("add_ypp", "no"))
         self.add_quantity_var = ctk.StringVar(value=str(state.get("add_quantity", "1")))
         self.add_title_var = ctk.StringVar(value=state.get("add_title", ""))
@@ -642,7 +1024,7 @@ class DashboardApp(ctk.CTk):
         self._build_log_tab()
 
     def _bind_variable_events(self) -> None:
-        self.current_group_var.trace_add("write", lambda *_: self._refresh_window_buttons())
+        self.current_group_var.trace_add("write", lambda *_: self._on_current_group_change())
         self.binding_group_var.trace_add("write", lambda *_: self.binding_folder_var.set(get_group_bindings(self.scheduler_config).get(self.binding_group_var.get(), "")))
         self.prompt_group_var.trace_add("write", lambda *_: self._load_prompt_for_group())
         self.run_metadata_var.trace_add("write", lambda *_: self._preview_plan())
@@ -713,106 +1095,79 @@ class DashboardApp(ctk.CTk):
         tab.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
         tab.grid_columnconfigure(0, weight=1)
 
-        group_frame = ctk.CTkFrame(tab)
-        group_frame.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
-        for column in range(6):
-            group_frame.grid_columnconfigure(column, weight=1)
-        ctk.CTkLabel(group_frame, text="今天哪些窗口要工作", font=ctk.CTkFont(size=24, weight="bold")).grid(
-            row=0, column=0, columnspan=6, sticky="w", padx=16, pady=(14, 12)
-        )
-        ctk.CTkLabel(group_frame, text="分组").grid(row=1, column=0, sticky="w", padx=(16, 8), pady=(0, 10))
-        self.current_group_menu = ctk.CTkOptionMenu(group_frame, variable=self.current_group_var, values=[""])
-        self.current_group_menu.grid(row=1, column=1, sticky="ew", padx=(0, 12), pady=(0, 10))
-        ctk.CTkButton(group_frame, text="刷新分组", command=self._refresh_groups).grid(
-            row=1, column=2, sticky="ew", padx=(0, 12), pady=(0, 10)
-        )
-        ctk.CTkLabel(group_frame, text="新增窗口用素材目录覆盖").grid(
-            row=1, column=3, sticky="w", padx=(0, 8), pady=(0, 10)
-        )
-        ctk.CTkEntry(group_frame, textvariable=self.source_dir_override_var).grid(
-            row=1, column=4, sticky="ew", padx=(0, 12), pady=(0, 10)
-        )
-        ctk.CTkButton(group_frame, text="选择文件夹", command=self._pick_source_override).grid(
-            row=1, column=5, sticky="ew", padx=(0, 16), pady=(0, 10)
-        )
-        ctk.CTkLabel(group_frame, text="文案来源").grid(row=2, column=0, sticky="w", padx=(16, 8), pady=(0, 10))
-        ctk.CTkLabel(
-            group_frame,
-            text="提示词那套（唯一文案来源）",
-            text_color="#d7e3f4",
-        ).grid(row=2, column=1, sticky="w", padx=(0, 12), pady=(0, 10))
-        ctk.CTkSwitch(group_frame, text="生成标题/简介/标签", variable=self.generate_text_var).grid(
-            row=2, column=2, sticky="w", padx=(0, 12), pady=(0, 10)
-        )
-        ctk.CTkSwitch(group_frame, text="重生成缩略图", variable=self.generate_thumbnails_var).grid(
-            row=2, column=3, sticky="w", padx=(0, 12), pady=(0, 10)
+        queue_frame = ctk.CTkFrame(tab)
+        queue_frame.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
+        queue_frame.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(queue_frame, text="运行队列", font=ctk.CTkFont(size=24, weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=16, pady=(14, 8)
         )
         ctk.CTkLabel(
-            group_frame,
-            text="文案结果会直接写入当前文案输出目录和上传清单",
+            queue_frame,
+            text="分组按队列顺序依次执行；每个分组内部仍按当前上传/渲染逻辑处理窗口。",
             text_color="#9fb2c8",
-        ).grid(row=2, column=4, columnspan=2, sticky="w", padx=(0, 16), pady=(0, 10))
+        ).grid(row=1, column=0, sticky="w", padx=16, pady=(0, 10))
+        self.queue_list_frame = ctk.CTkScrollableFrame(queue_frame, height=170)
+        self.queue_list_frame.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 14))
+        self.queue_list_frame.grid_columnconfigure(0, weight=1)
 
         add_frame = ctk.CTkFrame(tab)
         add_frame.grid(row=1, column=0, sticky="ew", padx=16, pady=8)
         for column in range(6):
             add_frame.grid_columnconfigure(column, weight=1)
-        ctk.CTkLabel(add_frame, text="????? YPP").grid(row=0, column=0, sticky="w", padx=(16, 8), pady=(14, 6))
-        ctk.CTkOptionMenu(add_frame, variable=self.add_ypp_var, values=YES_NO_VALUES).grid(
-            row=1, column=0, sticky="ew", padx=(16, 8), pady=(0, 14)
+        ctk.CTkLabel(add_frame, text="添加分组到队列", font=ctk.CTkFont(size=22, weight="bold")).grid(
+            row=0, column=0, columnspan=6, sticky="w", padx=16, pady=(14, 12)
         )
-        ctk.CTkLabel(add_frame, text="??(???)").grid(row=0, column=1, sticky="w", padx=8, pady=(14, 6))
-        ctk.CTkEntry(add_frame, textvariable=self.add_quantity_var).grid(
-            row=1, column=1, sticky="ew", padx=8, pady=(0, 14)
+        ctk.CTkLabel(add_frame, text="分组").grid(row=1, column=0, sticky="w", padx=(16, 8), pady=(0, 6))
+        self.current_group_menu = ctk.CTkOptionMenu(add_frame, variable=self.current_group_var, values=[""])
+        self.current_group_menu.grid(row=2, column=0, sticky="ew", padx=(16, 8), pady=(0, 12))
+        ctk.CTkButton(add_frame, text="刷新分组", command=self._refresh_groups).grid(
+            row=2, column=1, sticky="ew", padx=8, pady=(0, 12)
         )
-        ctk.CTkLabel(add_frame, text="???").grid(row=0, column=2, sticky="w", padx=8, pady=(14, 6))
-        ctk.CTkOptionMenu(add_frame, variable=self.add_visibility_var, values=VISIBILITY_VALUES).grid(
-            row=1, column=2, sticky="ew", padx=8, pady=(0, 14)
+        ctk.CTkLabel(add_frame, text="素材目录").grid(row=1, column=2, sticky="w", padx=8, pady=(0, 6))
+        ctk.CTkEntry(add_frame, textvariable=self.source_dir_override_var).grid(
+            row=2, column=2, columnspan=3, sticky="ew", padx=8, pady=(0, 12)
         )
-        ctk.CTkLabel(add_frame, text="??").grid(row=0, column=3, sticky="w", padx=8, pady=(14, 6))
-        ctk.CTkOptionMenu(add_frame, variable=self.add_category_var, values=CATEGORY_VALUES).grid(
-            row=1, column=3, sticky="ew", padx=8, pady=(0, 14)
+        ctk.CTkButton(add_frame, text="选择文件夹", command=self._pick_source_override).grid(
+            row=2, column=5, sticky="ew", padx=(8, 16), pady=(0, 12)
         )
-        ctk.CTkLabel(add_frame, text="????").grid(row=0, column=4, sticky="w", padx=8, pady=(14, 6))
-        ctk.CTkOptionMenu(add_frame, variable=self.add_kids_var, values=YES_NO_VALUES).grid(
-            row=1, column=4, sticky="ew", padx=8, pady=(0, 14)
-        )
-        ctk.CTkLabel(add_frame, text="AI ??").grid(row=0, column=5, sticky="w", padx=8, pady=(14, 6))
-        ctk.CTkOptionMenu(add_frame, variable=self.add_ai_var, values=YES_NO_VALUES).grid(
-            row=1, column=5, sticky="ew", padx=(8, 16), pady=(0, 14)
-        )
-        ctk.CTkCheckBox(
+
+        ctk.CTkLabel(add_frame, text="提示词模板").grid(row=3, column=0, sticky="w", padx=(16, 8), pady=(0, 6))
+        self.queue_prompt_template_menu = ctk.CTkOptionMenu(
             add_frame,
-            text="通知订阅用户",
-            variable=self.add_notify_var,
-        ).grid(row=2, column=5, sticky="w", padx=8, pady=(0, 6))
-        self.add_schedule_checkbox = ctk.CTkCheckBox(
-            add_frame,
-            text="窗口定时覆盖",
-            variable=self.add_schedule_enabled_var,
+            variable=self.queue_prompt_template_var,
+            values=["default"],
         )
-        self.add_schedule_checkbox.grid(row=2, column=0, sticky="w", padx=16, pady=(0, 6))
-        ctk.CTkLabel(add_frame, text="日期").grid(row=2, column=1, sticky="w", padx=8, pady=(0, 6))
-        ctk.CTkLabel(add_frame, text="时间").grid(row=2, column=2, sticky="w", padx=8, pady=(0, 6))
-        ctk.CTkLabel(add_frame, text="时区").grid(row=2, column=3, sticky="w", padx=8, pady=(0, 6))
-        self.add_schedule_date_menu = ctk.CTkOptionMenu(
+        self.queue_prompt_template_menu.grid(row=4, column=0, columnspan=2, sticky="ew", padx=(16, 8), pady=(0, 12))
+        ctk.CTkLabel(add_frame, text="API模板").grid(row=3, column=2, sticky="w", padx=8, pady=(0, 6))
+        self.queue_api_template_menu = ctk.CTkOptionMenu(
             add_frame,
-            variable=self.add_schedule_date_var,
-            values=_schedule_date_values(),
+            variable=self.queue_api_template_var,
+            values=["default"],
         )
-        self.add_schedule_date_menu.grid(row=3, column=1, sticky="ew", padx=8, pady=(0, 14))
-        self.add_schedule_time_menu = ctk.CTkOptionMenu(
+        self.queue_api_template_menu.grid(row=4, column=2, columnspan=2, sticky="ew", padx=8, pady=(0, 12))
+        ctk.CTkLabel(add_frame, text="视觉模式").grid(row=3, column=4, sticky="w", padx=8, pady=(0, 6))
+        self.queue_visual_mode_menu = ctk.CTkOptionMenu(
             add_frame,
-            variable=self.add_schedule_time_var,
-            values=_schedule_time_values(),
+            variable=self.queue_visual_mode_var,
+            values=[QUEUE_VISUAL_RANDOM, QUEUE_VISUAL_MANUAL, *self.visual_presets.keys()],
         )
-        self.add_schedule_time_menu.grid(row=3, column=2, sticky="ew", padx=8, pady=(0, 14))
-        self.add_schedule_timezone_menu = ctk.CTkOptionMenu(
+        self.queue_visual_mode_menu.grid(row=4, column=4, columnspan=2, sticky="ew", padx=(8, 16), pady=(0, 12))
+
+        window_header = ctk.CTkFrame(add_frame, fg_color="transparent")
+        window_header.grid(row=5, column=0, columnspan=6, sticky="ew", padx=10, pady=(0, 4))
+        window_header.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(window_header, text="窗口选择").grid(row=0, column=0, sticky="w", padx=6, pady=(0, 4))
+        ctk.CTkButton(window_header, text="全选", command=self._select_all_current_group_windows, width=96).grid(
+            row=0, column=1, sticky="e", padx=6, pady=(0, 4)
+        )
+        self.window_button_frame = ctk.CTkFrame(add_frame)
+        self.window_button_frame.grid(row=6, column=0, columnspan=6, sticky="ew", padx=16, pady=(0, 10))
+        ctk.CTkButton(
             add_frame,
-            variable=self.add_schedule_timezone_var,
-            values=SCHEDULE_TIMEZONE_VALUES,
-        )
-        self.add_schedule_timezone_menu.grid(row=3, column=3, sticky="ew", padx=8, pady=(0, 14))
+            text="➕ 添加到队列",
+            command=self._add_current_group_to_queue,
+            height=40,
+        ).grid(row=7, column=0, columnspan=6, sticky="ew", padx=16, pady=(0, 14))
 
         default_frame = ctk.CTkFrame(tab)
         default_frame.grid(row=2, column=0, sticky="ew", padx=16, pady=8)
@@ -885,35 +1240,31 @@ class DashboardApp(ctk.CTk):
             row=4, column=3, sticky="ew", padx=8, pady=(0, 14)
         )
 
-        self.window_button_frame = ctk.CTkFrame(tab)
-        self.window_button_frame.grid(row=3, column=0, sticky="ew", padx=16, pady=8)
-
-        task_frame = ctk.CTkFrame(tab)
-        task_frame.grid(row=4, column=0, sticky="ew", padx=16, pady=(8, 16))
-        task_frame.grid_columnconfigure(0, weight=1)
-        action_bar = ctk.CTkFrame(task_frame, fg_color="transparent")
-        action_bar.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
-        ctk.CTkButton(action_bar, text="移除选中", command=self._remove_selected_tasks).pack(side="left", padx=6)
-        ctk.CTkButton(action_bar, text="清空任务", command=self._clear_tasks).pack(side="left", padx=6)
-        ctk.CTkButton(action_bar, text="恢复分组绑定目录", command=self._fill_binding_source).pack(side="left", padx=6)
-
-        columns = ("tag", "serial", "quantity", "ypp", "visibility", "category", "kids", "ai", "schedule", "source")
-        self.task_tree = ttk.Treeview(task_frame, columns=columns, show="headings", height=14)
-        for key, width in {
-            "tag": 180,
-            "serial": 80,
-            "quantity": 70,
-            "ypp": 60,
-            "visibility": 90,
-            "category": 130,
-            "kids": 70,
-            "ai": 70,
-            "schedule": 160,
-            "source": 360,
-        }.items():
-            self.task_tree.heading(key, text=key)
-            self.task_tree.column(key, width=width, stretch=key in {"tag", "source", "schedule"})
-        self.task_tree.grid(row=1, column=0, sticky="ew", padx=8, pady=(4, 8))
+        control_frame = ctk.CTkFrame(tab)
+        control_frame.grid(row=3, column=0, sticky="ew", padx=16, pady=(8, 16))
+        for column in range(3):
+            control_frame.grid_columnconfigure(column, weight=1)
+        ctk.CTkLabel(control_frame, text="控制按钮", font=ctk.CTkFont(size=22, weight="bold")).grid(
+            row=0, column=0, columnspan=3, sticky="w", padx=16, pady=(14, 12)
+        )
+        ctk.CTkButton(control_frame, text="▶ 开始运行", command=self._start_real_flow, height=40).grid(
+            row=1, column=0, sticky="ew", padx=(16, 8), pady=(0, 14)
+        )
+        ctk.CTkButton(
+            control_frame,
+            text="⏸ 暂停",
+            textvariable=self.pause_button_text_var,
+            command=self._toggle_pause_current_task,
+            height=40,
+        ).grid(row=1, column=1, sticky="ew", padx=8, pady=(0, 14))
+        ctk.CTkButton(
+            control_frame,
+            text="⏹ 取消当前批次",
+            command=self._cancel_current_task,
+            height=40,
+            fg_color="#7a1f1f",
+            hover_color="#932525",
+        ).grid(row=1, column=2, sticky="ew", padx=(8, 16), pady=(0, 14))
 
     def _build_visual_tab(self) -> None:
         base_tab = self.tabview.tab("高级视觉")
@@ -928,6 +1279,7 @@ class DashboardApp(ctk.CTk):
         intro.grid_columnconfigure(0, weight=1)
         intro.grid_columnconfigure(1, weight=0)
         intro.grid_columnconfigure(2, weight=0)
+        intro.grid_columnconfigure(3, weight=0)
         ctk.CTkLabel(intro, text="高级视觉控制", font=ctk.CTkFont(size=24, weight="bold")).grid(
             row=0, column=0, sticky="w", padx=16, pady=(14, 8)
         )
@@ -935,8 +1287,39 @@ class DashboardApp(ctk.CTk):
             row=0, column=1, sticky="e", padx=16, pady=(14, 8)
         )
         ctk.CTkButton(intro, text="套用 MEGA BASS 预设", command=self._apply_visual_preset_mega_bass).grid(
-            row=0, column=2, sticky="e", padx=(0, 16), pady=(14, 8)
+            row=0, column=2, sticky="e", padx=(0, 8), pady=(14, 8)
         )
+        preset_bar = ctk.CTkFrame(intro, fg_color="transparent")
+        preset_bar.grid(row=1, column=0, columnspan=4, sticky="ew", padx=16, pady=(0, 6))
+        for column in range(4):
+            preset_bar.grid_columnconfigure(column, weight=1 if column == 1 else 0)
+        ctk.CTkLabel(preset_bar, text="视觉预设").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=0)
+        self.visual_preset_menu = ctk.CTkOptionMenu(
+            preset_bar,
+            variable=self.visual_preset_var,
+            values=_visual_preset_menu_values(self.visual_presets),
+            command=lambda _value: self._on_visual_preset_change(),
+        )
+        self.visual_preset_menu.grid(row=0, column=1, sticky="ew", padx=(0, 8), pady=0)
+        ctk.CTkButton(
+            preset_bar,
+            text="保存当前为预设",
+            command=self._save_current_visual_preset,
+        ).grid(row=0, column=2, sticky="ew", padx=(0, 8), pady=0)
+        ctk.CTkButton(
+            preset_bar,
+            text="删除预设",
+            command=self._delete_selected_visual_preset,
+        ).grid(row=0, column=3, sticky="ew", pady=0)
+        self.visual_preset_hint_label = ctk.CTkLabel(
+            intro,
+            textvariable=self.visual_preset_hint_var,
+            text_color="#f7d76a",
+            anchor="w",
+            justify="left",
+        )
+        self.visual_preset_hint_label.grid(row=2, column=0, columnspan=4, sticky="ew", padx=16, pady=(0, 6))
+        self.visual_preset_hint_label.grid_remove()
         ctk.CTkLabel(
             intro,
             text=(
@@ -945,7 +1328,7 @@ class DashboardApp(ctk.CTk):
             ),
             text_color="#b8c1cc",
             justify="left",
-        ).grid(row=1, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 14))
+        ).grid(row=3, column=0, columnspan=4, sticky="w", padx=16, pady=(0, 14))
 
         basic = ctk.CTkFrame(tab)
         basic.grid(row=1, column=0, sticky="ew", padx=8, pady=8)
@@ -954,14 +1337,38 @@ class DashboardApp(ctk.CTk):
         ctk.CTkLabel(basic, text="基础效果", font=ctk.CTkFont(size=22, weight="bold")).grid(
             row=0, column=0, columnspan=4, sticky="w", padx=16, pady=(14, 12)
         )
-        self._entry_row(basic, 1, "频谱", self.visual_spectrum_var, values=VISUAL_TOGGLE_VALUES)
-        self._entry_row(basic, 2, "时间轴", self.visual_timeline_var, values=VISUAL_TOGGLE_VALUES)
-        self._entry_row(basic, 3, "黑边", self.visual_letterbox_var, values=VISUAL_TOGGLE_VALUES)
-        self._entry_row(basic, 4, "镜头缩放", self.visual_zoom_var, values=_with_random(list_zoom_modes()))
-        self._entry_row(basic, 5, "频谱样式", self.visual_style_var, values=_with_random(list_effects()))
-        self._entry_row(basic, 6, "频谱 Y", self.visual_spectrum_y_var)
-        self._entry_row(basic, 7, "频谱 X (-1=居中)", self.visual_spectrum_x_var)
-        self._range_row(basic, 8, "频谱宽度", self.visual_spectrum_w_min_var, self.visual_spectrum_w_max_var)
+        self._remember_visual_widgets(
+            "spectrum",
+            self._entry_row(basic, 1, "频谱", self.visual_spectrum_var, values=VISUAL_TOGGLE_VALUES),
+        )
+        self._remember_visual_widgets(
+            "timeline",
+            self._entry_row(basic, 2, "时间轴", self.visual_timeline_var, values=VISUAL_TOGGLE_VALUES),
+        )
+        self._remember_visual_widgets(
+            "letterbox",
+            self._entry_row(basic, 3, "黑边", self.visual_letterbox_var, values=VISUAL_TOGGLE_VALUES),
+        )
+        self._remember_visual_widgets(
+            "zoom",
+            self._entry_row(basic, 4, "镜头缩放", self.visual_zoom_var, values=_with_random(list_zoom_modes())),
+        )
+        self._remember_visual_widgets(
+            "style",
+            self._entry_row(basic, 5, "频谱样式", self.visual_style_var, values=_with_random(list_effects())),
+        )
+        self._remember_visual_widgets(
+            "spectrum_y",
+            self._entry_row(basic, 6, "频谱 Y", self.visual_spectrum_y_var),
+        )
+        self._remember_visual_widgets(
+            "spectrum_x",
+            self._entry_row(basic, 7, "频谱 X (-1=居中)", self.visual_spectrum_x_var),
+        )
+        self._remember_visual_widgets(
+            "spectrum_w",
+            *self._range_row(basic, 8, "频谱宽度", self.visual_spectrum_w_min_var, self.visual_spectrum_w_max_var),
+        )
 
         mood = ctk.CTkFrame(tab)
         mood.grid(row=2, column=0, sticky="ew", padx=8, pady=8)
@@ -970,25 +1377,49 @@ class DashboardApp(ctk.CTk):
         ctk.CTkLabel(mood, text="色彩与氛围", font=ctk.CTkFont(size=22, weight="bold")).grid(
             row=0, column=0, columnspan=4, sticky="w", padx=16, pady=(14, 12)
         )
-        self._entry_row(mood, 1, "频谱配色", self.visual_color_spectrum_var, values=_with_random(list_palette_names()))
-        self._entry_row(mood, 2, "时间轴配色", self.visual_color_timeline_var, values=_with_random(list_palette_names()))
-        self._entry_row(mood, 3, "胶片颗粒", self.visual_film_grain_var, values=VISUAL_TOGGLE_VALUES)
-        self._range_row(
-            mood,
-            4,
-            "颗粒强度",
-            self.visual_grain_strength_min_var,
-            self.visual_grain_strength_max_var,
+        self._remember_visual_widgets(
+            "color_spectrum",
+            self._entry_row(mood, 1, "频谱配色", self.visual_color_spectrum_var, values=_with_random(list_palette_names())),
         )
-        self._entry_row(mood, 5, "暗角", self.visual_vignette_var, values=VISUAL_TOGGLE_VALUES)
-        self._entry_row(mood, 6, "色调", self.visual_tint_var, values=_with_random(list_tint_names()))
-        self._entry_row(mood, 7, "柔焦", self.visual_soft_focus_var, values=VISUAL_TOGGLE_VALUES)
-        self._range_row(
-            mood,
-            8,
-            "柔焦强度",
-            self.visual_soft_focus_sigma_min_var,
-            self.visual_soft_focus_sigma_max_var,
+        self._remember_visual_widgets(
+            "color_timeline",
+            self._entry_row(mood, 2, "时间轴配色", self.visual_color_timeline_var, values=_with_random(list_palette_names())),
+        )
+        self._remember_visual_widgets(
+            "film_grain",
+            self._entry_row(mood, 3, "胶片颗粒", self.visual_film_grain_var, values=VISUAL_TOGGLE_VALUES),
+        )
+        self._remember_visual_widgets(
+            "grain_strength",
+            *self._range_row(
+                mood,
+                4,
+                "颗粒强度",
+                self.visual_grain_strength_min_var,
+                self.visual_grain_strength_max_var,
+            ),
+        )
+        self._remember_visual_widgets(
+            "vignette",
+            self._entry_row(mood, 5, "暗角", self.visual_vignette_var, values=VISUAL_TOGGLE_VALUES),
+        )
+        self._remember_visual_widgets(
+            "color_tint",
+            self._entry_row(mood, 6, "色调", self.visual_tint_var, values=_with_random(list_tint_names())),
+        )
+        self._remember_visual_widgets(
+            "soft_focus",
+            self._entry_row(mood, 7, "柔焦", self.visual_soft_focus_var, values=VISUAL_TOGGLE_VALUES),
+        )
+        self._remember_visual_widgets(
+            "soft_focus_sigma",
+            *self._range_row(
+                mood,
+                8,
+                "柔焦强度",
+                self.visual_soft_focus_sigma_min_var,
+                self.visual_soft_focus_sigma_max_var,
+            ),
         )
 
         preset = ctk.CTkFrame(tab)
@@ -998,21 +1429,29 @@ class DashboardApp(ctk.CTk):
         ctk.CTkLabel(preset, text="节奏联动 / 预设", font=ctk.CTkFont(size=22, weight="bold")).grid(
             row=0, column=0, columnspan=4, sticky="w", padx=16, pady=(14, 12)
         )
-        self._entry_row(preset, 1, "视觉预设", self.visual_preset_var, values=["none", "mega_bass"])
-        self._entry_row(preset, 2, "低频脉冲", self.visual_bass_pulse_var, values=VISUAL_TOGGLE_VALUES)
-        self._range_row(
-            preset,
-            3,
-            "脉冲缩放",
-            self.visual_bass_pulse_scale_min_var,
-            self.visual_bass_pulse_scale_max_var,
+        self._remember_visual_widgets(
+            "bass_pulse",
+            self._entry_row(preset, 1, "低频脉冲", self.visual_bass_pulse_var, values=VISUAL_TOGGLE_VALUES),
         )
-        self._range_row(
-            preset,
-            4,
-            "脉冲亮度",
-            self.visual_bass_pulse_brightness_min_var,
-            self.visual_bass_pulse_brightness_max_var,
+        self._remember_visual_widgets(
+            "bass_pulse_scale",
+            *self._range_row(
+                preset,
+                2,
+                "脉冲缩放",
+                self.visual_bass_pulse_scale_min_var,
+                self.visual_bass_pulse_scale_max_var,
+            ),
+        )
+        self._remember_visual_widgets(
+            "bass_pulse_brightness",
+            *self._range_row(
+                preset,
+                3,
+                "脉冲亮度",
+                self.visual_bass_pulse_brightness_min_var,
+                self.visual_bass_pulse_brightness_max_var,
+            ),
         )
 
         overlay = ctk.CTkFrame(tab)
@@ -1022,32 +1461,56 @@ class DashboardApp(ctk.CTk):
         ctk.CTkLabel(overlay, text="贴纸 / 粒子 / 叠字", font=ctk.CTkFont(size=22, weight="bold")).grid(
             row=0, column=0, columnspan=4, sticky="w", padx=16, pady=(14, 12)
         )
-        self._entry_row(
-            overlay,
-            1,
-            "贴纸 / 粒子",
-            self.visual_particle_var,
-            values=_with_random_first(list_particle_effects()),
+        self._remember_visual_widgets(
+            "particle",
+            self._entry_row(
+                overlay,
+                1,
+                "贴纸 / 粒子",
+                self.visual_particle_var,
+                values=_with_random_first(list_particle_effects()),
+            ),
         )
-        self._range_row(
-            overlay,
-            2,
-            "贴纸透明度",
-            self.visual_particle_opacity_min_var,
-            self.visual_particle_opacity_max_var,
+        self._remember_visual_widgets(
+            "particle_opacity",
+            *self._range_row(
+                overlay,
+                2,
+                "贴纸透明度",
+                self.visual_particle_opacity_min_var,
+                self.visual_particle_opacity_max_var,
+            ),
         )
-        self._range_row(
-            overlay,
-            3,
-            "贴纸速度",
-            self.visual_particle_speed_min_var,
-            self.visual_particle_speed_max_var,
+        self._remember_visual_widgets(
+            "particle_speed",
+            *self._range_row(
+                overlay,
+                3,
+                "贴纸速度",
+                self.visual_particle_speed_min_var,
+                self.visual_particle_speed_max_var,
+            ),
         )
-        self._entry_row(overlay, 4, "叠字内容", self.visual_text_var)
-        self._entry_row(overlay, 5, "字体", self.visual_text_font_var, values=_with_random(list_font_names()))
-        self._entry_row(overlay, 6, "文字位置", self.visual_text_pos_var, values=_with_random(list_text_positions()))
-        self._range_row(overlay, 7, "文字大小", self.visual_text_size_min_var, self.visual_text_size_max_var)
-        self._entry_row(overlay, 8, "文字样式", self.visual_text_style_var, values=_with_random(list_text_styles()))
+        self._remember_visual_widgets(
+            "text",
+            self._entry_row(overlay, 4, "叠字内容", self.visual_text_var),
+        )
+        self._remember_visual_widgets(
+            "text_font",
+            self._entry_row(overlay, 5, "字体", self.visual_text_font_var, values=_with_random(list_font_names())),
+        )
+        self._remember_visual_widgets(
+            "text_pos",
+            self._entry_row(overlay, 6, "文字位置", self.visual_text_pos_var, values=_with_random(list_text_positions())),
+        )
+        self._remember_visual_widgets(
+            "text_size",
+            *self._range_row(overlay, 7, "文字大小", self.visual_text_size_min_var, self.visual_text_size_max_var),
+        )
+        self._remember_visual_widgets(
+            "text_style",
+            self._entry_row(overlay, 8, "文字样式", self.visual_text_style_var, values=_with_random(list_text_styles())),
+        )
 
         help_frame = ctk.CTkFrame(tab)
         help_frame.grid(row=5, column=0, sticky="ew", padx=8, pady=(8, 16))
@@ -1067,6 +1530,8 @@ class DashboardApp(ctk.CTk):
             text_color="#b8c1cc",
             justify="left",
         ).grid(row=1, column=0, sticky="w", padx=16, pady=(0, 14))
+        self._refresh_visual_preset_controls()
+        self._on_visual_preset_change()
 
     def _build_prompt_tab(self) -> None:
         base_tab = self.tabview.tab("提示词")
@@ -1201,7 +1666,7 @@ class DashboardApp(ctk.CTk):
         values: list[str] | None = None,
         show: str | None = None,
         entry_key: str | None = None,
-    ) -> None:
+    ) -> Any:
         ctk.CTkLabel(parent, text=label).grid(row=row, column=0, sticky="w", padx=16, pady=(0, 6))
         if values:
             widget = ctk.CTkOptionMenu(parent, variable=variable, values=values)
@@ -1210,6 +1675,7 @@ class DashboardApp(ctk.CTk):
         widget.grid(row=row, column=1, columnspan=3, sticky="ew", padx=16, pady=(0, 12))
         if entry_key:
             self._runtime_path_widgets[entry_key] = widget
+        return widget
 
     def _range_row(
         self,
@@ -1218,17 +1684,30 @@ class DashboardApp(ctk.CTk):
         label: str,
         min_var: ctk.StringVar,
         max_var: ctk.StringVar,
-    ) -> None:
+    ) -> tuple[Any, Any]:
         ctk.CTkLabel(parent, text=label).grid(row=row, column=0, sticky="w", padx=16, pady=(0, 6))
-        ctk.CTkEntry(parent, textvariable=min_var, placeholder_text="最小值").grid(
+        min_widget = ctk.CTkEntry(parent, textvariable=min_var, placeholder_text="最小值")
+        min_widget.grid(
             row=row, column=1, sticky="ew", padx=(16, 8), pady=(0, 12)
         )
         ctk.CTkLabel(parent, text="到").grid(row=row, column=2, sticky="ew", padx=4, pady=(0, 12))
-        ctk.CTkEntry(parent, textvariable=max_var, placeholder_text="最大值").grid(
+        max_widget = ctk.CTkEntry(parent, textvariable=max_var, placeholder_text="最大值")
+        max_widget.grid(
             row=row, column=3, sticky="ew", padx=(8, 16), pady=(0, 12)
         )
+        return min_widget, max_widget
 
-    def _bind_scroll_frame_wheel(self, scroll_frame: ctk.CTkScrollableFrame, *widgets: ctk.CTkBaseClass) -> None:
+    def _remember_visual_widgets(self, key: str, *widgets: Any) -> None:
+        remembered = [widget for widget in widgets if widget is not None]
+        if remembered:
+            self._visual_setting_widgets[key] = remembered
+
+    def _bind_scroll_frame_wheel(
+        self,
+        scroll_frame: ctk.CTkScrollableFrame,
+        *widgets: ctk.CTkBaseClass,
+        include_textboxes: bool = False,
+    ) -> None:
         canvas = getattr(scroll_frame, "_parent_canvas", None)
         if canvas is None:
             return
@@ -1252,11 +1731,14 @@ class DashboardApp(ctk.CTk):
             return None
 
         def _bind_tree(widget: Any) -> None:
-            if isinstance(widget, ctk.CTkTextbox):
+            if isinstance(widget, ctk.CTkTextbox) and not include_textboxes:
                 return
             for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-                widget.bind(sequence, _on_mousewheel, add="+")
-            for attr_name in ("_entry", "_text_label", "_canvas", "_dropdown_menu", "_scrollbar"):
+                try:
+                    widget.bind(sequence, _on_mousewheel, add="+")
+                except Exception:
+                    pass
+            for attr_name in ("_entry", "_text_label", "_canvas", "_dropdown_menu", "_scrollbar", "_textbox"):
                 inner = getattr(widget, attr_name, None)
                 if inner is None:
                     continue
@@ -1284,7 +1766,7 @@ class DashboardApp(ctk.CTk):
 
     def _collect_visual_settings(self) -> dict[str, Any]:
         return {
-            "preset": self.visual_preset_var.get().strip() or "none",
+            "preset": _visual_preset_choice_to_value(self.visual_preset_var.get()),
             "spectrum": _bool_from_yes_no(self.visual_spectrum_var.get()),
             "timeline": _bool_from_yes_no(self.visual_timeline_var.get()),
             "letterbox": _bool_from_yes_no(self.visual_letterbox_var.get()),
@@ -1346,6 +1828,194 @@ class DashboardApp(ctk.CTk):
             "text_style": self.visual_text_style_var.get().strip() or "Classic",
         }
 
+    def _visual_manual_control_values(self) -> dict[str, Any]:
+        return self._collect_visual_settings()
+
+    def _serialize_visual_preset(self, name: str) -> dict[str, Any]:
+        settings = self._visual_manual_control_values()
+        return {
+            "description": f"自定义视觉预设 — {name}",
+            "spectrum": str(settings.get("style") or "bar"),
+            "spectrum_y": str(settings.get("spectrum_y") or "530"),
+            "spectrum_x": str(settings.get("spectrum_x") or "-1"),
+            "spectrum_w": str(settings.get("spectrum_w") or "1200"),
+            "timeline": "on" if bool(settings.get("timeline")) else "off",
+            "letterbox": "on" if bool(settings.get("letterbox")) else "off",
+            "zoom": str(settings.get("zoom") or "normal"),
+            "tint": str(settings.get("color_tint") or "none"),
+            "particles": "bass_pulse" if bool(settings.get("bass_pulse")) else str(settings.get("particle") or ""),
+            "sticker": str(settings.get("text") or ""),
+            "color_spectrum": str(settings.get("color_spectrum") or "WhiteGold"),
+            "color_timeline": str(settings.get("color_timeline") or "WhiteGold"),
+            "film_grain": _bool_to_toggle(settings.get("film_grain")),
+            "grain_strength": str(settings.get("grain_strength") or "15"),
+            "vignette": _bool_to_toggle(settings.get("vignette")),
+            "soft_focus": _bool_to_toggle(settings.get("soft_focus")),
+            "soft_focus_sigma": str(settings.get("soft_focus_sigma") or "1.5"),
+            "bass_pulse": _bool_to_toggle(settings.get("bass_pulse")),
+            "bass_pulse_scale": str(settings.get("bass_pulse_scale") or "0.03"),
+            "bass_pulse_brightness": str(settings.get("bass_pulse_brightness") or "0.04"),
+            "text_font": str(settings.get("text_font") or "default"),
+            "text_pos": str(settings.get("text_pos") or "center"),
+            "text_size": str(settings.get("text_size") or "60"),
+            "text_style": str(settings.get("text_style") or "Classic"),
+        }
+
+    def _visual_preset_to_settings(self, preset_name: str) -> dict[str, Any]:
+        payload = dict(self.visual_presets.get(preset_name) or {})
+        particle_value = str(payload.get("particles") or payload.get("particle") or "none").strip()
+        bass_pulse_enabled = str(payload.get("bass_pulse") or "").strip().lower() in {"on", "yes", "true"}
+        if particle_value == "bass_pulse":
+            bass_pulse_enabled = True
+            particle_value = "none"
+        return {
+            "preset": preset_name,
+            "spectrum": True,
+            "timeline": str(payload.get("timeline") or "on").strip().lower() not in {"off", "no", "false"},
+            "letterbox": str(payload.get("letterbox") or "off").strip().lower() in {"on", "yes", "true"},
+            "zoom": str(payload.get("zoom") or "normal").strip() or "normal",
+            "style": str(payload.get("style") or payload.get("spectrum") or "bar").strip() or "bar",
+            "color_spectrum": str(payload.get("color_spectrum") or payload.get("tint") or "WhiteGold").strip() or "WhiteGold",
+            "color_timeline": str(payload.get("color_timeline") or payload.get("tint") or "WhiteGold").strip() or "WhiteGold",
+            "spectrum_y": str(payload.get("spectrum_y") or "530").strip() or "530",
+            "spectrum_x": str(payload.get("spectrum_x") or "-1").strip() or "-1",
+            "spectrum_w": str(payload.get("spectrum_w") or "1200").strip() or "1200",
+            "film_grain": str(payload.get("film_grain") or "off").strip().lower() in {"on", "yes", "true"},
+            "grain_strength": str(payload.get("grain_strength") or "15").strip() or "15",
+            "vignette": str(payload.get("vignette") or "off").strip().lower() in {"on", "yes", "true"},
+            "color_tint": str(payload.get("tint") or payload.get("color_tint") or "none").strip() or "none",
+            "soft_focus": str(payload.get("soft_focus") or "off").strip().lower() in {"on", "yes", "true"},
+            "soft_focus_sigma": str(payload.get("soft_focus_sigma") or "1.5").strip() or "1.5",
+            "particle": particle_value or "none",
+            "particle_opacity": str(payload.get("particle_opacity") or "0.6").strip() or "0.6",
+            "particle_speed": str(payload.get("particle_speed") or "1.0").strip() or "1.0",
+            "bass_pulse": bass_pulse_enabled,
+            "bass_pulse_scale": str(payload.get("bass_pulse_scale") or "0.03").strip() or "0.03",
+            "bass_pulse_brightness": str(payload.get("bass_pulse_brightness") or "0.04").strip() or "0.04",
+            "text": str(payload.get("sticker") or payload.get("text") or "").strip(),
+            "text_font": str(payload.get("text_font") or "default").strip() or "default",
+            "text_pos": str(payload.get("text_pos") or "center").strip() or "center",
+            "text_size": str(payload.get("text_size") or "60").strip() or "60",
+            "text_style": str(payload.get("text_style") or "Classic").strip() or "Classic",
+            "description": str(payload.get("description") or "").strip(),
+        }
+
+    def _apply_visual_settings_to_form(self, settings: dict[str, Any], *, preset_choice: str | None = None) -> None:
+        if preset_choice is not None:
+            self.visual_preset_var.set(preset_choice)
+        self.visual_spectrum_var.set(_bool_to_toggle(settings.get("spectrum", True)))
+        self.visual_timeline_var.set(_bool_to_toggle(settings.get("timeline", True)))
+        self.visual_letterbox_var.set(_bool_to_toggle(settings.get("letterbox", False)))
+        self.visual_zoom_var.set(str(settings.get("zoom") or "normal"))
+        self.visual_style_var.set(str(settings.get("style") or "bar"))
+        self.visual_color_spectrum_var.set(str(settings.get("color_spectrum") or "WhiteGold"))
+        self.visual_color_timeline_var.set(str(settings.get("color_timeline") or "WhiteGold"))
+        self.visual_spectrum_y_var.set(str(settings.get("spectrum_y") or "530"))
+        self.visual_spectrum_x_var.set(str(settings.get("spectrum_x") or "-1"))
+        spectrum_w_min, spectrum_w_max = _split_range_value(settings.get("spectrum_w", "1200"), 1200, 1200)
+        self.visual_spectrum_w_min_var.set(spectrum_w_min)
+        self.visual_spectrum_w_max_var.set(spectrum_w_max)
+        self.visual_film_grain_var.set(_bool_to_toggle(settings.get("film_grain", False)))
+        grain_min, grain_max = _split_range_value(settings.get("grain_strength", "15"), 15, 15)
+        self.visual_grain_strength_min_var.set(grain_min)
+        self.visual_grain_strength_max_var.set(grain_max)
+        self.visual_vignette_var.set(_bool_to_toggle(settings.get("vignette", False)))
+        self.visual_tint_var.set(str(settings.get("color_tint") or "none"))
+        self.visual_soft_focus_var.set(_bool_to_toggle(settings.get("soft_focus", False)))
+        soft_min, soft_max = _split_range_value(settings.get("soft_focus_sigma", "1.5"), 1.5, 1.5)
+        self.visual_soft_focus_sigma_min_var.set(soft_min)
+        self.visual_soft_focus_sigma_max_var.set(soft_max)
+        self.visual_particle_var.set(str(settings.get("particle") or "none"))
+        particle_opacity_min, particle_opacity_max = _split_range_value(settings.get("particle_opacity", "0.6"), 0.6, 0.6)
+        self.visual_particle_opacity_min_var.set(particle_opacity_min)
+        self.visual_particle_opacity_max_var.set(particle_opacity_max)
+        particle_speed_min, particle_speed_max = _split_range_value(settings.get("particle_speed", "1.0"), 1.0, 1.0)
+        self.visual_particle_speed_min_var.set(particle_speed_min)
+        self.visual_particle_speed_max_var.set(particle_speed_max)
+        self.visual_bass_pulse_var.set(_bool_to_toggle(settings.get("bass_pulse", False)))
+        bass_scale_min, bass_scale_max = _split_range_value(settings.get("bass_pulse_scale", "0.03"), 0.03, 0.03)
+        self.visual_bass_pulse_scale_min_var.set(bass_scale_min)
+        self.visual_bass_pulse_scale_max_var.set(bass_scale_max)
+        bass_brightness_min, bass_brightness_max = _split_range_value(settings.get("bass_pulse_brightness", "0.04"), 0.04, 0.04)
+        self.visual_bass_pulse_brightness_min_var.set(bass_brightness_min)
+        self.visual_bass_pulse_brightness_max_var.set(bass_brightness_max)
+        self.visual_text_var.set(str(settings.get("text") or ""))
+        self.visual_text_font_var.set(str(settings.get("text_font") or "default"))
+        self.visual_text_pos_var.set(str(settings.get("text_pos") or "center"))
+        text_size_min, text_size_max = _split_range_value(settings.get("text_size", "60"), 60, 60)
+        self.visual_text_size_min_var.set(text_size_min)
+        self.visual_text_size_max_var.set(text_size_max)
+        self.visual_text_style_var.set(str(settings.get("text_style") or "Classic"))
+
+    def _set_visual_fields_enabled(self, enabled: bool) -> None:
+        state = "normal" if enabled else "disabled"
+        for widgets in self._visual_setting_widgets.values():
+            for widget in widgets:
+                try:
+                    widget.configure(state=state)
+                except Exception:
+                    pass
+
+    def _refresh_visual_preset_controls(self) -> None:
+        preset_values = _visual_preset_menu_values(self.visual_presets)
+        if hasattr(self, "visual_preset_menu"):
+            self.visual_preset_menu.configure(values=preset_values)
+        queue_values = [QUEUE_VISUAL_RANDOM, QUEUE_VISUAL_MANUAL, *sorted(self.visual_presets.keys(), key=str.lower)]
+        if hasattr(self, "queue_visual_mode_menu"):
+            self.queue_visual_mode_menu.configure(values=queue_values)
+        current_choice = self.visual_preset_var.get()
+        if current_choice not in preset_values:
+            self.visual_preset_var.set(VISUAL_PRESET_NONE)
+        if hasattr(self, "queue_visual_mode_var") and self.queue_visual_mode_var.get() not in queue_values:
+            self.queue_visual_mode_var.set(QUEUE_VISUAL_RANDOM)
+
+    def _on_visual_preset_change(self, *_args: Any) -> None:
+        preset_name = _visual_preset_choice_to_value(self.visual_preset_var.get())
+        if preset_name == "none":
+            self._set_visual_fields_enabled(True)
+            self.visual_preset_hint_var.set("")
+            if hasattr(self, "visual_preset_hint_label"):
+                self.visual_preset_hint_label.grid_remove()
+            return
+        settings = self._visual_preset_to_settings(preset_name)
+        self._apply_visual_settings_to_form(settings, preset_choice=_visual_preset_value_to_choice(preset_name))
+        self._set_visual_fields_enabled(False)
+        self.visual_preset_hint_var.set(VISUAL_PRESET_HINT_TEMPLATE.format(name=preset_name))
+        if hasattr(self, "visual_preset_hint_label"):
+            self.visual_preset_hint_label.grid()
+
+    def _save_current_visual_preset(self) -> None:
+        name = simpledialog.askstring("保存视觉预设", "请输入预设名称：", parent=self)
+        clean_name = str(name or "").strip()
+        if not clean_name:
+            return
+        presets = dict(self.visual_presets)
+        presets[clean_name] = self._serialize_visual_preset(clean_name)
+        _write_json_object(VISUAL_PRESETS_FILE, presets)
+        self.visual_presets = _load_visual_presets()
+        self._refresh_visual_preset_controls()
+        self.visual_preset_var.set(_visual_preset_value_to_choice(clean_name))
+        self._on_visual_preset_change()
+        self._log(f"[Visual] 已保存视觉预设 {clean_name}")
+
+    def _delete_selected_visual_preset(self) -> None:
+        preset_name = _visual_preset_choice_to_value(self.visual_preset_var.get())
+        if preset_name == "none":
+            messagebox.showinfo("删除视觉预设", "当前未选择可删除的预设。")
+            return
+        presets = dict(self.visual_presets)
+        if preset_name not in presets:
+            self.visual_preset_var.set(VISUAL_PRESET_NONE)
+            self._on_visual_preset_change()
+            return
+        del presets[preset_name]
+        _write_json_object(VISUAL_PRESETS_FILE, presets)
+        self.visual_presets = _load_visual_presets()
+        self.visual_preset_var.set(VISUAL_PRESET_NONE)
+        self._refresh_visual_preset_controls()
+        self._on_visual_preset_change()
+        self._log(f"[Visual] 已删除视觉预设 {preset_name}")
+
     def _save_visual_settings(self) -> None:
         config = load_scheduler_settings(SCHEDULER_CONFIG_FILE)
         config["visual_settings"] = self._collect_visual_settings()
@@ -1354,47 +2024,17 @@ class DashboardApp(ctk.CTk):
         self._log("[Visual] Saved advanced visual settings")
 
     def _apply_visual_preset_mega_bass(self) -> None:
-        self.visual_preset_var.set("mega_bass")
-        self.visual_spectrum_var.set("yes")
-        self.visual_timeline_var.set("no")
-        self.visual_letterbox_var.set("no")
-        self.visual_zoom_var.set("random")
-        self.visual_style_var.set("random")
-        self.visual_color_spectrum_var.set("random")
-        self.visual_color_timeline_var.set("random")
-        self.visual_film_grain_var.set("yes")
-        self.visual_grain_strength_min_var.set("8")
-        self.visual_grain_strength_max_var.set("14")
-        self.visual_vignette_var.set("yes")
-        self.visual_tint_var.set("random")
-        self.visual_soft_focus_var.set("no")
-        self.visual_soft_focus_sigma_min_var.set("1.2")
-        self.visual_soft_focus_sigma_max_var.set("1.8")
-        self.visual_particle_var.set("random")
-        self.visual_particle_opacity_min_var.set("0.22")
-        self.visual_particle_opacity_max_var.set("0.42")
-        self.visual_particle_speed_min_var.set("0.95")
-        self.visual_particle_speed_max_var.set("1.45")
-        self.visual_bass_pulse_var.set("yes")
-        self.visual_bass_pulse_scale_min_var.set("0.018")
-        self.visual_bass_pulse_scale_max_var.set("0.036")
-        self.visual_bass_pulse_brightness_min_var.set("0.02")
-        self.visual_bass_pulse_brightness_max_var.set("0.06")
-        if not self.visual_text_var.get().strip():
-            self.visual_text_var.set("MEGA BASS")
-        self.visual_text_font_var.set("random")
-        self.visual_text_pos_var.set("random")
-        self.visual_text_size_min_var.set("96")
-        self.visual_text_size_max_var.set("136")
-        self.visual_text_style_var.set("random")
+        self.visual_preset_var.set(_visual_preset_value_to_choice("MegaBass"))
+        self._on_visual_preset_change()
         self._save_visual_settings()
-        self._log("[Visual] Applied MEGA BASS preset")
+        self._log("[Visual] Applied MegaBass preset")
 
     def _load_state(self) -> dict[str, Any]:
         if STATE_FILE.exists():
             try:
                 return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            except Exception:
+            except Exception as exc:
+                print(f"[警告] 加载状态文件失败，使用默认值: {exc}")
                 return {}
         return {}
 
@@ -1406,7 +2046,7 @@ class DashboardApp(ctk.CTk):
             "date_mmdd": self.date_var.get(),
             "simulate_seconds": self.simulate_seconds_var.get(),
             "randomize_effects": False,
-            "visual_preset": self.visual_preset_var.get(),
+            "visual_preset": _visual_preset_choice_to_value(self.visual_preset_var.get()),
             "visual_spectrum": self.visual_spectrum_var.get(),
             "visual_timeline": self.visual_timeline_var.get(),
             "visual_letterbox": self.visual_letterbox_var.get(),
@@ -1487,6 +2127,11 @@ class DashboardApp(ctk.CTk):
             "metadata_mode": "prompt_api",
             "current_group": self.current_group_var.get(),
             "source_dir_override": self.source_dir_override_var.get(),
+            "queue_prompt_template": self.queue_prompt_template_var.get(),
+            "queue_api_template": self.queue_api_template_var.get(),
+            "queue_visual_mode": _visual_mode_to_value(self.queue_visual_mode_var.get()),
+            "selected_window_serials": sorted(self._selected_window_serials),
+            "run_queue": self.run_queue.to_dict(),
             "add_ypp": self.add_ypp_var.get(),
             "add_quantity": self.add_quantity_var.get(),
             "add_title": self.add_title_var.get(),
@@ -1514,17 +2159,35 @@ class DashboardApp(ctk.CTk):
             "upload_auto_close": bool(self.upload_auto_close_var.get()),
             "prompt_group": self.prompt_group_var.get(),
         }
-        STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        # 原子写入：先写临时文件，再原子替换
+        temp_fd, temp_path = tempfile.mkstemp(
+            dir=str(STATE_FILE.parent), suffix=".tmp"
+        )
+        try:
+            with os.fdopen(temp_fd, 'w', encoding='utf-8') as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+            Path(temp_path).replace(STATE_FILE)
+        except Exception:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+            raise
 
     def _drain_log_queue(self) -> None:
-        while True:
+        # 批量处理日志 — 一次插入多条，减少GUI刷新次数
+        batch: list[str] = []
+        for _ in range(200):  # 每tick最多处理200条
             try:
-                message = self.log_queue.get_nowait()
+                batch.append(self.log_queue.get_nowait())
             except queue.Empty:
                 break
-            self.log_box.insert("end", message + "\n")
+        if batch:
+            self.log_box.insert("end", "\n".join(batch) + "\n")
             self.log_box.see("end")
-            self._update_run_status_from_log(message)
+            # 只对最后几条做状态解析（性能优化）
+            for msg in batch[-10:]:
+                self._update_run_status_from_log(msg)
         while True:
             try:
                 action = self.ui_action_queue.get_nowait()
@@ -1538,6 +2201,16 @@ class DashboardApp(ctk.CTk):
 
     def _post_ui_action(self, action: Callable[[], None]) -> None:
         self.ui_action_queue.put(action)
+
+    def _stream_process_output(self, proc: subprocess.Popen[str], label: str = "") -> None:
+        """统一读取子进程输出"""
+        prefix = f"[{label}] " if label else ""
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                self._log(f"{prefix}{line.rstrip()}")
+        except Exception as e:
+            self._log(f"{prefix}读取输出异常: {e}")
 
     def _clear_logs(self) -> None:
         self.log_box.delete("1.0", "end")
@@ -1657,7 +2330,8 @@ class DashboardApp(ctk.CTk):
         self._run_upload_done.clear()
         with self._upload_process_lock:
             self._upload_failures = []
-        self._run_result_map = {}
+        with self._state_lock:
+            self._run_result_map = {}
         self._run_plan_for_summary = None
         self._run_execution_result = None
         self._run_report_logged = False
@@ -1714,7 +2388,8 @@ class DashboardApp(ctk.CTk):
             if getattr(modules, "upload", False):
                 stages["upload"] = {"status": "pending", "detail": ""}
             result_map[key] = stages
-        self._run_result_map = result_map
+        with self._state_lock:
+            self._run_result_map = result_map
 
     def _mark_run_stage(
         self,
@@ -1727,23 +2402,26 @@ class DashboardApp(ctk.CTk):
         slot_index: int = 1,
         total_slots: int = 1,
     ) -> None:
-        key = self._task_result_key(tag, serial, slot_index, total_slots)
-        entry = self._run_result_map.setdefault(key, {})
-        stage_entry = entry.setdefault(stage, {"status": "pending", "detail": ""})
-        previous_status = str(stage_entry.get("status", "pending") or "pending").strip()
-        previous_detail = str(stage_entry.get("detail", "") or "").strip()
-        stage_entry["status"] = status
-        stage_entry["detail"] = str(detail or "").strip()
-        if status in {"failed", "skipped"} and (status != previous_status or stage_entry["detail"] != previous_detail):
-            stage_label = {"render": "剪辑", "metadata": "文案/封面", "upload": "上传"}.get(stage, stage)
-            prefix = "失败任务" if status == "failed" else "跳过任务"
-            reason = stage_entry["detail"] or ("已失败" if status == "failed" else "已跳过")
-            self._log(f"[{prefix}] {key} -> {stage_label}: {reason}")
+        with self._state_lock:
+            key = self._task_result_key(tag, serial, slot_index, total_slots)
+            entry = self._run_result_map.setdefault(key, {})
+            stage_entry = entry.setdefault(stage, {"status": "pending", "detail": ""})
+            previous_status = str(stage_entry.get("status", "pending") or "pending").strip()
+            previous_detail = str(stage_entry.get("detail", "") or "").strip()
+            stage_entry["status"] = status
+            stage_entry["detail"] = str(detail or "").strip()
+            if status in {"failed", "skipped"} and (status != previous_status or stage_entry["detail"] != previous_detail):
+                stage_label = {"render": "剪辑", "metadata": "文案/封面", "upload": "上传"}.get(stage, stage)
+                prefix = "失败任务" if status == "failed" else "跳过任务"
+                reason = stage_entry["detail"] or ("已失败" if status == "failed" else "已跳过")
+                self._log(f"[{prefix}] {key} -> {stage_label}: {reason}")
 
     def _failure_snapshot_text(self, limit: int = 6) -> str:
         stage_labels = {"render": "剪辑", "metadata": "文案/封面", "upload": "上传"}
         failed: list[str] = []
-        for key, stages in self._run_result_map.items():
+        with self._state_lock:
+            snapshot = dict(self._run_result_map)
+        for key, stages in snapshot.items():
             for stage_name in ("render", "metadata", "upload"):
                 stage = stages.get(stage_name)
                 if not stage:
@@ -1916,7 +2594,8 @@ class DashboardApp(ctk.CTk):
         self._run_upload_done.clear()
         self._run_plan_for_summary = None
         self._run_execution_result = None
-        self._run_result_map = {}
+        with self._state_lock:
+            self._run_result_map = {}
         self._run_report_logged = False
 
     def _tick_run_status(self) -> None:
@@ -2030,9 +2709,258 @@ class DashboardApp(ctk.CTk):
             parts.append("说明: 你可以继续切换其他页面查看或修改配置；新的开始任务会等当前流程结束。")
         return "\n".join(parts)
 
-    def _refresh_groups(self) -> None:
+    def _module_names_for_new_job(self) -> list[str]:
+        selected = [name for name, enabled in self._selected_modules().items() if enabled]
+        return selected or ["metadata", "upload"]
 
-        self.group_catalog = get_group_catalog()
+    def _current_upload_defaults_model(self) -> UploadDefaults:
+        timezone_text = str(self.schedule_timezone_var.get() or SCHEDULE_TIMEZONE_VALUES[0]).strip()
+        timezone_name = timezone_text.split(" ", 1)[0] if " " in timezone_text else timezone_text
+        return UploadDefaults(
+            visibility="schedule" if self.schedule_enabled_var.get() else self.default_visibility_var.get(),
+            category=self.default_category_var.get(),
+            is_for_kids=_bool_from_yes_no(self.default_kids_var.get()),
+            ai_content=self.default_ai_var.get(),
+            altered_content=self.default_ai_var.get(),
+            schedule_date=self.schedule_date_var.get() if self.schedule_enabled_var.get() else None,
+            schedule_time=self.schedule_time_var.get() if self.schedule_enabled_var.get() else None,
+            timezone=timezone_name or "Asia/Taipei",
+            auto_close_after=bool(self.upload_auto_close_var.get()),
+        )
+
+    def _effective_run_queue_jobs(self) -> list[GroupJob]:
+        effective_jobs: list[GroupJob] = []
+        current_defaults = self._current_upload_defaults_model()
+        for raw_job in self.run_queue.jobs:
+            job = GroupJob.from_dict(raw_job.to_dict())
+            job.upload_defaults = UploadDefaults.from_dict(current_defaults.to_dict())
+            if not job.modules:
+                job.modules = self._module_names_for_new_job()
+            effective_jobs.append(job)
+        return effective_jobs
+
+    def _find_window_info(self, tag: str, serial: int) -> WindowInfo:
+        for info in self.group_catalog.get(str(tag or "").strip(), []):
+            if int(info.serial) == int(serial):
+                return info
+        fallback_by_serial = _load_channel_mapping_lookup()[1]
+        fallback_entry = fallback_by_serial.get(int(serial)) or {}
+        return WindowInfo(
+            tag=str(tag or "").strip(),
+            serial=int(serial),
+            channel_name=str(fallback_entry.get("channel_name") or "").strip(),
+            is_ypp=False,
+        )
+
+    def _resolve_job_visual_settings(self, job: GroupJob) -> dict[str, Any]:
+        base_settings = dict(self._collect_visual_settings())
+        visual_mode = str(job.visual_mode or "random").strip() or "random"
+        if visual_mode == "manual":
+            if job.visual_settings:
+                base_settings.update(dict(job.visual_settings))
+            base_settings["preset"] = "none"
+            base_settings["visual_mode"] = "manual"
+            return base_settings
+        if visual_mode == "random":
+            base_settings["preset"] = "none"
+            base_settings["visual_mode"] = "random"
+            for key in (
+                "zoom",
+                "style",
+                "color_spectrum",
+                "color_timeline",
+                "color_tint",
+                "particle",
+                "text_font",
+                "text_pos",
+                "text_style",
+            ):
+                base_settings[key] = "random"
+            return base_settings
+        preset_settings = self._visual_preset_to_settings(visual_mode)
+        if job.visual_settings:
+            preset_settings.update(dict(job.visual_settings))
+        preset_settings["preset"] = visual_mode
+        preset_settings["visual_mode"] = visual_mode
+        return preset_settings
+
+    def _build_window_tasks_from_job(self, job: GroupJob) -> list[WindowTask]:
+        upload_defaults = job.upload_defaults
+        schedule_text = _compose_schedule_text(
+            str(upload_defaults.schedule_date or "").strip(),
+            str(upload_defaults.schedule_time or "").strip(),
+        )
+        notify_subscribers = bool(self.default_notify_var.get())
+        tasks: list[WindowTask] = []
+        seen_serials: set[int] = set()
+        for raw_serial in job.window_serials:
+            serial = int(raw_serial)
+            if serial in seen_serials:
+                continue
+            seen_serials.add(serial)
+            info = self._find_window_info(job.group_tag, serial)
+            tasks.append(
+                create_task(
+                    tag=job.group_tag,
+                    serial=serial,
+                    quantity=1,
+                    is_ypp=bool(info.is_ypp),
+                    title="",
+                    visibility=str(upload_defaults.visibility or "private").strip() or "private",
+                    category=str(upload_defaults.category or "Music").strip() or "Music",
+                    made_for_kids=bool(upload_defaults.is_for_kids),
+                    altered_content=_bool_from_yes_no(upload_defaults.ai_content or upload_defaults.altered_content),
+                    notify_subscribers=notify_subscribers,
+                    scheduled_publish_at=schedule_text,
+                    schedule_timezone=str(upload_defaults.timezone or "").strip(),
+                    source_dir=str(job.source_dir or "").strip(),
+                    channel_name=info.channel_name,
+                )
+            )
+        return tasks
+
+    def _sync_window_tasks_from_queue(self) -> None:
+        tasks: list[WindowTask] = []
+        for job in self._effective_run_queue_jobs():
+            tasks.extend(self._build_window_tasks_from_job(job))
+        self.window_tasks = tasks
+
+    def _queue_template_defaults_for_group(self, tag: str) -> tuple[str, str]:
+        prompt_config = self.prompt_config or {}
+        api_names = list((prompt_config.get("apiPresets") or {}).keys()) or ["default"]
+        content_names = list((prompt_config.get("contentTemplates") or {}).keys()) or ["default"]
+        api_name = (
+            find_explicit_api_preset_name(prompt_config, tag)
+            or pick_api_preset_name(prompt_config, tag)
+            or api_names[0]
+        )
+        content_name = (
+            find_explicit_content_template_name(prompt_config, tag)
+            or pick_content_template_name(prompt_config, tag)
+            or content_names[0]
+        )
+        if api_name not in api_names:
+            api_name = api_names[0]
+        if content_name not in content_names:
+            content_name = content_names[0]
+        return api_name, content_name
+
+    def _apply_current_group_context(self, *, preserve_selection: bool) -> None:
+        current_group = str(self.current_group_var.get() or "").strip()
+        bindings = get_group_bindings(self.scheduler_config)
+        self.source_dir_override_var.set(bindings.get(current_group, ""))
+        api_name, content_name = self._queue_template_defaults_for_group(current_group)
+        self.queue_api_template_var.set(api_name)
+        self.queue_prompt_template_var.set(content_name)
+        valid_serials = {int(info.serial) for info in self.group_catalog.get(current_group, [])}
+        if preserve_selection:
+            self._selected_window_serials = {
+                serial for serial in self._selected_window_serials if serial in valid_serials
+            }
+        else:
+            self._selected_window_serials = set()
+        self._refresh_window_buttons()
+
+    def _on_current_group_change(self) -> None:
+        try:
+            self._apply_current_group_context(preserve_selection=False)
+            self._save_state()
+        except Exception as exc:
+            print(f"[Dashboard] _on_current_group_change error: {exc}")
+
+    def _refresh_queue_display(self) -> None:
+        if not hasattr(self, "queue_list_frame"):
+            return
+        for child in self.queue_list_frame.winfo_children():
+            child.destroy()
+        if self.run_queue.is_empty():
+            ctk.CTkLabel(
+                self.queue_list_frame,
+                text="队列为空，请在下方添加分组任务",
+                text_color="#9fb2c8",
+            ).pack(anchor="w", padx=10, pady=12)
+            return
+        for summary in self.run_queue.get_summary():
+            row = ctk.CTkFrame(self.queue_list_frame)
+            row.pack(fill="x", padx=4, pady=4)
+            row.grid_columnconfigure(1, weight=1)
+            ctk.CTkButton(
+                row,
+                text="✕",
+                width=40,
+                command=lambda index=summary["index"]: self._remove_queue_job(index),
+                fg_color="#7a1f1f",
+                hover_color="#932525",
+            ).grid(row=0, column=0, sticky="w", padx=(10, 8), pady=8)
+            source_dir = str(summary.get("source_dir") or "").strip() or "(未设置，运行时按绑定目录解析)"
+            ctk.CTkLabel(
+                row,
+                text=(
+                    f"{summary['group_tag']} ({summary['window_count']}窗口) | "
+                    f"模板:{summary['prompt_template']} | 目录:{source_dir}"
+                ),
+                anchor="w",
+                justify="left",
+            ).grid(row=0, column=1, sticky="ew", padx=(0, 10), pady=8)
+
+    def _remove_queue_job(self, index: int) -> None:
+        try:
+            self.run_queue.remove_job(index)
+        except IndexError:
+            return
+        self._refresh_task_tree()
+        self._preview_plan()
+
+    def _select_all_current_group_windows(self) -> None:
+        current_group = str(self.current_group_var.get() or "").strip()
+        self._selected_window_serials = {
+            int(info.serial) for info in self.group_catalog.get(current_group, [])
+        }
+        self._refresh_window_buttons()
+        self._save_state()
+
+    def _toggle_window_selection(self, serial: int) -> None:
+        clean_serial = int(serial)
+        if clean_serial in self._selected_window_serials:
+            self._selected_window_serials.remove(clean_serial)
+        else:
+            self._selected_window_serials.add(clean_serial)
+        self._refresh_window_buttons()
+        self._save_state()
+
+    def _add_current_group_to_queue(self) -> None:
+        current_group = str(self.current_group_var.get() or "").strip()
+        if not current_group:
+            messagebox.showerror("无法加入队列", "请先选择一个分组。")
+            return
+        selected_serials = sorted(self._selected_window_serials)
+        if not selected_serials:
+            messagebox.showerror("无法加入队列", "请先选择至少一个窗口。")
+            return
+        visual_mode = _visual_mode_to_value(self.queue_visual_mode_var.get())
+        visual_settings: dict[str, Any] | None = None
+        if visual_mode == "manual":
+            visual_settings = dict(self._collect_visual_settings())
+        elif visual_mode not in {"random", "manual"}:
+            visual_settings = dict(self.visual_presets.get(visual_mode) or {})
+        job = GroupJob(
+            group_tag=current_group,
+            window_serials=selected_serials,
+            source_dir=str(self.source_dir_override_var.get() or "").strip(),
+            prompt_template=str(self.queue_prompt_template_var.get() or "default").strip() or "default",
+            api_template=str(self.queue_api_template_var.get() or "default").strip() or "default",
+            visual_mode=visual_mode,
+            visual_settings=visual_settings,
+            upload_defaults=self._current_upload_defaults_model(),
+            modules=self._module_names_for_new_job(),
+        )
+        self.run_queue.add_job(job)
+        self._selected_window_serials = set()
+        self._refresh_task_tree()
+        self._preview_plan()
+
+    def _refresh_groups(self) -> None:
+        self.group_catalog, browser_error = _build_group_catalog_from_config()
         groups = list(self.group_catalog.keys()) or [""]
         for menu in (
             self.current_group_menu,
@@ -2047,55 +2975,52 @@ class DashboardApp(ctk.CTk):
         if self.prompt_group_var.get() not in groups:
             self.prompt_group_var.set(self.current_group_var.get())
         self.binding_folder_var.set(get_group_bindings(self.scheduler_config).get(self.binding_group_var.get(), ""))
-        self._refresh_window_buttons()
+        self._apply_current_group_context(preserve_selection=True)
         self._refresh_bindings_box()
+        self._refresh_queue_display()
+        self._save_state()
+        if browser_error is not None:
+            self._log(f"[分组] BitBrowser 环境列表读取失败，已回退到 upload_config/channel_mapping: {browser_error}")
 
     def _refresh_window_buttons(self) -> None:
+        if not hasattr(self, "window_button_frame"):
+            return
         for child in self.window_button_frame.winfo_children():
             child.destroy()
-        current_group = self.current_group_var.get()
+        self._window_button_widgets = {}
+        current_group = str(self.current_group_var.get() or "").strip()
         windows = self.group_catalog.get(current_group, [])
         if not windows:
             ctk.CTkLabel(self.window_button_frame, text="当前分组没有窗口").pack(padx=12, pady=12)
             return
-        ctk.CTkLabel(self.window_button_frame, text="点哪个窗口，就把哪个窗口加入任务区").pack(anchor="w", padx=12, pady=(10, 6))
+        selected_count = len(self._selected_window_serials)
+        ctk.CTkLabel(
+            self.window_button_frame,
+            text=f"点击切换选中状态，当前已选 {selected_count} 个窗口",
+        ).pack(anchor="w", padx=12, pady=(10, 6))
         grid = ctk.CTkFrame(self.window_button_frame, fg_color="transparent")
         grid.pack(fill="x", padx=8, pady=(0, 10))
         for column in range(WINDOW_BUTTONS_PER_ROW):
             grid.grid_columnconfigure(column, weight=1)
         for index, info in enumerate(windows):
-            label = f"{info.serial} {info.channel_name}".strip()
             row_index = index // WINDOW_BUTTONS_PER_ROW
             column_index = index % WINDOW_BUTTONS_PER_ROW
-            ctk.CTkButton(
-                grid,
-                text=label,
-                command=lambda current=info: self._add_window_task(current),
-            ).grid(row=row_index, column=column_index, sticky="ew", padx=6, pady=6)
+            selected = int(info.serial) in self._selected_window_serials
+            label = f"[{info.serial}] {info.channel_name}".strip()
+            button_kwargs = {
+                "text": label,
+                "command": lambda serial=info.serial: self._toggle_window_selection(serial),
+            }
+            if selected:
+                button_kwargs["fg_color"] = "#2563eb"
+                button_kwargs["hover_color"] = "#1d4ed8"
+            button = ctk.CTkButton(grid, **button_kwargs)
+            button.grid(row=row_index, column=column_index, sticky="ew", padx=6, pady=6)
+            self._window_button_widgets[int(info.serial)] = button
 
     def _refresh_task_tree(self) -> None:
-        for item in self.task_tree.get_children():
-            self.task_tree.delete(item)
-        bindings = get_group_bindings(self.scheduler_config)
-        for index, task in enumerate(self.window_tasks):
-            source_text = task.source_dir.strip() or bindings.get(task.tag, "")
-            self.task_tree.insert(
-                "",
-                "end",
-                iid=str(index),
-                values=(
-                    task.tag,
-                    task.serial,
-                    max(1, int(getattr(task, "quantity", 1) or 1)),
-                    _yes_no_from_bool(task.is_ypp),
-                    task.visibility,
-                    task.category,
-                    _yes_no_from_bool(task.made_for_kids),
-                    _yes_no_from_bool(task.altered_content),
-                    task.scheduled_publish_at,
-                    source_text,
-                ),
-            )
+        self._sync_window_tasks_from_queue()
+        self._refresh_queue_display()
         self._save_state()
 
     def _refresh_bindings_box(self) -> None:
@@ -2106,12 +3031,25 @@ class DashboardApp(ctk.CTk):
         self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
         api_names = list((self.prompt_config.get("apiPresets") or {}).keys()) or [""]
         content_names = list((self.prompt_config.get("contentTemplates") or {}).keys()) or [""]
+        queue_api_values = api_names if any(api_names) else ["default"]
+        queue_content_values = content_names if any(content_names) else ["default"]
         self.api_preset_menu.configure(values=api_names)
         self.content_template_menu.configure(values=content_names)
+        if hasattr(self, "queue_api_template_menu"):
+            self.queue_api_template_menu.configure(values=queue_api_values)
+        if hasattr(self, "queue_prompt_template_menu"):
+            self.queue_prompt_template_menu.configure(values=queue_content_values)
         if self.api_preset_var.get() not in api_names:
             self.api_preset_var.set(api_names[0])
         if self.content_template_var.get() not in content_names:
             self.content_template_var.set(content_names[0])
+        queue_api_name, queue_content_name = self._queue_template_defaults_for_group(self.current_group_var.get())
+        if self.queue_api_template_var.get() not in queue_api_values:
+            self.queue_api_template_var.set(queue_api_name if queue_api_name in queue_api_values else queue_api_values[0])
+        if self.queue_prompt_template_var.get() not in queue_content_values:
+            self.queue_prompt_template_var.set(
+                queue_content_name if queue_content_name in queue_content_values else queue_content_values[0]
+            )
 
     def _pick_source_override(self) -> None:
         selected = filedialog.askdirectory(title="选择新增窗口使用的素材目录")
@@ -2618,7 +3556,13 @@ class DashboardApp(ctk.CTk):
         else:
             target = Path(self.output_root_var.get())
         if target.exists():
-            os.startfile(target)
+            import platform as _plat
+            if _plat.system() == "Darwin":
+                subprocess.call(["open", str(target)])
+            elif _plat.system() == "Windows":
+                os.startfile(target)
+            else:
+                subprocess.call(["xdg-open", str(target)])
 
 
     def _collect_output_dirs_from_result(self, result) -> dict[str, str]:
@@ -2705,9 +3649,7 @@ class DashboardApp(ctk.CTk):
             error_text = ""
             completed_ok = False
             try:
-                assert proc.stdout is not None
-                for line in proc.stdout:
-                    self._log(f"[Upload {label}] {line.rstrip()}")
+                self._stream_process_output(proc, f"Upload {label}")
                 return_code = proc.wait()
                 if return_code != 0 and not self._cancel_requested:
                     error_text = f"{label} exit {return_code}"
@@ -2866,9 +3808,7 @@ class DashboardApp(ctk.CTk):
                 def reader() -> None:
                     error_text = ""
                     try:
-                        assert proc.stdout is not None
-                        for line in proc.stdout:
-                            self._log(f"[Upload {label}] {line.rstrip()}")
+                        self._stream_process_output(proc, f"Upload {label}")
                         return_code = proc.wait()
                         if return_code != 0 and not self._cancel_requested:
                             error_text = f"{label} exit {return_code}"
@@ -3086,20 +4026,8 @@ class DashboardApp(ctk.CTk):
         RUN_SNAPSHOT_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _runtime_window_tasks(self) -> list[WindowTask]:
-        selected_tag = str(self.current_group_var.get() or "").strip()
-        live_source_dir = str(self.source_dir_override_var.get() or "").strip()
-        tags = [str(task.tag or "").strip() for task in self.window_tasks if str(task.tag or "").strip()]
-        unique_tags = list(dict.fromkeys(tags))
-        single_tag_mode = len(unique_tags) == 1
-
         runtime_tasks: list[WindowTask] = []
         for task in self.window_tasks:
-            should_override_source = False
-            if single_tag_mode:
-                should_override_source = True
-            elif selected_tag and str(task.tag or "").strip() == selected_tag:
-                should_override_source = True
-
             cloned = create_task(
                 tag=task.tag,
                 serial=task.serial,
@@ -3114,7 +4042,7 @@ class DashboardApp(ctk.CTk):
                 notify_subscribers=task.notify_subscribers,
                 scheduled_publish_at=task.scheduled_publish_at,
                 schedule_timezone=task.schedule_timezone,
-                source_dir=live_source_dir if should_override_source else task.source_dir,
+                source_dir=task.source_dir,
                 channel_name=task.channel_name,
                 slot_index=getattr(task, "slot_index", 1),
                 total_slots=getattr(task, "total_slots", 1),
@@ -3132,6 +4060,106 @@ class DashboardApp(ctk.CTk):
             defaults=self._collect_defaults(),
             modules=self._current_module_selection(),
             config=config or self._sync_runtime_paths(persist=False),
+        )
+
+    def _module_selection_for_job(self, job: GroupJob):
+        flags = {"metadata": False, "render": False, "upload": False}
+        for module_name in job.modules:
+            clean_name = str(module_name or "").strip()
+            if clean_name in flags:
+                flags[clean_name] = True
+        if not any(flags.values()):
+            flags = self._selected_modules()
+        return build_module_selection(
+            metadata=flags["metadata"],
+            render=flags["render"],
+            upload=flags["upload"],
+        )
+
+    def _workflow_defaults_for_job(self, job: GroupJob) -> WorkflowDefaults:
+        upload_defaults = job.upload_defaults
+        schedule_text = _compose_schedule_text(
+            str(upload_defaults.schedule_date or "").strip(),
+            str(upload_defaults.schedule_time or "").strip(),
+        )
+        module_selection = self._module_selection_for_job(job)
+        return WorkflowDefaults(
+            date_mmdd=normalize_mmdd(self.date_var.get().strip() or _today_mmdd()),
+            visibility=str(upload_defaults.visibility or "private").strip() or "private",
+            category=str(upload_defaults.category or "Music").strip() or "Music",
+            made_for_kids=bool(upload_defaults.is_for_kids),
+            altered_content=_bool_from_yes_no(upload_defaults.ai_content or upload_defaults.altered_content),
+            notify_subscribers=bool(self.default_notify_var.get()),
+            schedule_enabled=bool(schedule_text and str(upload_defaults.visibility or "").strip() == "schedule"),
+            schedule_start=schedule_text,
+            schedule_interval_minutes=int(self.schedule_interval_var.get().strip() or "60"),
+            schedule_timezone=str(upload_defaults.timezone or "Asia/Taipei").strip() or "Asia/Taipei",
+            metadata_mode="prompt_api",
+            generate_text=bool(module_selection.metadata),
+            generate_thumbnails=bool(module_selection.metadata),
+            sync_daily_content=bool(module_selection.metadata),
+            randomize_effects=False,
+            visual_settings=self._resolve_job_visual_settings(job),
+        )
+
+    def _apply_job_prompt_bindings(self, job: GroupJob) -> None:
+        self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
+        api_presets = self.prompt_config.get("apiPresets") or {}
+        content_templates = self.prompt_config.get("contentTemplates") or {}
+        api_name, content_name = self._queue_template_defaults_for_group(job.group_tag)
+        requested_api = str(job.api_template or getattr(job, "api_preset", "") or "").strip()
+        requested_content = str(job.prompt_template or "").strip()
+        if requested_api and requested_api != "default" and requested_api in api_presets:
+            api_name = requested_api
+        if requested_content and requested_content != "default" and requested_content in content_templates:
+            content_name = requested_content
+        api_payload = dict(api_presets.get(api_name) or {})
+        content_payload = dict(content_templates.get(content_name) or {})
+        if api_payload or content_payload:
+            ensure_prompt_presets(
+                api_name=api_name,
+                api_payload=api_payload,
+                content_name=content_name,
+                content_payload=content_payload,
+                tag=job.group_tag,
+                path=PROMPT_STUDIO_FILE,
+            )
+            self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
+
+    def _build_run_plan_for_job(self, job: GroupJob, *, config: dict[str, Any] | None = None):
+        runtime_config = config or self._sync_runtime_paths(persist=False)
+        tasks = self._build_window_tasks_from_job(job)
+        return build_run_plan(
+            tasks=tasks,
+            defaults=self._workflow_defaults_for_job(job),
+            modules=self._module_selection_for_job(job),
+            config=runtime_config,
+        )
+
+    def _build_tracking_plan_for_queue(self, *, config: dict[str, Any] | None = None):
+        runtime_config = config or self._sync_runtime_paths(persist=False)
+        effective_jobs = self._effective_run_queue_jobs()
+        tracking_tasks: list[WindowTask] = []
+        combined_flags = {"metadata": False, "render": False, "upload": False}
+        for job in effective_jobs:
+            tracking_tasks.extend(self._build_window_tasks_from_job(job))
+            for module_name in job.modules:
+                clean_name = str(module_name or "").strip()
+                if clean_name in combined_flags:
+                    combined_flags[clean_name] = True
+        modules = build_module_selection(
+            metadata=combined_flags["metadata"],
+            render=combined_flags["render"],
+            upload=combined_flags["upload"],
+        )
+        defaults = self._collect_defaults()
+        if effective_jobs:
+            defaults.visual_settings = self._resolve_job_visual_settings(effective_jobs[0])
+        return build_run_plan(
+            tasks=tracking_tasks,
+            defaults=defaults,
+            modules=modules,
+            config=runtime_config,
         )
 
     def _assert_manifest_ready_for_upload(self, *, manifest_path: Path, task: WindowTask, output_dir: Path) -> None:
@@ -3534,7 +4562,6 @@ class DashboardApp(ctk.CTk):
             )
             stream_upload = bool(run_plan.modules.render and run_plan.modules.upload)
             upload_dispatched = False
-            upload_launched = 0
 
             def handle_item_ready(task: WindowTask, output_dir: Path, _manifest_path: Path) -> None:
                 nonlocal upload_dispatched
@@ -3594,57 +4621,6 @@ class DashboardApp(ctk.CTk):
             include_upload=bool(module_selection.upload),
         )
 
-
-    def _bind_scroll_frame_wheel(
-        self,
-        scroll_frame: ctk.CTkScrollableFrame,
-        *widgets: ctk.CTkBaseClass,
-        include_textboxes: bool = False,
-    ) -> None:
-        canvas = getattr(scroll_frame, "_parent_canvas", None)
-        if canvas is None:
-            return
-
-        try:
-            canvas.configure(yscrollincrement=24)
-        except Exception:
-            pass
-
-        def _on_mousewheel(event: Any) -> str | None:
-            delta = 0
-            if getattr(event, "delta", 0):
-                delta = -int(event.delta / 120) if event.delta else 0
-            elif getattr(event, "num", None) == 4:
-                delta = -1
-            elif getattr(event, "num", None) == 5:
-                delta = 1
-            if delta:
-                canvas.yview_scroll(delta, "units")
-                return "break"
-            return None
-
-        def _bind_tree(widget: Any) -> None:
-            if isinstance(widget, ctk.CTkTextbox) and not include_textboxes:
-                return
-            for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-                try:
-                    widget.bind(sequence, _on_mousewheel, add="+")
-                except Exception:
-                    pass
-            for attr_name in ("_entry", "_text_label", "_canvas", "_dropdown_menu", "_scrollbar", "_textbox"):
-                inner = getattr(widget, attr_name, None)
-                if inner is None:
-                    continue
-                for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-                    try:
-                        inner.bind(sequence, _on_mousewheel, add="+")
-                    except Exception:
-                        pass
-            for child in widget.winfo_children():
-                _bind_tree(child)
-
-        for widget in widgets:
-            _bind_tree(widget)
 
     def _build_start_tab(self) -> None:
         tab = self.tabview.tab("快捷开始")
@@ -3809,32 +4785,22 @@ class DashboardApp(ctk.CTk):
 
     def _on_close(self) -> None:
         self._save_state()
+        # 清理上传监控线程
+        for thread in getattr(self, 'upload_monitor_threads', []):
+            if thread.is_alive():
+                thread.join(timeout=2)
+        # 终止所有子进程
+        for proc in getattr(self, 'worker_processes', []):
+            try:
+                proc.terminate()
+            except Exception:
+                pass
         self.destroy()
 
 
 def _patched_refresh_task_tree(self: DashboardApp) -> None:
-    for item in self.task_tree.get_children():
-        self.task_tree.delete(item)
-    bindings = get_group_bindings(self.scheduler_config)
-    for index, task in enumerate(self.window_tasks):
-        source_text = str(task.source_dir or "").strip() or bindings.get(task.tag, "")
-        self.task_tree.insert(
-            "",
-            "end",
-            iid=str(index),
-            values=(
-                task.tag,
-                task.serial,
-                max(1, int(getattr(task, "quantity", 1) or 1)),
-                _yes_no_from_bool(task.is_ypp),
-                task.visibility,
-                task.category,
-                _yes_no_from_bool(task.made_for_kids),
-                _yes_no_from_bool(task.altered_content),
-                task.scheduled_publish_at,
-                source_text,
-            ),
-        )
+    self._sync_window_tasks_from_queue()
+    self._refresh_queue_display()
     self._save_state()
 
 
@@ -3872,20 +4838,8 @@ def _patched_add_window_task(self: DashboardApp, info: Any) -> None:
 
 
 def _patched_runtime_window_tasks(self: DashboardApp) -> list[WindowTask]:
-    selected_tag = str(self.current_group_var.get() or "").strip()
-    live_source_dir = str(self.source_dir_override_var.get() or "").strip()
-    tags = [str(task.tag or "").strip() for task in self.window_tasks if str(task.tag or "").strip()]
-    unique_tags = list(dict.fromkeys(tags))
-    single_tag_mode = len(unique_tags) == 1
-
     runtime_tasks: list[WindowTask] = []
     for task in self.window_tasks:
-        should_override_source = False
-        if single_tag_mode:
-            should_override_source = True
-        elif selected_tag and str(task.tag or "").strip() == selected_tag:
-            should_override_source = True
-
         cloned = create_task(
             tag=task.tag,
             serial=task.serial,
@@ -3900,7 +4854,7 @@ def _patched_runtime_window_tasks(self: DashboardApp) -> list[WindowTask]:
             notify_subscribers=task.notify_subscribers,
             scheduled_publish_at=task.scheduled_publish_at,
             schedule_timezone=task.schedule_timezone,
-            source_dir=live_source_dir if should_override_source else task.source_dir,
+            source_dir=task.source_dir,
             channel_name=task.channel_name,
             slot_index=getattr(task, "slot_index", 1),
             total_slots=getattr(task, "total_slots", 1),
@@ -4118,9 +5072,7 @@ def _patched_launch_stream_upload_for_task(
         error_text = ""
         completed_ok = False
         try:
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                self._log(f"[Upload {label}] {line.rstrip()}")
+            self._stream_process_output(proc, f"Upload {label}")
             return_code = proc.wait()
             if return_code != 0 and not self._cancel_requested:
                 error_text = f"{label} exit {return_code}"
@@ -4202,7 +5154,6 @@ def _patched_dispatch_upload_round(
             launched += 1
         if launched == 0:
             return []
-        self._log(f"[Upload] Round parallel upload started for {launched} windows")
         return self._wait_for_stream_uploads()
 
 
@@ -4215,23 +5166,27 @@ def _patched_start_real_flow(self: DashboardApp) -> None:
         f"image={saved_config.get('base_image_dir')} | "
         f"output={saved_config.get('output_root')}"
     )
-    module_selection = self._current_module_selection()
-    if not module_selection.any_selected():
-        messagebox.showerror("Cannot Start", "Select at least one module first.")
+    if self.run_queue.is_empty():
+        messagebox.showerror("Cannot Start", "Run queue is empty. Add at least one group job first.")
         return
+    self._refresh_task_tree()
     if not self.window_tasks:
-        messagebox.showerror("Cannot Start", "Add at least one window task first.")
+        messagebox.showerror("Cannot Start", "Run queue has no valid window tasks.")
         return
-    if module_selection.metadata:
+    effective_jobs = self._effective_run_queue_jobs()
+    tracking_plan = self._build_tracking_plan_for_queue(config=saved_config)
+    if not tracking_plan.modules.any_selected():
+        messagebox.showerror("Cannot Start", "Select at least one module before adding jobs to the queue.")
+        return
+    if tracking_plan.modules.metadata:
         if not bool(self.generate_text_var.get()):
             self.generate_text_var.set(True)
         if not bool(self.generate_thumbnails_var.get()):
             self.generate_thumbnails_var.set(True)
         self._log("[Metadata] Quick Start 已勾选文案模块，本次强制走 API 生成标题/简介/标签，缩略图优先走图片 API。")
     self._persist_prompt_form_for_active_tasks()
-    full_run_plan = self._build_current_run_plan(config=saved_config)
-    self._write_run_snapshot(config=saved_config, run_plan=full_run_plan)
-    self._prepare_run_result_tracking(full_run_plan)
+    self._write_run_snapshot(config=saved_config, run_plan=tracking_plan)
+    self._prepare_run_result_tracking(tracking_plan)
     task_runtime_rows = [
         {
             "tag": str(task.tag or "").strip(),
@@ -4244,31 +5199,22 @@ def _patched_start_real_flow(self: DashboardApp) -> None:
             "title": str(task.title or "").strip(),
             "thumbnails": [str(item).strip() for item in task.thumbnails if str(item).strip()],
         }
-        for task in full_run_plan.tasks
+        for task in tracking_plan.tasks
     ]
     self._log(f"[Paths] Runtime tasks: {json.dumps(task_runtime_rows, ensure_ascii=False)}")
-    self._log(f"[Paths] Resolved tag output dirs: {json.dumps(full_run_plan.window_plan.get('tag_output_dirs', {}), ensure_ascii=False)}")
-    self._log(f"[Paths] Resolved tag metadata dirs: {json.dumps(full_run_plan.window_plan.get('tag_metadata_dirs', {}), ensure_ascii=False)}")
-
-    round_groups: dict[int, list[WindowTask]] = {}
-    for task in full_run_plan.tasks:
-        round_groups.setdefault(int(getattr(task, "round_index", 1) or 1), []).append(task)
-    ordered_rounds = [round_groups[idx] for idx in sorted(round_groups)]
-    upload_runtime = {
-        "retain_days": str(self.cleanup_days_var.get().strip() or "5"),
-        "auto_close": bool(self.upload_auto_close_var.get()),
-    }
+    self._log(f"[Paths] Resolved tag output dirs: {json.dumps(tracking_plan.window_plan.get('tag_output_dirs', {}), ensure_ascii=False)}")
+    self._log(f"[Paths] Resolved tag metadata dirs: {json.dumps(tracking_plan.window_plan.get('tag_metadata_dirs', {}), ensure_ascii=False)}")
 
     def job() -> bool:
         self._log(
-            f"[Paths] metadata={full_run_plan.metadata_root} | music={full_run_plan.music_root} | "
-            f"image={full_run_plan.image_root} | output={full_run_plan.output_root}"
+            f"[Paths] metadata={tracking_plan.metadata_root} | music={tracking_plan.music_root} | "
+            f"image={tracking_plan.image_root} | output={tracking_plan.output_root}"
         )
         seen_failures: set[str] = set()
 
-        def collect_round_failures(round_tasks: list[WindowTask]) -> list[str]:
+        def collect_job_failures(job_run_plan) -> list[str]:
             failures: list[str] = []
-            for round_task in round_tasks:
+            for round_task in getattr(job_run_plan, "tasks", []) or []:
                 key = self._task_result_key(
                     round_task.tag,
                     round_task.serial,
@@ -4287,42 +5233,48 @@ def _patched_start_real_flow(self: DashboardApp) -> None:
                         break
             return failures
 
-        for round_number, round_tasks in enumerate(ordered_rounds, 1):
+        for queue_index, queue_job in enumerate(effective_jobs, 1):
             if self._cancel_requested:
                 return False
-            round_labels = ", ".join(task_runtime_key(task) for task in round_tasks)
-            self._log(f"[Round] {round_number}/{len(ordered_rounds)} -> {round_labels}")
-            round_plan = build_run_plan(
-                tasks=round_tasks,
-                defaults=full_run_plan.defaults,
-                modules=full_run_plan.modules,
-                config=saved_config,
+            self._apply_job_prompt_bindings(queue_job)
+            job_run_plan = self._build_run_plan_for_job(queue_job, config=saved_config)
+            self._log(
+                f"[Queue] {queue_index}/{len(effective_jobs)} -> {queue_job.group_tag} | "
+                f"windows={queue_job.window_serials} | prompt={queue_job.prompt_template} | "
+                f"api={queue_job.api_template} | visual={queue_job.visual_mode}"
             )
-            stream_upload = bool(round_plan.modules.upload and (round_plan.modules.render or round_plan.modules.metadata))
+            stream_upload = bool(
+                job_run_plan.modules.upload and (job_run_plan.modules.render or job_run_plan.modules.metadata)
+            )
             upload_dispatched = False
-            upload_launched = 0
             with self._upload_process_lock:
                 self._upload_failures = []
+            upload_runtime = {
+                "retain_days": str(self.cleanup_days_var.get().strip() or "5"),
+                "auto_close": bool(queue_job.upload_defaults.auto_close_after),
+            }
 
             def handle_item_ready(task: WindowTask, output_dir: Path, manifest_path: Path) -> None:
-                nonlocal upload_dispatched, upload_launched
+                nonlocal upload_dispatched
                 if not stream_upload:
                     return
                 self._assert_manifest_ready_for_upload(manifest_path=manifest_path, task=task, output_dir=output_dir)
                 upload_dispatched = True
-                upload_launched += 1
-                self._log(f"[Upload] Round {round_number}: {task_runtime_key(task)} 已就绪，立即上传")
+                self._log(
+                    f"[Upload] Queue {queue_index}/{len(effective_jobs)}: "
+                    f"{task_runtime_key(task)} 已就绪，立即上传"
+                )
                 self._launch_stream_upload_for_task(
-                    round_plan,
+                    job_run_plan,
                     task,
                     output_dir,
                     retain_days=upload_runtime["retain_days"],
                     auto_close=upload_runtime["auto_close"],
                 )
 
-            if round_plan.modules.render or round_plan.modules.metadata:
+            if job_run_plan.modules.render or job_run_plan.modules.metadata:
                 execution = execute_run_plan(
-                    round_plan,
+                    job_run_plan,
                     control=self.execution_control,
                     on_item_ready=handle_item_ready if stream_upload else None,
                     log=self._log,
@@ -4330,37 +5282,36 @@ def _patched_start_real_flow(self: DashboardApp) -> None:
                 self._ingest_execution_result(execution)
                 if stream_upload:
                     if upload_dispatched:
-                        self._log(f"[Upload] Round {round_number}: parallel uploads already launched for {upload_launched} windows")
                         failures = self._wait_for_stream_uploads()
                         if self._cancel_requested:
                             return False
                         for failure in failures:
-                            failure_key = f"{round_number}:{failure}"
+                            failure_key = f"{queue_index}:{failure}"
                             if failure_key not in seen_failures:
                                 seen_failures.add(failure_key)
                     else:
-                        self._log(f"[Round] {round_number}: no ready uploads in this round")
-                round_failures = collect_round_failures(round_tasks)
-                if round_failures:
-                    self._log("[Round] Failures -> " + " | ".join(round_failures))
+                        self._log(f"[Queue] {queue_index}/{len(effective_jobs)}: no ready uploads in this group")
+                job_failures = collect_job_failures(job_run_plan)
+                if job_failures:
+                    self._log("[Queue] Failures -> " + " | ".join(job_failures))
                 continue
 
-            if round_plan.modules.upload:
-                self._log(f"[Start] Upload round {round_number}")
+            if job_run_plan.modules.upload:
+                self._log(f"[Queue] {queue_index}/{len(effective_jobs)} 开始上传分组 {queue_job.group_tag}")
                 failures = self._dispatch_upload_round(
-                    round_plan,
+                    job_run_plan,
                     retain_days=upload_runtime["retain_days"],
                     auto_close=upload_runtime["auto_close"],
                 )
                 if self._cancel_requested:
                     return False
                 for failure in failures:
-                    failure_key = f"{round_number}:{failure}"
+                    failure_key = f"{queue_index}:{failure}"
                     if failure_key not in seen_failures:
                         seen_failures.add(failure_key)
-                round_failures = collect_round_failures(round_tasks)
-                if round_failures:
-                    self._log("[Round] Failures -> " + " | ".join(round_failures))
+                job_failures = collect_job_failures(job_run_plan)
+                if job_failures:
+                    self._log("[Queue] Failures -> " + " | ".join(job_failures))
 
         if self._cancel_requested:
             return False
@@ -4369,12 +5320,172 @@ def _patched_start_real_flow(self: DashboardApp) -> None:
             raise RuntimeError(" | ".join(item.split(":", 1)[-1] for item in failures[:3]))
         return False
 
-    task_name = " + ".join(self._selected_module_labels())
+    task_name = " + ".join(tracking_plan.modules.labels()) or "RunQueue"
     self._run_background(
         job,
         task_name=task_name,
-        total_items=len(full_run_plan.tasks),
-        include_upload=bool(module_selection.upload),
+        total_items=len(tracking_plan.tasks),
+        include_upload=bool(tracking_plan.modules.upload),
+    )
+
+
+def _patched_start_real_flow(self: DashboardApp) -> None:
+    saved_config = self._save_paths()
+    self._log(
+        "[Paths] 本次运行使用: "
+        f"metadata={saved_config.get('metadata_root')} | "
+        f"music={saved_config.get('music_dir')} | "
+        f"image={saved_config.get('base_image_dir')} | "
+        f"output={saved_config.get('output_root')}"
+    )
+    if self.run_queue.is_empty():
+        messagebox.showerror("Cannot Start", "Run queue is empty. Add at least one group job first.")
+        return
+    self._refresh_task_tree()
+    if not self.window_tasks:
+        messagebox.showerror("Cannot Start", "Run queue has no valid window tasks.")
+        return
+
+    queue_defaults = self._current_upload_defaults_model()
+    tracking_plan = self._build_tracking_plan_for_queue(config=saved_config)
+    if not tracking_plan.modules.any_selected():
+        messagebox.showerror("Cannot Start", "Select at least one module before adding jobs to the queue.")
+        return
+    if tracking_plan.modules.metadata:
+        if not bool(self.generate_text_var.get()):
+            self.generate_text_var.set(True)
+        if not bool(self.generate_thumbnails_var.get()):
+            self.generate_thumbnails_var.set(True)
+        self._log("[Metadata] Quick Start 已选中文案模块，本次强制走 API 生成标题/简介/标签。")
+
+    self._persist_prompt_form_for_active_tasks()
+    self._write_run_snapshot(config=saved_config, run_plan=tracking_plan)
+    self._prepare_run_result_tracking(tracking_plan)
+
+    task_runtime_rows = [
+        {
+            "tag": str(task.tag or "").strip(),
+            "serial": int(task.serial),
+            "quantity": max(1, int(getattr(task, "quantity", 1) or 1)),
+            "slot_index": int(getattr(task, "slot_index", 1) or 1),
+            "total_slots": int(getattr(task, "total_slots", 1) or 1),
+            "round_index": int(getattr(task, "round_index", 1) or 1),
+            "source_dir": str(task.source_dir or "").strip(),
+            "title": str(task.title or "").strip(),
+            "thumbnails": [str(item).strip() for item in task.thumbnails if str(item).strip()],
+        }
+        for task in tracking_plan.tasks
+    ]
+    self._log(f"[Paths] Runtime tasks: {json.dumps(task_runtime_rows, ensure_ascii=False)}")
+    self._log(f"[Paths] Resolved tag output dirs: {json.dumps(tracking_plan.window_plan.get('tag_output_dirs', {}), ensure_ascii=False)}")
+    self._log(f"[Paths] Resolved tag metadata dirs: {json.dumps(tracking_plan.window_plan.get('tag_metadata_dirs', {}), ensure_ascii=False)}")
+
+    def handle_queue_progress(event: dict[str, Any]) -> None:
+        event_type = str(event.get("type") or "").strip()
+        if not event_type:
+            return
+        if event_type == "log":
+            message = str(event.get("message") or "").strip()
+            if message:
+                self._log(message)
+            return
+
+        group_tag = str(event.get("group_tag") or "").strip()
+        label = str(event.get("label") or "").strip()
+        serial_value = int(event.get("serial") or 0)
+
+        if event_type == "job_started":
+            self._run_phase = f"queue {event.get('job_index', 0)}/{event.get('job_total', 0)}"
+            self._run_current_item = f"{group_tag} | {int(event.get('window_count') or 0)}窗口"
+            self._run_current_ratio = 0.0
+            self._log(
+                f"[Queue] {event.get('job_index', 0)}/{event.get('job_total', 0)} -> "
+                f"{group_tag} | windows={event.get('window_serials', [])}"
+            )
+            return
+        if event_type == "prepare_started":
+            self._run_phase = "prepare"
+            self._run_current_item = f"{group_tag} | generating metadata/render"
+            self._run_current_ratio = 0.0
+            return
+        if event_type == "prepare_finished":
+            self._run_phase = "prepare done"
+            self._run_current_item = f"{group_tag} | ready for upload"
+            self._run_current_ratio = 0.0
+            return
+        if event_type == "window_started":
+            if label and not bool(event.get("has_prepare_step", True)):
+                self._run_progress_step_done(label, "render")
+            if group_tag and serial_value:
+                self._mark_run_stage(group_tag, serial_value, "upload", "running", "uploading")
+            self._run_phase = "upload"
+            self._run_current_item = f"{group_tag} / 窗口 {serial_value}"
+            self._run_current_ratio = 0.0
+            return
+        if event_type == "window_finished":
+            detail = str(event.get("detail") or event.get("stage") or "").strip()
+            if group_tag and serial_value:
+                self._mark_run_stage(
+                    group_tag,
+                    serial_value,
+                    "upload",
+                    "success" if bool(event.get("success")) else "failed",
+                    detail,
+                )
+            if label:
+                self._run_progress_step_done(label, "upload")
+            self._run_phase = "upload done" if bool(event.get("success")) else "upload failed"
+            self._run_current_item = f"{group_tag} / 窗口 {serial_value} | {detail or 'done'}"
+            self._run_current_ratio = 0.0
+            return
+        if event_type == "group_finished":
+            self._run_phase = "group done"
+            self._run_current_item = (
+                f"{group_tag} | success={int(event.get('success_count') or 0)} | "
+                f"failed={int(event.get('failed_count') or 0)}"
+            )
+            return
+        if event_type == "job_error":
+            self._run_phase = "job error"
+            self._run_current_item = f"{group_tag} | {str(event.get('detail') or '').strip()}"
+
+    def job() -> bool:
+        self._log(
+            f"[Paths] metadata={tracking_plan.metadata_root} | music={tracking_plan.music_root} | "
+            f"image={tracking_plan.image_root} | output={tracking_plan.output_root}"
+        )
+        queue_results = asyncio.run(
+            execute_run_queue(
+                self.run_queue,
+                queue_defaults,
+                control=self.execution_control,
+                before_job_callback=self._apply_job_prompt_bindings,
+                build_run_plan_for_job=lambda queue_job: self._build_run_plan_for_job(queue_job, config=saved_config),
+                execution_result_callback=lambda _job, execution: self._ingest_execution_result(execution),
+                progress_callback=handle_queue_progress,
+                log=self._log,
+            )
+        )
+        if self._cancel_requested:
+            return False
+        failures: list[str] = []
+        for job_result in queue_results:
+            for item in job_result.get("results", []) or []:
+                if bool(item.get("success")):
+                    continue
+                detail = str(item.get("detail") or item.get("stage") or "upload failed").strip()
+                if detail and detail not in failures:
+                    failures.append(detail)
+        if failures:
+            raise RuntimeError(" | ".join(failures[:3]))
+        return False
+
+    task_name = " + ".join(tracking_plan.modules.labels()) or "RunQueue"
+    self._run_background(
+        job,
+        task_name=task_name,
+        total_items=len(tracking_plan.tasks),
+        include_upload=bool(tracking_plan.modules.upload and (tracking_plan.modules.metadata or tracking_plan.modules.render)),
     )
 
 
@@ -4388,6 +5499,2664 @@ DashboardApp._update_run_status_from_log = _patched_update_run_status_from_log
 DashboardApp._launch_stream_upload_for_task = _patched_launch_stream_upload_for_task
 DashboardApp._dispatch_upload_round = _patched_dispatch_upload_round
 DashboardApp._start_real_flow = _patched_start_real_flow
+
+
+QUEUE_VISUAL_RANDOM = "随机"
+QUEUE_VISUAL_MANUAL = "手动"
+VISUAL_PRESET_NONE = "无预设"
+VISUAL_PRESET_HINT_TEMPLATE = "当前使用预设: {name} - 取消预设后可手动编辑"
+
+_ORIGINAL_BUILD_VARIABLES = DashboardApp._build_variables
+_ORIGINAL_BIND_VARIABLE_EVENTS = DashboardApp._bind_variable_events
+_ORIGINAL_SAVE_STATE = DashboardApp._save_state
+_ORIGINAL_DASHBOARD_INIT = DashboardApp.__init__
+_ORIGINAL_DASHBOARD_DESTROY = DashboardApp.destroy
+
+
+def _dashboard_cjk_font_family() -> str:
+    system = platform.system()
+    if system == "Windows":
+        return "Microsoft YaHei UI"
+    if system == "Darwin":
+        return "PingFang SC"
+    return "Noto Sans CJK SC"
+
+
+def _dashboard_theme_font(size: int = 12, *, weight: str = "normal") -> ctk.CTkFont:
+    return ctk.CTkFont(family=_dashboard_cjk_font_family(), size=size, weight=weight)
+
+
+def _prime_dashboard_cjk_theme() -> str:
+    family = _dashboard_cjk_font_family()
+    try:
+        theme = getattr(ctk.ThemeManager, "theme", None)
+        if isinstance(theme, dict):
+            font_settings = theme.setdefault("CTkFont", {})
+            if isinstance(font_settings, dict):
+                font_settings["family"] = family
+    except Exception:
+        pass
+    return family
+
+
+def _patched_apply_cjk_font_to_widgets_v2(self: DashboardApp, widget: tk.Misc | None = None) -> None:
+    target = widget or self
+    family = str(getattr(self, "_cjk_font_family", "") or _dashboard_cjk_font_family())
+    base_font = ctk.CTkFont(family=family, size=12)
+    for child in target.winfo_children():
+        try:
+            if isinstance(child, tk.Listbox):
+                child.configure(font=(family, 11))
+            else:
+                widget_type = child.__class__.__name__
+                if widget_type in {"CTkOptionMenu", "CTkComboBox"}:
+                    child.configure(font=base_font)
+                    try:
+                        child.configure(dropdown_font=base_font)
+                    except Exception:
+                        pass
+                elif widget_type in {"CTkButton", "CTkCheckBox", "CTkEntry", "CTkSegmentedButton", "CTkLabel"}:
+                    child.configure(font=base_font)
+        except Exception:
+            pass
+        self._apply_cjk_font_to_widgets(child)
+
+
+def _patched_setup_cjk_font_v2(self: DashboardApp) -> None:
+    family = _prime_dashboard_cjk_theme()
+    self._cjk_font_family = family
+    try:
+        self.option_add("*Font", f"{{{family}}} 11")
+    except Exception:
+        pass
+    for font_name in (
+        "TkDefaultFont",
+        "TkTextFont",
+        "TkMenuFont",
+        "TkHeadingFont",
+        "TkCaptionFont",
+        "TkTooltipFont",
+        "TkFixedFont",
+        "TkIconFont",
+    ):
+        try:
+            tkfont.nametofont(font_name).configure(family=family, size=11)
+        except Exception:
+            continue
+    self._apply_cjk_font_to_widgets()
+
+
+def _patched_dashboard_init_v2(self: DashboardApp) -> None:
+    self._cjk_font_family = _prime_dashboard_cjk_theme()
+    _ORIGINAL_DASHBOARD_INIT(self)
+    self._setup_cjk_font()
+
+
+def _patched_dashboard_destroy_v2(self: DashboardApp) -> None:
+    try:
+        pending_ids = self.tk.call("after", "info")
+    except Exception:
+        pending_ids = ()
+    if isinstance(pending_ids, str):
+        pending_items = [pending_ids] if pending_ids else []
+    else:
+        pending_items = list(pending_ids)
+    for after_id in pending_items:
+        try:
+            self.after_cancel(after_id)
+        except Exception:
+            continue
+    try:
+        _ORIGINAL_DASHBOARD_DESTROY(self)
+    except Exception:
+        pass
+
+
+def _dashboard_parse_serials(raw_value: str) -> list[int]:
+    serials: list[int] = []
+    seen: set[int] = set()
+    for token in re.split(r"[\s,，/|]+", str(raw_value or "").strip()):
+        clean = str(token or "").strip()
+        if not clean:
+            continue
+        try:
+            serial = int(clean)
+        except ValueError:
+            continue
+        if serial in seen:
+            continue
+        seen.add(serial)
+        serials.append(serial)
+    return serials
+
+
+def _dashboard_sorted_template_names(templates: dict[str, dict[str, Any]]) -> list[str]:
+    names = [str(name).strip() for name in templates.keys() if str(name).strip()]
+    return sorted(names, key=lambda item: (item != DEFAULT_PATH_TEMPLATE_NAME, item.lower())) or [DEFAULT_PATH_TEMPLATE_NAME]
+
+
+def _dashboard_option_row(
+    parent: ctk.CTkFrame,
+    row: int,
+    label: str,
+    variable: ctk.StringVar,
+    *,
+    values: list[str] | None = None,
+    button_text: str | None = None,
+    button_command: Callable[[], None] | None = None,
+) -> Any:
+    parent.grid_columnconfigure(1, weight=1)
+    ctk.CTkLabel(parent, text=label).grid(row=row, column=0, sticky="w", padx=(16, 8), pady=(0, 8))
+    if values:
+        widget = ctk.CTkOptionMenu(
+            parent,
+            variable=variable,
+            values=values,
+            font=_dashboard_theme_font(),
+            dropdown_font=_dashboard_theme_font(),
+        )
+    else:
+        widget = ctk.CTkEntry(parent, textvariable=variable)
+    widget.grid(row=row, column=1, sticky="ew", padx=8, pady=(0, 8))
+    if button_text and button_command:
+        ctk.CTkButton(parent, text=button_text, command=button_command, width=110).grid(
+            row=row, column=2, sticky="e", padx=(8, 16), pady=(0, 8)
+        )
+    return widget
+
+
+def _dashboard_range_row(
+    parent: ctk.CTkFrame,
+    row: int,
+    label: str,
+    min_var: ctk.StringVar,
+    max_var: ctk.StringVar,
+) -> tuple[Any, Any]:
+    parent.grid_columnconfigure(1, weight=1)
+    parent.grid_columnconfigure(3, weight=1)
+    ctk.CTkLabel(parent, text=label).grid(row=row, column=0, sticky="w", padx=(16, 8), pady=(0, 8))
+    min_widget = ctk.CTkEntry(parent, textvariable=min_var, placeholder_text="最小值")
+    min_widget.grid(row=row, column=1, sticky="ew", padx=(8, 6), pady=(0, 8))
+    ctk.CTkLabel(parent, text="到").grid(row=row, column=2, sticky="ew", padx=4, pady=(0, 8))
+    max_widget = ctk.CTkEntry(parent, textvariable=max_var, placeholder_text="最大值")
+    max_widget.grid(row=row, column=3, sticky="ew", padx=(6, 16), pady=(0, 8))
+    return min_widget, max_widget
+
+
+def _patched_build_variables_v2(self: DashboardApp) -> None:
+    _ORIGINAL_BUILD_VARIABLES(self)
+    state = self._state
+    self.title("YouTube 自动化统一控制台")
+    self.run_metadata_var.set(True)
+    self.run_render_var.set(True)
+    self.run_upload_var.set(True)
+    self.path_templates = load_path_templates()
+    self._live_groups: dict[str, list[str]] = {}
+    self.queue_path_template_var = ctk.StringVar(
+        value=str(state.get("queue_path_template") or DEFAULT_PATH_TEMPLATE_NAME).strip() or DEFAULT_PATH_TEMPLATE_NAME
+    )
+    self.queue_windows_var = ctk.StringVar(value=str(state.get("queue_windows") or "").strip())
+    self.queue_videos_per_window_var = ctk.StringVar(value=str(state.get("queue_videos_per_window") or "1").strip() or "1")
+    # 浏览器提供者选择: auto / hubstudio / bitbrowser
+    _saved_provider = str(state.get("browser_provider") or "auto").strip().lower() or "auto"
+    self.browser_provider_var = ctk.StringVar(value=_saved_provider)
+    # 启动时立即应用 provider 设置
+    set_runtime_provider(_saved_provider if _saved_provider != "auto" else None)
+    self._step_generate_var = ctk.BooleanVar(value=bool(state.get("step_generate", True)))
+    self._step_render_var = ctk.BooleanVar(value=bool(state.get("step_render", True)))
+    self._step_upload_var = ctk.BooleanVar(value=bool(state.get("step_upload", True)))
+    self._default_rules_expanded = bool(state.get("default_rules_expanded", False))
+    self.default_rules_toggle_text_var = ctk.StringVar(value="")
+    self.path_template_name_var = ctk.StringVar(value="")
+    self.path_template_description_var = ctk.StringVar(value="")
+    self.path_template_source_root_var = ctk.StringVar(value="")
+    self.path_template_copywriting_output_var = ctk.StringVar(value="")
+    self.path_template_thumbnail_output_var = ctk.StringVar(value="")
+    self.path_template_render_output_var = ctk.StringVar(value="")
+    self.path_template_used_materials_var = ctk.StringVar(value="")
+    self.path_template_used_videos_var = ctk.StringVar(value="")
+    self.path_template_auto_delete_days_var = ctk.StringVar(value="0")
+    self._path_template_editor_selection = str(
+        state.get("path_template_editor_selection") or DEFAULT_PATH_TEMPLATE_NAME
+    ).strip() or DEFAULT_PATH_TEMPLATE_NAME
+    self.path_template_listbox: tk.Listbox | None = None
+    self.default_rules_body: Any = None
+    self.default_schedule_details_frame: Any = None
+    self.default_schedule_hint_var = ctk.StringVar(
+        value="💡 示例：首个 15:00，间隔 60 分钟 -> 15:00, 16:00, 17:00 ..."
+    )
+    self.queue_list_frame: Any = None
+    self.pause_button = None
+    self.cancel_button = None
+    self.run_status_var.set("空闲")
+    self.run_phase_var.set("等待任务")
+    self.run_detail_var.set("当前没有在运行的任务")
+    self.run_last_log_var.set("最近日志会显示在这里")
+    self.pause_button_text_var.set("暂停")
+
+
+def _patched_bind_variable_events_v2(self: DashboardApp) -> None:
+    _ORIGINAL_BIND_VARIABLE_EVENTS(self)
+    self.queue_path_template_var.trace_add("write", lambda *_: self._on_queue_path_template_change())
+    for variable in (
+        self._step_generate_var,
+        self._step_render_var,
+        self._step_upload_var,
+        self.queue_videos_per_window_var,
+    ):
+        variable.trace_add("write", lambda *_: self._save_state())
+
+
+def _patched_save_state_v2(self: DashboardApp) -> None:
+    """防抖版 save_state — 300ms 内多次调用只执行一次磁盘写入"""
+    if not hasattr(self, "_save_state_pending"):
+        self._save_state_pending = None
+
+    if self._save_state_pending is not None:
+        try:
+            self.after_cancel(self._save_state_pending)
+        except Exception:
+            pass
+        self._save_state_pending = None
+
+    def _do_save() -> None:
+        self._save_state_pending = None
+        _ORIGINAL_SAVE_STATE(self)
+        payload = {}
+        if STATE_FILE.exists():
+            try:
+                payload = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        payload.update(
+            {
+                "queue_path_template": str(self.queue_path_template_var.get() or "").strip(),
+                "queue_windows": str(self.queue_windows_var.get() or "").strip(),
+                "queue_videos_per_window": str(self.queue_videos_per_window_var.get() or "1").strip() or "1",
+                "step_generate": bool(self._step_generate_var.get()),
+                "step_render": bool(self._step_render_var.get()),
+                "step_upload": bool(self._step_upload_var.get()),
+                "default_rules_expanded": bool(self._default_rules_expanded),
+                "path_template_editor_selection": str(self._path_template_editor_selection or "").strip(),
+                "browser_provider": str(self.browser_provider_var.get() or "auto").strip().lower(),
+            }
+        )
+        STATE_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    self._save_state_pending = self.after(300, _do_save)
+
+
+def _patched_refresh_bindings_box_v2(self: DashboardApp) -> None:
+    if hasattr(self, "binding_box") and self.binding_box is not None:
+        try:
+            self.binding_box.delete("1.0", "end")
+            self.binding_box.insert("end", describe_group_bindings(self.scheduler_config))
+        except Exception:
+            pass
+
+
+def _patched_module_names_for_new_job_v2(self: DashboardApp) -> list[str]:
+    modules: list[str] = []
+    if self._step_generate_var.get():
+        modules.append("metadata")
+    if self._step_render_var.get():
+        modules.append("render")
+    if self._step_upload_var.get():
+        modules.append("upload")
+    if modules:
+        return modules
+    self._step_generate_var.set(True)
+    self._step_render_var.set(True)
+    self._step_upload_var.set(True)
+    return ["metadata", "render", "upload"]
+
+
+def _patched_apply_run_status_v2(self: DashboardApp) -> None:
+    if not self._run_started_at:
+        self.run_status_var.set("空闲")
+        self.run_phase_var.set("等待任务")
+        self.run_detail_var.set("当前没有在运行的任务")
+        self.run_progress_var.set("0/0")
+        self.run_elapsed_var.set("00:00")
+        self.run_eta_var.set("--")
+        if not self.run_last_log_var.get().strip():
+            self.run_last_log_var.set("最近日志会显示在这里")
+        self.run_progress_bar.set(0.0)
+        self._run_paused = False
+        self.pause_button_text_var.set("暂停")
+        return
+
+    elapsed = time.time() - self._run_started_at
+    progress = 0.0
+    if self._run_total_steps > 0:
+        progress = min(1.0, max(0.0, (self._run_completed_steps + self._run_current_ratio) / self._run_total_steps))
+    eta = "--"
+    if progress > 0:
+        remaining = max(0.0, elapsed * (1.0 - progress) / progress)
+        eta = _format_runtime_duration(remaining)
+
+    status_text = "已暂停" if self._run_paused else "运行中"
+    self.run_status_var.set(f"{status_text} | {self._run_mode_label}")
+    phase_text = self._run_phase or "处理中"
+    if self._run_paused and not phase_text.startswith("已暂停"):
+        phase_text = f"已暂停 | {phase_text}"
+    self.run_phase_var.set(phase_text)
+    self.run_detail_var.set(self._run_current_item or "等待首条进度")
+    self.run_progress_var.set(f"{self._run_completed_steps}/{self._run_total_steps} | {progress * 100:.0f}%")
+    self.run_elapsed_var.set(_format_runtime_duration(elapsed))
+    self.run_eta_var.set(eta)
+    self.run_progress_bar.set(progress)
+
+
+def _patched_start_run_tracking_v2(
+    self: DashboardApp,
+    mode_label: str,
+    total_items: int,
+    *,
+    include_upload: bool = False,
+) -> None:
+    self._run_started_at = time.time()
+    self._run_mode_label = mode_label
+    self._run_total_items = max(0, int(total_items))
+    self._run_include_upload = bool(include_upload)
+    self._run_total_steps = self._run_total_items * (2 if include_upload else 1)
+    self._run_completed_steps = 0
+    self._run_current_ratio = 0.0
+    self._run_current_item = f"{self._run_total_items} 个窗口待处理"
+    self._run_phase = "准备中"
+    self.execution_control = ExecutionControl()
+    self._cancel_requested = False
+    self._run_paused = False
+    self.pause_button_text_var.set("暂停")
+    self._run_render_done.clear()
+    self._run_upload_done.clear()
+    with self._upload_process_lock:
+        self._upload_failures = []
+    with self._state_lock:
+        self._run_result_map = {}
+    self._run_plan_for_summary = None
+    self._run_execution_result = None
+    self._run_report_logged = False
+    self.run_last_log_var.set("任务已启动，等待第一条日志")
+    self._apply_run_status()
+
+
+def _patched_finish_run_tracking_v2(
+    self: DashboardApp,
+    *,
+    success: bool,
+    summary: str,
+    cancelled: bool = False,
+) -> None:
+    elapsed = time.time() - self._run_started_at if self._run_started_at else 0.0
+    summary_text, full_report = self._compose_run_completion_report(success, summary, cancelled)
+    self.run_status_var.set("已取消" if cancelled else ("完成" if success else "失败"))
+    self.run_phase_var.set("已结束")
+    self.run_detail_var.set(summary_text)
+    self.run_progress_var.set(f"{self._run_completed_steps}/{self._run_total_steps}")
+    self.run_elapsed_var.set(_format_runtime_duration(elapsed))
+    self.run_eta_var.set("00:00" if success or cancelled else "--")
+    self.run_progress_bar.set(1.0 if success or cancelled else self.run_progress_bar.get())
+    if full_report and not self._run_report_logged:
+        self._run_report_logged = True
+        self._log(full_report)
+    self._run_started_at = None
+    self._run_mode_label = ""
+    self._run_total_items = 0
+    self._run_total_steps = 0
+    self._run_completed_steps = 0
+    self._run_current_ratio = 0.0
+    self._run_current_item = ""
+    self._run_phase = "空闲"
+    self._run_include_upload = False
+    self.execution_control = None
+    self._cancel_requested = False
+    self._run_paused = False
+    self.pause_button_text_var.set("暂停")
+    self._run_render_done.clear()
+    self._run_upload_done.clear()
+    self._run_plan_for_summary = None
+    self._run_execution_result = None
+    with self._state_lock:
+        self._run_result_map = {}
+    self._run_report_logged = False
+
+
+def _patched_build_layout_v2(self: DashboardApp) -> None:
+    self.title("YouTube 自动化统一控制台")
+    self.grid_columnconfigure(0, weight=1)
+    self.grid_rowconfigure(1, weight=1)
+
+    header = ctk.CTkFrame(self, corner_radius=18)
+    header.grid(row=0, column=0, sticky="ew", padx=18, pady=(18, 8))
+    header.grid_columnconfigure(0, weight=1)
+    ctk.CTkLabel(
+        header,
+        text="YouTube 自动化统一控制台",
+        font=ctk.CTkFont(size=32, weight="bold"),
+    ).grid(row=0, column=0, sticky="w", padx=20, pady=(18, 6))
+    ctk.CTkLabel(
+        header,
+        text="上传页负责排队与运行，提示词 / 路径模板 / 高级视觉分别管理各自模板。",
+        text_color="#b8c1cc",
+        font=ctk.CTkFont(size=14),
+    ).grid(row=1, column=0, sticky="w", padx=20, pady=(0, 18))
+
+    status_frame = ctk.CTkFrame(header)
+    status_frame.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 18))
+    for column in range(4):
+        status_frame.grid_columnconfigure(column, weight=1)
+    ctk.CTkLabel(status_frame, text="运行状态", font=ctk.CTkFont(size=18, weight="bold")).grid(
+        row=0, column=0, sticky="w", padx=14, pady=(12, 4)
+    )
+    ctk.CTkLabel(status_frame, textvariable=self.run_status_var).grid(row=0, column=1, sticky="w", padx=8, pady=(12, 4))
+    ctk.CTkLabel(status_frame, text="阶段").grid(row=1, column=0, sticky="w", padx=14, pady=(0, 4))
+    ctk.CTkLabel(status_frame, textvariable=self.run_phase_var).grid(
+        row=1, column=1, columnspan=3, sticky="w", padx=8, pady=(0, 4)
+    )
+    ctk.CTkLabel(status_frame, text="当前任务").grid(row=2, column=0, sticky="w", padx=14, pady=(0, 4))
+    ctk.CTkLabel(status_frame, textvariable=self.run_detail_var).grid(
+        row=2, column=1, columnspan=3, sticky="w", padx=8, pady=(0, 4)
+    )
+    ctk.CTkLabel(status_frame, text="进度").grid(row=3, column=0, sticky="w", padx=14, pady=(0, 4))
+    ctk.CTkLabel(status_frame, textvariable=self.run_progress_var).grid(row=3, column=1, sticky="w", padx=8, pady=(0, 4))
+    ctk.CTkLabel(status_frame, text="已运行").grid(row=3, column=2, sticky="w", padx=8, pady=(0, 4))
+    ctk.CTkLabel(status_frame, textvariable=self.run_elapsed_var).grid(row=3, column=3, sticky="w", padx=8, pady=(0, 4))
+    ctk.CTkLabel(status_frame, text="预计剩余").grid(row=4, column=0, sticky="w", padx=14, pady=(0, 4))
+    ctk.CTkLabel(status_frame, textvariable=self.run_eta_var).grid(row=4, column=1, sticky="w", padx=8, pady=(0, 4))
+    ctk.CTkLabel(status_frame, text="最近日志").grid(row=4, column=2, sticky="w", padx=8, pady=(0, 4))
+    ctk.CTkLabel(status_frame, textvariable=self.run_last_log_var).grid(
+        row=4, column=3, sticky="w", padx=8, pady=(0, 4)
+    )
+    self.run_progress_bar = ctk.CTkProgressBar(status_frame)
+    self.run_progress_bar.grid(row=5, column=0, columnspan=4, sticky="ew", padx=14, pady=(6, 12))
+    self.run_progress_bar.set(0.0)
+
+    self.tabview = ctk.CTkTabview(self, corner_radius=18)
+    self.tabview.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 18))
+    for name in ("上传", "提示词", "路径模板", "高级视觉", "日志"):
+        self.tabview.add(name)
+
+    self._build_upload_tab()
+    self._build_prompt_tab()
+    self._build_paths_tab()
+    self._build_visual_tab()
+    self._build_log_tab()
+    self.tabview.set("上传")
+
+
+def _patched_build_upload_tab_v2(self: DashboardApp) -> None:
+    base_tab = self.tabview.tab("上传")
+    base_tab.grid_columnconfigure(0, weight=1)
+    base_tab.grid_rowconfigure(0, weight=1)
+    tab = ctk.CTkScrollableFrame(base_tab)
+    tab.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+    tab.grid_columnconfigure(0, weight=1)
+
+    add_frame = ctk.CTkFrame(tab)
+    add_frame.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 8))
+    for column in range(4):
+        add_frame.grid_columnconfigure(column, weight=1)
+    ctk.CTkLabel(add_frame, text="添加分组到队列", font=ctk.CTkFont(size=24, weight="bold")).grid(
+        row=0, column=0, columnspan=4, sticky="w", padx=16, pady=(14, 12)
+    )
+    ctk.CTkLabel(add_frame, text="分组").grid(row=1, column=0, sticky="w", padx=(16, 8), pady=(0, 6))
+    ctk.CTkLabel(add_frame, text="窗口").grid(row=1, column=1, sticky="w", padx=8, pady=(0, 6))
+    ctk.CTkLabel(add_frame, text="素材目录").grid(row=1, column=2, sticky="w", padx=8, pady=(0, 6))
+    self.current_group_menu = ctk.CTkOptionMenu(
+        add_frame,
+        variable=self.current_group_var,
+        values=[""],
+        font=_dashboard_theme_font(),
+        dropdown_font=_dashboard_theme_font(),
+    )
+    self.current_group_menu.grid(row=2, column=0, sticky="ew", padx=(16, 8), pady=(0, 12))
+    ctk.CTkEntry(add_frame, textvariable=self.queue_windows_var).grid(row=2, column=1, sticky="ew", padx=8, pady=(0, 12))
+    source_bar = ctk.CTkFrame(add_frame, fg_color="transparent")
+    source_bar.grid(row=2, column=2, columnspan=2, sticky="ew", padx=(8, 16), pady=(0, 12))
+    source_bar.grid_columnconfigure(0, weight=1)
+    ctk.CTkEntry(source_bar, textvariable=self.source_dir_override_var).grid(
+        row=0, column=0, sticky="ew", padx=(0, 8), pady=0
+    )
+    ctk.CTkButton(source_bar, text="选择文件夹", command=lambda: self._browse_directory_var(self.source_dir_override_var, "选择素材目录")).grid(
+        row=0, column=1, sticky="e", pady=0
+    )
+
+    ctk.CTkButton(add_frame, text="刷新分组", command=self._refresh_groups).grid(
+        row=3, column=0, sticky="w", padx=(16, 8), pady=(0, 12)
+    )
+    ctk.CTkLabel(add_frame, text="提示词模板").grid(row=4, column=0, sticky="w", padx=(16, 8), pady=(0, 6))
+    ctk.CTkLabel(add_frame, text="视觉模板").grid(row=4, column=1, sticky="w", padx=8, pady=(0, 6))
+    ctk.CTkLabel(add_frame, text="路径模板").grid(row=4, column=2, sticky="w", padx=8, pady=(0, 6))
+    self.queue_prompt_template_menu = ctk.CTkOptionMenu(
+        add_frame,
+        variable=self.queue_prompt_template_var,
+        values=["default"],
+        font=_dashboard_theme_font(),
+        dropdown_font=_dashboard_theme_font(),
+    )
+    self.queue_prompt_template_menu.grid(row=5, column=0, sticky="ew", padx=(16, 8), pady=(0, 12))
+    self.queue_visual_mode_menu = ctk.CTkOptionMenu(
+        add_frame,
+        variable=self.queue_visual_mode_var,
+        values=[QUEUE_VISUAL_RANDOM, QUEUE_VISUAL_MANUAL, *sorted(self.visual_presets.keys(), key=str.lower)],
+        font=_dashboard_theme_font(),
+        dropdown_font=_dashboard_theme_font(),
+    )
+    self.queue_visual_mode_menu.grid(row=5, column=1, sticky="ew", padx=8, pady=(0, 12))
+    self.queue_path_template_menu = ctk.CTkOptionMenu(
+        add_frame,
+        variable=self.queue_path_template_var,
+        values=[""],
+        font=_dashboard_theme_font(),
+        dropdown_font=_dashboard_theme_font(),
+    )
+    self.queue_path_template_menu.grid(row=5, column=2, sticky="ew", padx=8, pady=(0, 12))
+    steps_frame = ctk.CTkFrame(add_frame, fg_color="transparent")
+    steps_frame.grid(row=6, column=0, columnspan=4, sticky="ew", padx=16, pady=(0, 12))
+    for column in range(4):
+        steps_frame.grid_columnconfigure(column, weight=1 if column else 0)
+    ctk.CTkLabel(steps_frame, text="执行步骤:").grid(row=0, column=0, sticky="w", padx=(0, 12), pady=0)
+    ctk.CTkCheckBox(
+        steps_frame,
+        text="生成文案(标题/简介/缩略图)",
+        variable=self._step_generate_var,
+    ).grid(row=0, column=1, sticky="w", padx=(0, 12), pady=0)
+    ctk.CTkCheckBox(
+        steps_frame,
+        text="剪辑视频",
+        variable=self._step_render_var,
+    ).grid(row=0, column=2, sticky="w", padx=(0, 12), pady=0)
+    ctk.CTkCheckBox(
+        steps_frame,
+        text="上传YouTube",
+        variable=self._step_upload_var,
+    ).grid(row=0, column=3, sticky="w", pady=0)
+    ctk.CTkButton(add_frame, text="+ 添加到队列", command=self._add_current_group_to_queue, height=38).grid(
+        row=7, column=0, columnspan=4, sticky="ew", padx=16, pady=(0, 12)
+    )
+
+    table_frame = ctk.CTkFrame(tab)
+    table_frame.grid(row=1, column=0, sticky="nsew", padx=8, pady=8)
+    table_frame.grid_columnconfigure(0, weight=1)
+    ctk.CTkLabel(table_frame, text="运行队列", font=ctk.CTkFont(size=24, weight="bold")).grid(
+        row=0, column=0, sticky="w", padx=16, pady=(14, 10)
+    )
+    header_row = ctk.CTkFrame(table_frame, fg_color="transparent")
+    header_row.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 6))
+    for column, title in enumerate(["序号", "分组", "窗口", "提示词模板", "视觉模板", "路径模板", "操作"]):
+        header_row.grid_columnconfigure(column, weight=1 if column in {1, 2, 3, 4, 5} else 0)
+        ctk.CTkLabel(header_row, text=title, font=ctk.CTkFont(weight="bold"), anchor="w").grid(
+            row=0, column=column, sticky="w", padx=6, pady=(0, 4)
+        )
+    self.queue_list_frame = ctk.CTkScrollableFrame(table_frame, height=250)
+    self.queue_list_frame.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 14))
+    self.queue_list_frame.grid_columnconfigure(0, weight=1)
+
+    default_frame = ctk.CTkFrame(tab)
+    default_frame.grid(row=2, column=0, sticky="ew", padx=8, pady=8)
+    default_frame.grid_columnconfigure(0, weight=1)
+    toggle_bar = ctk.CTkFrame(default_frame, fg_color="transparent")
+    toggle_bar.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 6))
+    toggle_bar.grid_columnconfigure(0, weight=1)
+    ctk.CTkButton(
+        toggle_bar,
+        textvariable=self.default_rules_toggle_text_var,
+        command=self._toggle_default_rules_panel,
+        anchor="w",
+        fg_color="transparent",
+        hover_color="#24324a",
+    ).grid(row=0, column=0, sticky="ew")
+    self.default_rules_body = ctk.CTkFrame(default_frame, fg_color="transparent")
+    self.default_rules_body.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
+    for column in range(4):
+        self.default_rules_body.grid_columnconfigure(column, weight=1)
+    ctk.CTkLabel(self.default_rules_body, text="可见性").grid(row=0, column=0, sticky="w", padx=(8, 8), pady=(0, 6))
+    ctk.CTkLabel(self.default_rules_body, text="分类").grid(row=0, column=1, sticky="w", padx=8, pady=(0, 6))
+    ctk.CTkLabel(self.default_rules_body, text="儿童内容").grid(row=0, column=2, sticky="w", padx=8, pady=(0, 6))
+    ctk.CTkLabel(self.default_rules_body, text="AI 内容").grid(row=0, column=3, sticky="w", padx=(8, 16), pady=(0, 6))
+    ctk.CTkOptionMenu(self.default_rules_body, variable=self.default_visibility_var, values=VISIBILITY_VALUES).grid(
+        row=1, column=0, sticky="ew", padx=(8, 8), pady=(0, 12)
+    )
+    ctk.CTkOptionMenu(self.default_rules_body, variable=self.default_category_var, values=CATEGORY_VALUES).grid(
+        row=1, column=1, sticky="ew", padx=8, pady=(0, 12)
+    )
+    ctk.CTkOptionMenu(self.default_rules_body, variable=self.default_kids_var, values=YES_NO_VALUES).grid(
+        row=1, column=2, sticky="ew", padx=8, pady=(0, 12)
+    )
+    ctk.CTkOptionMenu(self.default_rules_body, variable=self.default_ai_var, values=YES_NO_VALUES).grid(
+        row=1, column=3, sticky="ew", padx=(8, 16), pady=(0, 12)
+    )
+    self.schedule_enabled_checkbox = ctk.CTkCheckBox(
+        self.default_rules_body,
+        text="启用定时发布",
+        variable=self.schedule_enabled_var,
+    )
+    self.schedule_enabled_checkbox.grid(row=2, column=0, sticky="w", padx=(8, 8), pady=(0, 8))
+    ctk.CTkCheckBox(
+        self.default_rules_body,
+        text="上传完成后自动关闭窗口",
+        variable=self.upload_auto_close_var,
+    ).grid(row=2, column=1, columnspan=2, sticky="w", padx=8, pady=(0, 8))
+    ctk.CTkLabel(self.default_rules_body, text="间隔(分钟)").grid(row=2, column=3, sticky="w", padx=(8, 16), pady=(0, 6))
+    ctk.CTkEntry(self.default_rules_body, textvariable=self.schedule_interval_var).grid(
+        row=3, column=3, sticky="ew", padx=(8, 16), pady=(0, 12)
+    )
+    ctk.CTkLabel(self.default_rules_body, text="发布日期").grid(row=4, column=0, sticky="w", padx=(8, 8), pady=(0, 6))
+    ctk.CTkLabel(self.default_rules_body, text="发布时间").grid(row=4, column=1, sticky="w", padx=8, pady=(0, 6))
+    ctk.CTkLabel(self.default_rules_body, text="时区").grid(row=4, column=2, sticky="w", padx=8, pady=(0, 6))
+    self.schedule_date_menu = ctk.CTkOptionMenu(self.default_rules_body, variable=self.schedule_date_var, values=_schedule_date_values())
+    self.schedule_date_menu.grid(row=5, column=0, sticky="ew", padx=(8, 8), pady=(0, 12))
+    self.schedule_time_menu = ctk.CTkOptionMenu(self.default_rules_body, variable=self.schedule_time_var, values=_schedule_time_values())
+    self.schedule_time_menu.grid(row=5, column=1, sticky="ew", padx=8, pady=(0, 12))
+    self.schedule_timezone_menu = ctk.CTkOptionMenu(
+        self.default_rules_body,
+        variable=self.schedule_timezone_var,
+        values=SCHEDULE_TIMEZONE_VALUES,
+    )
+    self.schedule_timezone_menu.grid(row=5, column=2, sticky="ew", padx=8, pady=(0, 12))
+
+    control_frame = ctk.CTkFrame(tab)
+    control_frame.grid(row=3, column=0, sticky="ew", padx=8, pady=(8, 16))
+    for column in range(3):
+        control_frame.grid_columnconfigure(column, weight=1)
+    ctk.CTkButton(control_frame, text="▶ 开始运行", command=self._start_real_flow, height=40).grid(
+        row=0, column=0, sticky="ew", padx=(16, 8), pady=14
+    )
+    self.pause_button = ctk.CTkButton(
+        control_frame,
+        textvariable=self.pause_button_text_var,
+        command=self._toggle_pause_current_task,
+        height=40,
+    )
+    self.pause_button.grid(row=0, column=1, sticky="ew", padx=8, pady=14)
+    self.cancel_button = ctk.CTkButton(
+        control_frame,
+        text="⏹ 取消当前批次",
+        command=self._cancel_current_task,
+        height=40,
+        fg_color="#7a1f1f",
+        hover_color="#932525",
+    )
+    self.cancel_button.grid(row=0, column=2, sticky="ew", padx=(8, 16), pady=14)
+
+    self._refresh_default_rules_panel()
+    self._bind_scroll_frame_wheel(tab, base_tab, tab, add_frame, table_frame, default_frame, control_frame)
+
+
+def _patched_build_prompt_tab_v2(self: DashboardApp) -> None:
+    base_tab = self.tabview.tab("提示词")
+    base_tab.grid_columnconfigure(0, weight=1)
+    base_tab.grid_rowconfigure(0, weight=1)
+    tab = ctk.CTkScrollableFrame(base_tab)
+    tab.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+    tab.grid_columnconfigure(0, weight=1)
+
+    top = ctk.CTkFrame(tab)
+    top.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
+    for column in range(6):
+        top.grid_columnconfigure(column, weight=1)
+    ctk.CTkLabel(top, text="提示词模板入口", font=ctk.CTkFont(size=24, weight="bold")).grid(
+        row=0, column=0, columnspan=6, sticky="w", padx=16, pady=(14, 12)
+    )
+    ctk.CTkLabel(top, text="分组").grid(row=1, column=0, sticky="w", padx=(16, 8), pady=(0, 6))
+    self.prompt_group_menu = ctk.CTkOptionMenu(top, variable=self.prompt_group_var, values=[""])
+    self.prompt_group_menu.grid(row=2, column=0, sticky="ew", padx=(16, 8), pady=(0, 12))
+    ctk.CTkLabel(top, text="API 模板").grid(row=1, column=1, sticky="w", padx=8, pady=(0, 6))
+    self.api_preset_menu = ctk.CTkOptionMenu(top, variable=self.api_preset_var, values=[""])
+    self.api_preset_menu.grid(row=2, column=1, sticky="ew", padx=8, pady=(0, 12))
+    ctk.CTkLabel(top, text="内容模板").grid(row=1, column=2, sticky="w", padx=8, pady=(0, 6))
+    self.content_template_menu = ctk.CTkOptionMenu(top, variable=self.content_template_var, values=[""])
+    self.content_template_menu.grid(row=2, column=2, sticky="ew", padx=8, pady=(0, 12))
+    ctk.CTkButton(top, text="载入当前模板", command=self._load_prompt_for_group).grid(
+        row=2, column=3, sticky="ew", padx=8, pady=(0, 12)
+    )
+    ctk.CTkButton(top, text="绑定分组到 API 模板", command=self._bind_group_api).grid(
+        row=2, column=4, sticky="ew", padx=8, pady=(0, 12)
+    )
+    ctk.CTkButton(top, text="绑定分组到内容模板", command=self._bind_group_content).grid(
+        row=2, column=5, sticky="ew", padx=(8, 16), pady=(0, 12)
+    )
+    ctk.CTkLabel(top, text="API 模板另存为").grid(row=3, column=0, sticky="w", padx=(16, 8), pady=(0, 6))
+    ctk.CTkEntry(top, textvariable=self.api_save_name_var).grid(row=4, column=0, sticky="ew", padx=(16, 8), pady=(0, 14))
+    ctk.CTkLabel(top, text="内容模板另存为").grid(row=3, column=1, sticky="w", padx=8, pady=(0, 6))
+    ctk.CTkEntry(top, textvariable=self.content_save_name_var).grid(row=4, column=1, sticky="ew", padx=8, pady=(0, 14))
+    ctk.CTkButton(top, text="保存当前 API 模板", command=self._save_api_preset).grid(
+        row=4, column=2, sticky="ew", padx=8, pady=(0, 14)
+    )
+    ctk.CTkButton(top, text="保存当前内容模板", command=self._save_content_template).grid(
+        row=4, column=3, sticky="ew", padx=8, pady=(0, 14)
+    )
+
+    api_frame = ctk.CTkFrame(tab)
+    api_frame.grid(row=1, column=0, sticky="ew", padx=8, pady=8)
+    for column in range(4):
+        api_frame.grid_columnconfigure(column, weight=1)
+    ctk.CTkLabel(api_frame, text="文本 / 图片 API 模板", font=ctk.CTkFont(size=24, weight="bold")).grid(
+        row=0, column=0, columnspan=4, sticky="w", padx=16, pady=(14, 12)
+    )
+    self._entry_row(api_frame, 1, "文本 Provider", self.provider_var, values=PROVIDER_VALUES)
+    self._entry_row(api_frame, 2, "文本 Base URL", self.base_url_var)
+    self._entry_row(api_frame, 3, "文本 Model", self.model_var)
+    self._entry_row(api_frame, 4, "文本 API Key", self.api_key_var, show="*")
+    self._entry_row(api_frame, 5, "Temperature", self.temperature_var)
+    self._entry_row(api_frame, 6, "Max Tokens", self.max_tokens_var)
+    self._entry_row(api_frame, 7, "自动出图", self.auto_image_var, values=AUTO_IMAGE_VALUES)
+    self._entry_row(api_frame, 8, "图片 Base URL", self.image_base_url_var)
+    self._entry_row(api_frame, 9, "图片 API Key", self.image_api_key_var, show="*")
+    self._entry_row(api_frame, 10, "图片 Model", self.image_model_var)
+    self._entry_row(api_frame, 11, "图片并发", self.image_concurrency_var)
+    button_bar = ctk.CTkFrame(api_frame, fg_color="transparent")
+    button_bar.grid(row=12, column=0, columnspan=4, sticky="ew", padx=16, pady=(0, 14))
+    ctk.CTkButton(button_bar, text="测试文本连通性", command=self._test_text_api).pack(side="left", padx=6)
+    ctk.CTkButton(button_bar, text="测试图片连通性", command=self._test_image_api).pack(side="left", padx=6)
+
+    content_frame = ctk.CTkFrame(tab)
+    content_frame.grid(row=2, column=0, sticky="ew", padx=8, pady=8)
+    for column in range(4):
+        content_frame.grid_columnconfigure(column, weight=1)
+    ctk.CTkLabel(content_frame, text="内容模板", font=ctk.CTkFont(size=24, weight="bold")).grid(
+        row=0, column=0, columnspan=4, sticky="w", padx=16, pady=(14, 12)
+    )
+    self._entry_row(content_frame, 1, "音乐类型", self.music_genre_var)
+    self._entry_row(content_frame, 2, "切入角度", self.angle_var)
+    self._entry_row(content_frame, 3, "目标受众", self.audience_var)
+    self._entry_row(content_frame, 4, "输出语言", self.content_language_var, values=LANGUAGE_VALUES)
+    self._entry_row(content_frame, 5, "标题数量", self.title_count_var)
+    self._entry_row(content_frame, 6, "简介数量", self.desc_count_var)
+    self._entry_row(content_frame, 7, "缩略图数量", self.thumb_count_var)
+    self._entry_row(content_frame, 8, "标题最少字数", self.title_min_var)
+    self._entry_row(content_frame, 9, "标题最多字数", self.title_max_var)
+    self._entry_row(content_frame, 10, "简介目标字数", self.desc_len_var)
+    self._entry_row(content_frame, 11, "标签数量区间", self.tag_range_var)
+    ctk.CTkLabel(content_frame, text="主提示词").grid(row=12, column=0, sticky="w", padx=16, pady=(0, 6))
+    self.master_prompt_box = ctk.CTkTextbox(content_frame, height=180)
+    self.master_prompt_box.grid(row=13, column=0, columnspan=4, sticky="ew", padx=16, pady=(0, 12))
+    ctk.CTkLabel(content_frame, text="标题库").grid(row=14, column=0, sticky="w", padx=16, pady=(0, 6))
+    self.title_library_box = ctk.CTkTextbox(content_frame, height=160)
+    self.title_library_box.grid(row=15, column=0, columnspan=4, sticky="ew", padx=16, pady=(0, 14))
+    self.master_prompt_box.bind("<KeyRelease>", lambda *_: self._mark_prompt_form_dirty(), add="+")
+    self.title_library_box.bind("<KeyRelease>", lambda *_: self._mark_prompt_form_dirty(), add="+")
+
+    audience_frame = ctk.CTkFrame(tab)
+    audience_frame.grid(row=3, column=0, sticky="ew", padx=8, pady=(8, 16))
+    audience_frame.grid_columnconfigure(0, weight=1)
+    ctk.CTkLabel(audience_frame, text="受众截图自动识别", font=ctk.CTkFont(size=24, weight="bold")).grid(
+        row=0, column=0, sticky="w", padx=16, pady=(14, 12)
+    )
+    bar = ctk.CTkFrame(audience_frame, fg_color="transparent")
+    bar.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 8))
+    ctk.CTkButton(bar, text="选择截图", command=self._choose_audience_image).pack(side="left", padx=6)
+    ctk.CTkButton(bar, text="粘贴截图", command=self._paste_audience_image).pack(side="left", padx=6)
+    ctk.CTkButton(bar, text="重新识别", command=self._reanalyze_audience_image).pack(side="left", padx=6)
+    ctk.CTkButton(bar, text="清空截图", command=self._clear_audience_image).pack(side="left", padx=6)
+    self.audience_result_box = ctk.CTkTextbox(audience_frame, height=140)
+    self.audience_result_box.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 14))
+    self._bind_scroll_frame_wheel(tab, base_tab, tab, top, api_frame, content_frame, audience_frame, include_textboxes=True)
+
+
+def _patched_build_paths_tab_v2(self: DashboardApp) -> None:
+    base_tab = self.tabview.tab("路径模板")
+    base_tab.grid_columnconfigure(0, weight=1)
+    base_tab.grid_rowconfigure(0, weight=1)
+
+    container = ctk.CTkFrame(base_tab)
+    container.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+    container.grid_columnconfigure(0, weight=0, minsize=240)
+    container.grid_columnconfigure(1, weight=1)
+    container.grid_rowconfigure(0, weight=1)
+
+    left = ctk.CTkFrame(container)
+    left.grid(row=0, column=0, sticky="nsw", padx=(0, 10), pady=0)
+    left.grid_rowconfigure(1, weight=1)
+    ctk.CTkLabel(left, text="路径模板列表", font=ctk.CTkFont(size=22, weight="bold")).grid(
+        row=0, column=0, sticky="w", padx=16, pady=(14, 8)
+    )
+    list_frame = ctk.CTkFrame(left)
+    list_frame.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 14))
+    list_frame.grid_columnconfigure(0, weight=1)
+    list_frame.grid_rowconfigure(0, weight=1)
+    self.path_template_listbox = tk.Listbox(
+        list_frame,
+        exportselection=False,
+        activestyle="none",
+        font=("Microsoft YaHei UI", 11),
+        height=16,
+    )
+    self.path_template_listbox.grid(row=0, column=0, sticky="nsew")
+    list_scrollbar = tk.Scrollbar(list_frame, orient="vertical", command=self.path_template_listbox.yview)
+    list_scrollbar.grid(row=0, column=1, sticky="ns")
+    self.path_template_listbox.configure(yscrollcommand=list_scrollbar.set)
+    self.path_template_listbox.bind("<<ListboxSelect>>", self._on_path_template_listbox_select)
+
+    right = ctk.CTkScrollableFrame(container)
+    right.grid(row=0, column=1, sticky="nsew", padx=0, pady=0)
+    right.grid_columnconfigure(0, weight=1)
+    editor = ctk.CTkFrame(right)
+    editor.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
+    editor.grid_columnconfigure(0, weight=1)
+    ctk.CTkLabel(editor, text="路径模板编辑", font=ctk.CTkFont(size=24, weight="bold")).grid(
+        row=0, column=0, sticky="w", padx=16, pady=(14, 12)
+    )
+    _dashboard_option_row(editor, 1, "模板名称", self.path_template_name_var)
+    _dashboard_option_row(editor, 2, "描述", self.path_template_description_var)
+    _dashboard_option_row(
+        editor,
+        3,
+        "素材根目录",
+        self.path_template_source_root_var,
+        button_text="选择文件夹",
+        button_command=lambda: self._browse_directory_var(self.path_template_source_root_var, "选择素材根目录"),
+    )
+    _dashboard_option_row(
+        editor,
+        4,
+        "文案输出目录",
+        self.path_template_copywriting_output_var,
+        button_text="选择文件夹",
+        button_command=lambda: self._browse_directory_var(self.path_template_copywriting_output_var, "选择文案输出目录"),
+    )
+    _dashboard_option_row(
+        editor,
+        5,
+        "缩略图输出目录",
+        self.path_template_thumbnail_output_var,
+        button_text="选择文件夹",
+        button_command=lambda: self._browse_directory_var(self.path_template_thumbnail_output_var, "选择缩略图输出目录"),
+    )
+    _dashboard_option_row(
+        editor,
+        6,
+        "渲染输出目录",
+        self.path_template_render_output_var,
+        button_text="选择文件夹",
+        button_command=lambda: self._browse_directory_var(self.path_template_render_output_var, "选择渲染输出目录"),
+    )
+    _dashboard_option_row(
+        editor,
+        7,
+        "已用素材归档目录",
+        self.path_template_used_materials_var,
+        button_text="选择文件夹",
+        button_command=lambda: self._browse_directory_var(self.path_template_used_materials_var, "选择已用素材归档目录"),
+    )
+    _dashboard_option_row(
+        editor,
+        8,
+        "已用视频归档目录",
+        self.path_template_used_videos_var,
+        button_text="选择文件夹",
+        button_command=lambda: self._browse_directory_var(self.path_template_used_videos_var, "选择已用视频归档目录"),
+    )
+    _dashboard_option_row(editor, 9, "视频自动删除天数", self.path_template_auto_delete_days_var)
+    button_bar = ctk.CTkFrame(editor, fg_color="transparent")
+    button_bar.grid(row=10, column=0, sticky="ew", padx=12, pady=(0, 14))
+    ctk.CTkButton(button_bar, text="保存", command=self._save_current_path_template).pack(side="left", padx=6)
+    ctk.CTkButton(button_bar, text="删除", command=self._delete_current_path_template).pack(side="left", padx=6)
+    ctk.CTkButton(button_bar, text="新建", command=self._new_path_template).pack(side="left", padx=6)
+
+    self._refresh_path_template_controls()
+
+
+def _patched_build_visual_tab_v2(self: DashboardApp) -> None:
+    base_tab = self.tabview.tab("高级视觉")
+    base_tab.grid_columnconfigure(0, weight=1)
+    base_tab.grid_rowconfigure(0, weight=1)
+    tab = ctk.CTkScrollableFrame(base_tab)
+    tab.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+    tab.grid_columnconfigure(0, weight=1)
+    self._visual_setting_widgets = {}
+
+    intro = ctk.CTkFrame(tab)
+    intro.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
+    intro.grid_columnconfigure(0, weight=1)
+    intro.grid_columnconfigure(1, weight=0)
+    intro.grid_columnconfigure(2, weight=0)
+    intro.grid_columnconfigure(3, weight=0)
+    ctk.CTkLabel(intro, text="高级视觉控制", font=ctk.CTkFont(size=24, weight="bold")).grid(
+        row=0, column=0, sticky="w", padx=16, pady=(14, 8)
+    )
+    ctk.CTkButton(intro, text="保存视觉设置", command=self._save_visual_settings).grid(
+        row=0, column=1, sticky="e", padx=16, pady=(14, 8)
+    )
+    ctk.CTkButton(intro, text="套用 MegaBass", command=self._apply_visual_preset_mega_bass).grid(
+        row=0, column=2, sticky="e", padx=(0, 8), pady=(14, 8)
+    )
+    preset_bar = ctk.CTkFrame(intro, fg_color="transparent")
+    preset_bar.grid(row=1, column=0, columnspan=4, sticky="ew", padx=16, pady=(0, 6))
+    for column in range(4):
+        preset_bar.grid_columnconfigure(column, weight=1 if column == 1 else 0)
+    ctk.CTkLabel(preset_bar, text="视觉预设").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=0)
+    self.visual_preset_menu = ctk.CTkOptionMenu(
+        preset_bar,
+        variable=self.visual_preset_var,
+        values=_visual_preset_menu_values(self.visual_presets),
+        command=lambda _value: self._on_visual_preset_change(),
+    )
+    self.visual_preset_menu.grid(row=0, column=1, sticky="ew", padx=(0, 8), pady=0)
+    ctk.CTkButton(preset_bar, text="保存当前为预设", command=self._save_current_visual_preset).grid(
+        row=0, column=2, sticky="ew", padx=(0, 8), pady=0
+    )
+    ctk.CTkButton(preset_bar, text="删除预设", command=self._delete_selected_visual_preset).grid(
+        row=0, column=3, sticky="ew", pady=0
+    )
+    self.visual_preset_hint_label = ctk.CTkLabel(
+        intro,
+        textvariable=self.visual_preset_hint_var,
+        text_color="#f7d76a",
+        anchor="w",
+        justify="left",
+    )
+    self.visual_preset_hint_label.grid(row=2, column=0, columnspan=4, sticky="ew", padx=16, pady=(0, 6))
+    self.visual_preset_hint_label.grid_remove()
+
+    basic = ctk.CTkFrame(tab)
+    basic.grid(row=1, column=0, sticky="ew", padx=8, pady=8)
+    for column in range(4):
+        basic.grid_columnconfigure(column, weight=1)
+    ctk.CTkLabel(basic, text="基础效果", font=ctk.CTkFont(size=22, weight="bold")).grid(
+        row=0, column=0, columnspan=4, sticky="w", padx=16, pady=(14, 12)
+    )
+    self._remember_visual_widgets("spectrum", _dashboard_option_row(basic, 1, "频谱", self.visual_spectrum_var, values=VISUAL_TOGGLE_VALUES))
+    self._remember_visual_widgets("timeline", _dashboard_option_row(basic, 2, "时间轴", self.visual_timeline_var, values=VISUAL_TOGGLE_VALUES))
+    self._remember_visual_widgets("letterbox", _dashboard_option_row(basic, 3, "黑边", self.visual_letterbox_var, values=VISUAL_TOGGLE_VALUES))
+    self._remember_visual_widgets("zoom", _dashboard_option_row(basic, 4, "镜头缩放", self.visual_zoom_var, values=_with_random(list_zoom_modes())))
+    self._remember_visual_widgets("style", _dashboard_option_row(basic, 5, "频谱样式", self.visual_style_var, values=_with_random(list_effects())))
+    self._remember_visual_widgets("spectrum_y", _dashboard_option_row(basic, 6, "频谱 Y", self.visual_spectrum_y_var))
+    self._remember_visual_widgets("spectrum_x", _dashboard_option_row(basic, 7, "频谱 X (-1=居中)", self.visual_spectrum_x_var))
+    self._remember_visual_widgets("spectrum_w", *_dashboard_range_row(basic, 8, "频谱宽度", self.visual_spectrum_w_min_var, self.visual_spectrum_w_max_var))
+
+    mood = ctk.CTkFrame(tab)
+    mood.grid(row=2, column=0, sticky="ew", padx=8, pady=8)
+    for column in range(4):
+        mood.grid_columnconfigure(column, weight=1)
+    ctk.CTkLabel(mood, text="色彩与氛围", font=ctk.CTkFont(size=22, weight="bold")).grid(
+        row=0, column=0, columnspan=4, sticky="w", padx=16, pady=(14, 12)
+    )
+    self._remember_visual_widgets("color_spectrum", _dashboard_option_row(mood, 1, "频谱配色", self.visual_color_spectrum_var, values=_with_random(list_palette_names())))
+    self._remember_visual_widgets("color_timeline", _dashboard_option_row(mood, 2, "时间轴配色", self.visual_color_timeline_var, values=_with_random(list_palette_names())))
+    self._remember_visual_widgets("film_grain", _dashboard_option_row(mood, 3, "胶片颗粒", self.visual_film_grain_var, values=VISUAL_TOGGLE_VALUES))
+    self._remember_visual_widgets("grain_strength", *_dashboard_range_row(mood, 4, "颗粒强度", self.visual_grain_strength_min_var, self.visual_grain_strength_max_var))
+    self._remember_visual_widgets("vignette", _dashboard_option_row(mood, 5, "暗角", self.visual_vignette_var, values=VISUAL_TOGGLE_VALUES))
+    self._remember_visual_widgets("color_tint", _dashboard_option_row(mood, 6, "色调", self.visual_tint_var, values=_with_random(list_tint_names())))
+    self._remember_visual_widgets("soft_focus", _dashboard_option_row(mood, 7, "柔焦", self.visual_soft_focus_var, values=VISUAL_TOGGLE_VALUES))
+    self._remember_visual_widgets("soft_focus_sigma", *_dashboard_range_row(mood, 8, "柔焦强度", self.visual_soft_focus_sigma_min_var, self.visual_soft_focus_sigma_max_var))
+
+    pulse = ctk.CTkFrame(tab)
+    pulse.grid(row=3, column=0, sticky="ew", padx=8, pady=8)
+    for column in range(4):
+        pulse.grid_columnconfigure(column, weight=1)
+    ctk.CTkLabel(pulse, text="节奏联动", font=ctk.CTkFont(size=22, weight="bold")).grid(
+        row=0, column=0, columnspan=4, sticky="w", padx=16, pady=(14, 12)
+    )
+    self._remember_visual_widgets("bass_pulse", _dashboard_option_row(pulse, 1, "低频脉冲", self.visual_bass_pulse_var, values=VISUAL_TOGGLE_VALUES))
+    self._remember_visual_widgets("bass_pulse_scale", *_dashboard_range_row(pulse, 2, "脉冲缩放", self.visual_bass_pulse_scale_min_var, self.visual_bass_pulse_scale_max_var))
+    self._remember_visual_widgets(
+        "bass_pulse_brightness",
+        *_dashboard_range_row(pulse, 3, "脉冲亮度", self.visual_bass_pulse_brightness_min_var, self.visual_bass_pulse_brightness_max_var),
+    )
+
+    overlay = ctk.CTkFrame(tab)
+    overlay.grid(row=4, column=0, sticky="ew", padx=8, pady=8)
+    for column in range(4):
+        overlay.grid_columnconfigure(column, weight=1)
+    ctk.CTkLabel(overlay, text="粒子与叠字", font=ctk.CTkFont(size=22, weight="bold")).grid(
+        row=0, column=0, columnspan=4, sticky="w", padx=16, pady=(14, 12)
+    )
+    self._remember_visual_widgets("particle", _dashboard_option_row(overlay, 1, "粒子效果", self.visual_particle_var, values=_with_random_first(list_particle_effects())))
+    self._remember_visual_widgets("particle_opacity", *_dashboard_range_row(overlay, 2, "粒子透明度", self.visual_particle_opacity_min_var, self.visual_particle_opacity_max_var))
+    self._remember_visual_widgets("particle_speed", *_dashboard_range_row(overlay, 3, "粒子速度", self.visual_particle_speed_min_var, self.visual_particle_speed_max_var))
+    self._remember_visual_widgets("text", _dashboard_option_row(overlay, 4, "叠字内容", self.visual_text_var))
+    self._remember_visual_widgets("text_font", _dashboard_option_row(overlay, 5, "字体", self.visual_text_font_var, values=_with_random(list_font_names())))
+    self._remember_visual_widgets("text_pos", _dashboard_option_row(overlay, 6, "文字位置", self.visual_text_pos_var, values=_with_random(list_text_positions())))
+    self._remember_visual_widgets("text_size", *_dashboard_range_row(overlay, 7, "文字大小", self.visual_text_size_min_var, self.visual_text_size_max_var))
+    self._remember_visual_widgets("text_style", _dashboard_option_row(overlay, 8, "文字样式", self.visual_text_style_var, values=_with_random(list_text_styles())))
+
+    self._refresh_visual_preset_controls()
+    self._on_visual_preset_change()
+    self._bind_scroll_frame_wheel(tab, base_tab, tab, intro, basic, mood, pulse, overlay)
+
+
+def _patched_build_log_tab_v2(self: DashboardApp) -> None:
+    tab = self.tabview.tab("日志")
+    tab.grid_columnconfigure(0, weight=1)
+    tab.grid_rowconfigure(1, weight=1)
+    bar = ctk.CTkFrame(tab, fg_color="transparent")
+    bar.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
+    ctk.CTkButton(bar, text="清空日志", command=self._clear_logs).pack(side="left", padx=6)
+    self.log_box = ctk.CTkTextbox(tab)
+    self.log_box.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 16))
+
+
+def _patched_refresh_default_rules_panel_v2(self: DashboardApp) -> None:
+    expanded = bool(self._default_rules_expanded)
+    self.default_rules_toggle_text_var.set("▼ 默认规则（点击折叠）" if expanded else "▶ 默认规则（点击展开）")
+    if self.default_rules_body is None:
+        return
+    if expanded:
+        self.default_rules_body.grid()
+    else:
+        self.default_rules_body.grid_remove()
+    self._refresh_schedule_controls()
+
+
+def _patched_toggle_default_rules_panel_v2(self: DashboardApp) -> None:
+    self._default_rules_expanded = not bool(self._default_rules_expanded)
+    self._refresh_default_rules_panel()
+    self._save_state()
+
+
+def _patched_browse_directory_var_v2(self: DashboardApp, variable: ctk.StringVar, title: str) -> None:
+    selected = filedialog.askdirectory(title=title)
+    if selected:
+        variable.set(selected)
+
+
+def _patched_refresh_path_template_controls_v2(self: DashboardApp) -> None:
+    self.path_templates = load_path_templates()
+    names = _dashboard_sorted_template_names(self.path_templates)
+    if hasattr(self, "queue_path_template_menu"):
+        self.queue_path_template_menu.configure(values=names)
+    selected_name = str(self._path_template_editor_selection or "").strip()
+    if selected_name not in names:
+        selected_name = names[0]
+    self._path_template_editor_selection = selected_name
+
+    if self.path_template_listbox is not None:
+        self.path_template_listbox.delete(0, "end")
+        for name in names:
+            self.path_template_listbox.insert("end", name)
+        try:
+            selected_index = names.index(selected_name)
+        except ValueError:
+            selected_index = 0
+        self.path_template_listbox.selection_clear(0, "end")
+        self.path_template_listbox.selection_set(selected_index)
+        self.path_template_listbox.activate(selected_index)
+        self.path_template_listbox.see(selected_index)
+
+    self._load_path_template_into_editor(selected_name)
+    current_queue_template = str(self.queue_path_template_var.get() or "").strip()
+    if current_queue_template not in names:
+        self.queue_path_template_var.set(selected_name)
+
+
+def _patched_load_path_template_into_editor_v2(self: DashboardApp, name: str) -> None:
+    clean_name, template = get_path_template(name, templates=self.path_templates)
+    self._path_template_editor_selection = clean_name
+    self.path_template_name_var.set(clean_name)
+    self.path_template_description_var.set(str(template.get("description") or "").strip())
+    self.path_template_source_root_var.set(str(template.get("source_root") or "").strip())
+    self.path_template_copywriting_output_var.set(str(template.get("copywriting_output") or "").strip())
+    self.path_template_thumbnail_output_var.set(str(template.get("thumbnail_output") or "").strip())
+    self.path_template_render_output_var.set(str(template.get("render_output") or "").strip())
+    self.path_template_used_materials_var.set(str(template.get("used_materials_dir") or "").strip())
+    self.path_template_used_videos_var.set(str(template.get("used_videos_dir") or "").strip())
+    self.path_template_auto_delete_days_var.set(str(template.get("auto_delete_days") or 0))
+
+
+def _patched_on_path_template_listbox_select_v2(self: DashboardApp, _event: Any | None = None) -> None:
+    if self.path_template_listbox is None:
+        return
+    selection = self.path_template_listbox.curselection()
+    if not selection:
+        return
+    name = str(self.path_template_listbox.get(selection[0]) or "").strip()
+    if not name:
+        return
+    self._load_path_template_into_editor(name)
+    self._save_state()
+
+
+def _patched_new_path_template_v2(self: DashboardApp) -> None:
+    self._path_template_editor_selection = ""
+    self.path_template_name_var.set("")
+    self.path_template_description_var.set("")
+    self.path_template_source_root_var.set("")
+    self.path_template_copywriting_output_var.set("")
+    self.path_template_thumbnail_output_var.set("")
+    self.path_template_render_output_var.set("")
+    self.path_template_used_materials_var.set("")
+    self.path_template_used_videos_var.set("")
+    self.path_template_auto_delete_days_var.set("0")
+    if self.path_template_listbox is not None:
+        self.path_template_listbox.selection_clear(0, "end")
+
+
+def _patched_save_current_path_template_v2(self: DashboardApp) -> None:
+    name = str(self.path_template_name_var.get() or "").strip()
+    if not name:
+        messagebox.showerror("保存路径模板失败", "模板名称不能为空。")
+        return
+    payload = normalize_path_template(
+        name,
+        {
+            "description": self.path_template_description_var.get(),
+            "source_root": self.path_template_source_root_var.get(),
+            "copywriting_output": self.path_template_copywriting_output_var.get(),
+            "thumbnail_output": self.path_template_thumbnail_output_var.get(),
+            "render_output": self.path_template_render_output_var.get(),
+            "used_materials_dir": self.path_template_used_materials_var.get(),
+            "used_videos_dir": self.path_template_used_videos_var.get(),
+            "auto_delete_days": self.path_template_auto_delete_days_var.get(),
+        },
+    )
+    templates = dict(load_path_templates())
+    templates[name] = payload
+    self.path_templates = save_path_templates(templates)
+    self._path_template_editor_selection = name
+    self._refresh_path_template_controls()
+    self.queue_path_template_var.set(name)
+    self._apply_current_group_context(preserve_selection=True)
+    self._log(f"[路径模板] 已保存: {name}")
+    self._save_state()
+
+
+def _patched_delete_current_path_template_v2(self: DashboardApp) -> None:
+    name = str(self.path_template_name_var.get() or "").strip()
+    if not name:
+        return
+    if name == DEFAULT_PATH_TEMPLATE_NAME:
+        messagebox.showinfo("删除路径模板", "默认路径不能删除。")
+        return
+    templates = dict(load_path_templates())
+    if name not in templates:
+        return
+    del templates[name]
+    self.path_templates = save_path_templates(templates)
+    self._path_template_editor_selection = DEFAULT_PATH_TEMPLATE_NAME
+    self._refresh_path_template_controls()
+    self.queue_path_template_var.set(DEFAULT_PATH_TEMPLATE_NAME)
+    self._apply_current_group_context(preserve_selection=True)
+    self._log(f"[路径模板] 已删除: {name}")
+    self._save_state()
+
+
+def _patched_on_queue_path_template_change_v2(self: DashboardApp) -> None:
+    self._apply_queue_path_template_selection()
+    self._save_state()
+
+
+def _patched_apply_queue_path_template_selection_v1(self: DashboardApp) -> None:
+    current_group = str(self.current_group_var.get() or "").strip()
+    selected_name = str(self.queue_path_template_var.get() or "").strip()
+    path_name, path_template = get_path_template(selected_name, templates=self.path_templates)
+    if path_name != selected_name:
+        self.queue_path_template_var.set(path_name)
+        return
+    resolved_source = resolve_source_dir(
+        path_template,
+        group_tag=current_group,
+        fallback=self.source_dir_override_var.get(),
+    )
+    self.source_dir_override_var.set(resolved_source)
+
+
+def _patched_apply_current_group_context_v2(self: DashboardApp, *, preserve_selection: bool) -> None:
+    current_group = str(self.current_group_var.get() or "").strip()
+    available_serials = [int(info.serial) for info in self.group_catalog.get(current_group, [])]
+    valid_serials = set(available_serials)
+    if preserve_selection:
+        existing = [serial for serial in _dashboard_parse_serials(self.queue_windows_var.get()) if serial in valid_serials]
+        serials = existing or available_serials
+    else:
+        serials = available_serials
+    self.queue_windows_var.set(", ".join(str(serial) for serial in serials))
+
+    path_name, path_template = get_path_template(self.queue_path_template_var.get(), templates=self.path_templates)
+    if path_name != self.queue_path_template_var.get():
+        self.queue_path_template_var.set(path_name)
+    resolved_source = resolve_source_dir(path_template, group_tag=current_group, fallback=self.source_dir_override_var.get())
+    self.source_dir_override_var.set(resolved_source)
+
+    api_name, content_name = self._queue_template_defaults_for_group(current_group)
+    self.queue_api_template_var.set(api_name)
+    self.queue_prompt_template_var.set(content_name)
+
+
+def _patched_refresh_groups_v2(self: DashboardApp) -> None:
+    self.group_catalog, browser_error = _build_group_catalog_from_config()
+    groups = list(self.group_catalog.keys()) or [""]
+    for attr_name in ("current_group_menu", "prompt_group_menu"):
+        menu = getattr(self, attr_name, None)
+        if menu is not None:
+            menu.configure(values=groups)
+    if self.current_group_var.get() not in groups:
+        self.current_group_var.set(groups[0])
+    if self.prompt_group_var.get() not in groups:
+        self.prompt_group_var.set(self.current_group_var.get())
+    self._apply_current_group_context(preserve_selection=True)
+    self._refresh_queue_display()
+    self._save_state()
+    if browser_error is not None:
+        self._log(f"[分组] BitBrowser 环境读取失败，已回退到 upload_config/channel_mapping: {browser_error}")
+
+
+def _patched_remove_queue_job_v2(self: DashboardApp, index: int) -> None:
+    try:
+        self.run_queue.remove_job(index)
+    except IndexError:
+        return
+    self._refresh_task_tree()
+
+
+def _patched_refresh_queue_display_v2(self: DashboardApp) -> None:
+    if self.queue_list_frame is None:
+        return
+    for child in self.queue_list_frame.winfo_children():
+        child.destroy()
+    if self.run_queue.is_empty():
+        ctk.CTkLabel(self.queue_list_frame, text="队列为空，请在上方添加分组任务", text_color="#9fb2c8").pack(
+            anchor="w",
+            padx=12,
+            pady=12,
+        )
+        return
+    for summary in self.run_queue.get_summary():
+        row = ctk.CTkFrame(self.queue_list_frame)
+        row.pack(fill="x", padx=4, pady=4)
+        for column in range(7):
+            row.grid_columnconfigure(column, weight=1 if column in {1, 2, 3, 4, 5} else 0)
+        ctk.CTkLabel(row, text=str(summary["index"] + 1), anchor="w").grid(row=0, column=0, sticky="w", padx=6, pady=8)
+        ctk.CTkLabel(row, text=summary["group_tag"], anchor="w").grid(row=0, column=1, sticky="w", padx=6, pady=8)
+        ctk.CTkLabel(row, text=summary["window_serials_text"], anchor="w").grid(row=0, column=2, sticky="w", padx=6, pady=8)
+        ctk.CTkLabel(row, text=summary["prompt_template"], anchor="w").grid(row=0, column=3, sticky="w", padx=6, pady=8)
+        ctk.CTkLabel(row, text=summary["visual_mode"], anchor="w").grid(row=0, column=4, sticky="w", padx=6, pady=8)
+        ctk.CTkLabel(row, text=summary["path_template"], anchor="w").grid(row=0, column=5, sticky="w", padx=6, pady=8)
+        action_bar = ctk.CTkFrame(row, fg_color="transparent")
+        action_bar.grid(row=0, column=6, sticky="e", padx=6, pady=8)
+        ctk.CTkButton(action_bar, text="设置", width=72, command=lambda index=summary["index"]: self._open_window_override_dialog(index)).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(
+            action_bar,
+            text="删除",
+            width=72,
+            command=lambda index=summary["index"]: self._remove_queue_job(index),
+            fg_color="#7a1f1f",
+            hover_color="#932525",
+        ).pack(side="left")
+
+
+def _patched_add_current_group_to_queue_v2(self: DashboardApp) -> None:
+    current_group = str(self.current_group_var.get() or "").strip()
+    if not current_group:
+        messagebox.showerror("无法加入队列", "请先选择一个分组。")
+        return
+    selected_serials = _dashboard_parse_serials(self.queue_windows_var.get())
+    if not selected_serials:
+        messagebox.showerror("无法加入队列", "请先填写至少一个窗口号。")
+        return
+
+    visual_mode = _visual_mode_to_value(self.queue_visual_mode_var.get())
+    visual_settings: dict[str, Any] | None = None
+    if visual_mode == "manual":
+        visual_settings = dict(self._collect_visual_settings())
+    elif visual_mode not in {"random", "manual"}:
+        visual_settings = dict(self.visual_presets.get(visual_mode) or {})
+
+    path_name, path_template = get_path_template(self.queue_path_template_var.get(), templates=self.path_templates)
+    resolved_source = str(self.source_dir_override_var.get() or "").strip() or resolve_source_dir(path_template, group_tag=current_group)
+    selected_modules = self._module_names_for_new_job()
+    selected_steps = []
+    if "metadata" in selected_modules:
+        selected_steps.append("generate")
+    if "render" in selected_modules:
+        selected_steps.append("render")
+    if "upload" in selected_modules:
+        selected_steps.append("upload")
+    job = GroupJob(
+        group_tag=current_group,
+        window_serials=selected_serials,
+        source_dir=resolved_source,
+        prompt_template=str(self.queue_prompt_template_var.get() or "default").strip() or "default",
+        api_template=str(self.queue_api_template_var.get() or "default").strip() or "default",
+        api_preset=str(self.queue_api_template_var.get() or "default").strip() or "default",
+        visual_mode=visual_mode,
+        visual_settings=visual_settings,
+        path_template=path_name,
+        upload_defaults=self._current_upload_defaults_model(),
+        steps=selected_steps,
+        modules=selected_modules,
+    )
+    self.run_queue.add_job(job)
+    self._apply_current_group_context(preserve_selection=False)
+    self._refresh_task_tree()
+
+
+def _patched_window_default_values_v2(self: DashboardApp, job: GroupJob, serial: int) -> dict[str, str]:
+    info = self._find_window_info(job.group_tag, serial)
+    defaults = self._current_upload_defaults_model()
+    override = job.get_window_override(serial)
+    visibility = str((override.visibility if override and override.visibility else defaults.visibility) or "private").strip() or "private"
+    category = str((override.category if override and override.category else defaults.category) or "Music").strip() or "Music"
+    kids = str((override.kids_content if override and override.kids_content else _yes_no_from_bool(defaults.is_for_kids)) or "no").strip() or "no"
+    ai = str((override.ai_content if override and override.ai_content else (defaults.ai_content or defaults.altered_content or "yes")) or "yes").strip() or "yes"
+    schedule_time = str((override.schedule_time if override and override.schedule_time else defaults.schedule_time or "")).strip()
+    ypp = str((override.ypp if override and override.ypp else _yes_no_from_bool(bool(info.is_ypp))) or "no").strip() or "no"
+    return {
+        "ypp": ypp,
+        "visibility": visibility,
+        "category": category,
+        "kids_content": kids,
+        "ai_content": ai,
+        "schedule_time": schedule_time,
+    }
+
+
+def _patched_open_window_override_dialog_v2(self: DashboardApp, index: int) -> None:
+    if index < 0 or index >= len(self.run_queue.jobs):
+        return
+    job = self.run_queue.jobs[index]
+    dialog = ctk.CTkToplevel(self)
+    dialog.title(f"单独设置 - {job.group_tag}")
+    dialog.geometry("960x440")
+    dialog.transient(self)
+    dialog.grab_set()
+    dialog.grid_columnconfigure(0, weight=1)
+    dialog.grid_rowconfigure(1, weight=1)
+    ctk.CTkLabel(
+        dialog,
+        text=f"分组: {job.group_tag}  |  窗口: {', '.join(str(item) for item in job.window_serials)}",
+        font=ctk.CTkFont(size=18, weight="bold"),
+    ).grid(row=0, column=0, sticky="w", padx=16, pady=(16, 10))
+
+    table = ctk.CTkScrollableFrame(dialog)
+    table.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
+    for column in range(7):
+        table.grid_columnconfigure(column, weight=1)
+
+    headers = ["窗口", "YPP", "可见性", "分类", "儿童内容", "AI 内容", "定时发布"]
+    for column, title in enumerate(headers):
+        ctk.CTkLabel(table, text=title, font=ctk.CTkFont(weight="bold")).grid(row=0, column=column, sticky="w", padx=6, pady=(4, 8))
+
+    row_vars: dict[int, dict[str, ctk.StringVar]] = {}
+    default_cache = {serial: self._window_default_values(job, serial) for serial in job.window_serials}
+    schedule_values = ["", *_schedule_time_values()]
+    for row_index, serial in enumerate(job.window_serials, start=1):
+        defaults = default_cache[serial]
+        ctk.CTkLabel(table, text=str(serial)).grid(row=row_index, column=0, sticky="w", padx=6, pady=6)
+        vars_for_row = {
+            "ypp": ctk.StringVar(value=defaults["ypp"]),
+            "visibility": ctk.StringVar(value=defaults["visibility"]),
+            "category": ctk.StringVar(value=defaults["category"]),
+            "kids_content": ctk.StringVar(value=defaults["kids_content"]),
+            "ai_content": ctk.StringVar(value=defaults["ai_content"]),
+            "schedule_time": ctk.StringVar(value=defaults["schedule_time"]),
+        }
+        row_vars[serial] = vars_for_row
+        ctk.CTkOptionMenu(table, variable=vars_for_row["ypp"], values=YES_NO_VALUES).grid(row=row_index, column=1, sticky="ew", padx=6, pady=6)
+        ctk.CTkOptionMenu(table, variable=vars_for_row["visibility"], values=VISIBILITY_VALUES).grid(row=row_index, column=2, sticky="ew", padx=6, pady=6)
+        ctk.CTkOptionMenu(table, variable=vars_for_row["category"], values=CATEGORY_VALUES).grid(row=row_index, column=3, sticky="ew", padx=6, pady=6)
+        ctk.CTkOptionMenu(table, variable=vars_for_row["kids_content"], values=YES_NO_VALUES).grid(row=row_index, column=4, sticky="ew", padx=6, pady=6)
+        ctk.CTkOptionMenu(table, variable=vars_for_row["ai_content"], values=YES_NO_VALUES).grid(row=row_index, column=5, sticky="ew", padx=6, pady=6)
+        ctk.CTkOptionMenu(table, variable=vars_for_row["schedule_time"], values=schedule_values).grid(row=row_index, column=6, sticky="ew", padx=6, pady=6)
+
+    def reset_to_defaults() -> None:
+        for serial, vars_for_row in row_vars.items():
+            defaults = default_cache[serial]
+            for key, var in vars_for_row.items():
+                var.set(defaults[key])
+
+    def save_dialog() -> None:
+        job.clear_window_overrides()
+        for serial, vars_for_row in row_vars.items():
+            defaults = default_cache[serial]
+            override = WindowOverride(
+                serial=int(serial),
+                ypp="" if vars_for_row["ypp"].get() == defaults["ypp"] else vars_for_row["ypp"].get(),
+                visibility="" if vars_for_row["visibility"].get() == defaults["visibility"] else vars_for_row["visibility"].get(),
+                category="" if vars_for_row["category"].get() == defaults["category"] else vars_for_row["category"].get(),
+                kids_content="" if vars_for_row["kids_content"].get() == defaults["kids_content"] else vars_for_row["kids_content"].get(),
+                ai_content="" if vars_for_row["ai_content"].get() == defaults["ai_content"] else vars_for_row["ai_content"].get(),
+                schedule_time="" if vars_for_row["schedule_time"].get() == defaults["schedule_time"] else vars_for_row["schedule_time"].get(),
+            )
+            job.set_window_override(override)
+        dialog.destroy()
+        self._refresh_task_tree()
+
+    button_bar = ctk.CTkFrame(dialog, fg_color="transparent")
+    button_bar.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 16))
+    ctk.CTkButton(button_bar, text="全部使用默认值", command=reset_to_defaults).pack(side="left", padx=6)
+    ctk.CTkButton(button_bar, text="确定", command=save_dialog).pack(side="left", padx=6)
+    ctk.CTkButton(button_bar, text="取消", command=dialog.destroy).pack(side="left", padx=6)
+
+
+def _patched_build_window_tasks_from_job_v2(self: DashboardApp, job: GroupJob) -> list[WindowTask]:
+    upload_defaults = UploadDefaults.from_dict(self._current_upload_defaults_model().to_dict())
+    if job.upload_defaults:
+        upload_defaults = UploadDefaults.from_dict(job.upload_defaults.to_dict())
+    notify_subscribers = bool(self.default_notify_var.get())
+    tasks: list[WindowTask] = []
+    seen_serials: set[int] = set()
+    for raw_serial in job.window_serials:
+        serial = int(raw_serial)
+        if serial in seen_serials:
+            continue
+        seen_serials.add(serial)
+        info = self._find_window_info(job.group_tag, serial)
+        override = job.get_window_override(serial)
+        visibility = str((override.visibility if override and override.visibility else upload_defaults.visibility) or "private").strip() or "private"
+        category = str((override.category if override and override.category else upload_defaults.category) or "Music").strip() or "Music"
+        kids_value = override.kids_content if override and override.kids_content else _yes_no_from_bool(upload_defaults.is_for_kids)
+        ai_value = override.ai_content if override and override.ai_content else (upload_defaults.ai_content or upload_defaults.altered_content or "yes")
+        schedule_time = override.schedule_time if override and override.schedule_time else str(upload_defaults.schedule_time or "").strip()
+        schedule_text = ""
+        if visibility == "schedule":
+            schedule_text = _compose_schedule_text(str(upload_defaults.schedule_date or "").strip(), schedule_time)
+        tasks.append(
+            create_task(
+                tag=job.group_tag,
+                serial=serial,
+                quantity=1,
+                is_ypp=_bool_from_yes_no(override.ypp) if override and str(override.ypp or "").strip() else bool(info.is_ypp),
+                title="",
+                visibility=visibility,
+                category=category,
+                made_for_kids=_bool_from_yes_no(kids_value),
+                altered_content=_bool_from_yes_no(ai_value),
+                notify_subscribers=notify_subscribers,
+                scheduled_publish_at=schedule_text,
+                schedule_timezone=str(upload_defaults.timezone or "").strip() if visibility == "schedule" else "",
+                source_dir=str(job.source_dir or "").strip(),
+                channel_name=info.channel_name,
+            )
+        )
+    return tasks
+
+
+def _patched_runtime_config_for_job_v2(self: DashboardApp, job: GroupJob) -> dict[str, Any]:
+    base_config = load_scheduler_settings(SCHEDULER_CONFIG_FILE)
+    template_name, template = get_path_template(job.path_template, templates=self.path_templates)
+    return build_runtime_config(base_config, template, template_name=template_name, source_dir=str(job.source_dir or "").strip())
+
+
+def _patched_build_run_plan_for_job_v2(self: DashboardApp, job: GroupJob, *, config: dict[str, Any] | None = None):
+    runtime_config = config or self._runtime_config_for_job(job)
+    tasks = self._build_window_tasks_from_job(job)
+    return build_run_plan(
+        tasks=tasks,
+        defaults=self._workflow_defaults_for_job(job),
+        modules=self._module_selection_for_job(job),
+        config=runtime_config,
+    )
+
+
+def _patched_build_tracking_plan_for_queue_v2(self: DashboardApp, *, config: dict[str, Any] | None = None):
+    effective_jobs = self._effective_run_queue_jobs()
+    runtime_config = config or (self._runtime_config_for_job(effective_jobs[0]) if effective_jobs else self._sync_runtime_paths(persist=False))
+    tracking_tasks: list[WindowTask] = []
+    combined_flags = {"metadata": False, "render": False, "upload": False}
+    for job in effective_jobs:
+        tracking_tasks.extend(self._build_window_tasks_from_job(job))
+        for module_name in job.modules:
+            clean_name = str(module_name or "").strip()
+            if clean_name in combined_flags:
+                combined_flags[clean_name] = True
+    modules = build_module_selection(
+        metadata=combined_flags["metadata"],
+        render=combined_flags["render"],
+        upload=combined_flags["upload"],
+    )
+    defaults = self._collect_defaults()
+    if effective_jobs:
+        defaults.visual_settings = self._resolve_job_visual_settings(effective_jobs[0])
+    return build_run_plan(tasks=tracking_tasks, defaults=defaults, modules=modules, config=runtime_config)
+
+
+def _patched_preview_plan_v2(self: DashboardApp) -> None:
+    self._save_state()
+    preview_widget = getattr(self, "start_preview", None)
+    if preview_widget is None:
+        return
+    preview_widget.delete("1.0", "end")
+    if not self.window_tasks:
+        preview_widget.insert("1.0", "暂无队列任务。")
+        return
+    try:
+        run_plan = self._build_tracking_plan_for_queue()
+    except Exception as exc:
+        preview_widget.insert("1.0", f"计划构建失败: {exc}")
+        return
+    preview_widget.insert("1.0", "\n".join(preview_run_plan(run_plan)))
+
+
+def _patched_on_visual_preset_change_v2(self: DashboardApp, *_args: Any) -> None:
+    preset_name = _visual_preset_choice_to_value(self.visual_preset_var.get())
+    if preset_name == "none":
+        self._set_visual_fields_enabled(True)
+        self.visual_preset_hint_var.set("")
+        if hasattr(self, "visual_preset_hint_label"):
+            self.visual_preset_hint_label.grid_remove()
+        return
+    settings = self._visual_preset_to_settings(preset_name)
+    self._apply_visual_settings_to_form(settings, preset_choice=_visual_preset_value_to_choice(preset_name))
+    self._set_visual_fields_enabled(False)
+    self.visual_preset_hint_var.set(VISUAL_PRESET_HINT_TEMPLATE.format(name=preset_name))
+    if hasattr(self, "visual_preset_hint_label"):
+        self.visual_preset_hint_label.grid()
+
+
+def _patched_save_current_visual_preset_v2(self: DashboardApp) -> None:
+    name = simpledialog.askstring("保存视觉预设", "请输入预设名称：", parent=self)
+    clean_name = str(name or "").strip()
+    if not clean_name:
+        return
+    presets = dict(self.visual_presets)
+    presets[clean_name] = self._serialize_visual_preset(clean_name)
+    _write_json_object(VISUAL_PRESETS_FILE, presets)
+    self.visual_presets = _load_visual_presets()
+    self._refresh_visual_preset_controls()
+    self.visual_preset_var.set(_visual_preset_value_to_choice(clean_name))
+    self._on_visual_preset_change()
+    self._log(f"[视觉] 已保存预设: {clean_name}")
+
+
+def _patched_delete_selected_visual_preset_v2(self: DashboardApp) -> None:
+    preset_name = _visual_preset_choice_to_value(self.visual_preset_var.get())
+    if preset_name == "none":
+        messagebox.showinfo("删除视觉预设", "当前没有选中可删除的预设。")
+        return
+    presets = dict(self.visual_presets)
+    if preset_name not in presets:
+        self.visual_preset_var.set(VISUAL_PRESET_NONE)
+        self._on_visual_preset_change()
+        return
+    del presets[preset_name]
+    _write_json_object(VISUAL_PRESETS_FILE, presets)
+    self.visual_presets = _load_visual_presets()
+    self.visual_preset_var.set(VISUAL_PRESET_NONE)
+    self._refresh_visual_preset_controls()
+    self._on_visual_preset_change()
+    self._log(f"[视觉] 已删除预设: {preset_name}")
+
+
+def _patched_save_visual_settings_v2(self: DashboardApp) -> None:
+    config = load_scheduler_settings(SCHEDULER_CONFIG_FILE)
+    config["visual_settings"] = self._collect_visual_settings()
+    self.scheduler_config = save_scheduler_settings(config, SCHEDULER_CONFIG_FILE)
+    self._save_state()
+    self._log("[视觉] 已保存高级视觉设置")
+
+
+def _patched_apply_visual_preset_mega_bass_v2(self: DashboardApp) -> None:
+    self.visual_preset_var.set(_visual_preset_value_to_choice("MegaBass"))
+    self._on_visual_preset_change()
+    self._save_visual_settings()
+    self._log("[视觉] 已套用 MegaBass")
+
+
+def _patched_start_real_flow_v2(self: DashboardApp) -> None:
+    if self.run_queue.is_empty():
+        messagebox.showerror("无法开始运行", "队列为空，请先添加至少一个分组任务。")
+        return
+    self._refresh_task_tree()
+    if not self.window_tasks:
+        messagebox.showerror("无法开始运行", "队列中没有有效的窗口任务。")
+        return
+
+    queue_defaults = self._current_upload_defaults_model()
+    effective_jobs = self._effective_run_queue_jobs()
+    tracking_plan = self._build_tracking_plan_for_queue()
+    runtime_config = self._runtime_config_for_job(effective_jobs[0])
+    self._persist_prompt_form_for_active_tasks()
+    self._write_run_snapshot(config=runtime_config, run_plan=tracking_plan)
+    self._prepare_run_result_tracking(tracking_plan)
+
+    def handle_queue_progress(event: dict[str, Any]) -> None:
+        event_type = str(event.get("type") or "").strip()
+        if not event_type:
+            return
+        if event_type == "log":
+            message = str(event.get("message") or "").strip()
+            if message:
+                self._log(message)
+            return
+
+        group_tag = str(event.get("group_tag") or "").strip()
+        label = str(event.get("label") or "").strip()
+        serial_value = int(event.get("serial") or 0)
+
+        if event_type == "job_started":
+            self._run_phase = f"队列 {event.get('job_index', 0)}/{event.get('job_total', 0)}"
+            self._run_current_item = f"{group_tag} | {int(event.get('window_count') or 0)} 个窗口"
+            self._run_current_ratio = 0.0
+            self._log(f"[队列] {event.get('job_index', 0)}/{event.get('job_total', 0)} -> {group_tag} | windows={event.get('window_serials', [])}")
+            return
+        if event_type == "prepare_started":
+            self._run_phase = "生成文案 / 渲染"
+            self._run_current_item = f"{group_tag} | 准备上传素材"
+            self._run_current_ratio = 0.0
+            return
+        if event_type == "prepare_finished":
+            self._run_phase = "准备完成"
+            self._run_current_item = f"{group_tag} | 等待上传"
+            self._run_current_ratio = 0.0
+            return
+        if event_type == "window_started":
+            if label and not bool(event.get("has_prepare_step", True)):
+                self._run_progress_step_done(label, "render")
+            if group_tag and serial_value:
+                self._mark_run_stage(group_tag, serial_value, "upload", "running", "上传中")
+            self._run_phase = "上传"
+            self._run_current_item = f"{group_tag} / 窗口 {serial_value}"
+            self._run_current_ratio = 0.0
+            return
+        if event_type == "window_finished":
+            detail = str(event.get("detail") or event.get("stage") or "").strip()
+            if group_tag and serial_value:
+                self._mark_run_stage(group_tag, serial_value, "upload", "success" if bool(event.get("success")) else "failed", detail)
+            if label:
+                self._run_progress_step_done(label, "upload")
+            self._run_phase = "上传完成" if bool(event.get("success")) else "上传失败"
+            self._run_current_item = f"{group_tag} / 窗口 {serial_value} | {detail or '完成'}"
+            self._run_current_ratio = 0.0
+            return
+        if event_type == "group_finished":
+            self._run_phase = "分组完成"
+            self._run_current_item = f"{group_tag} | success={int(event.get('success_count') or 0)} | failed={int(event.get('failed_count') or 0)}"
+            return
+        if event_type == "job_error":
+            self._run_phase = "分组失败"
+            self._run_current_item = f"{group_tag} | {str(event.get('detail') or '').strip()}"
+
+    def job() -> bool:
+        queue_results = asyncio.run(
+            execute_run_queue(
+                self.run_queue,
+                queue_defaults,
+                control=self.execution_control,
+                before_job_callback=self._apply_job_prompt_bindings,
+                build_run_plan_for_job=lambda queue_job: self._build_run_plan_for_job(queue_job),
+                execution_result_callback=lambda _job, execution: self._ingest_execution_result(execution),
+                progress_callback=handle_queue_progress,
+                log=self._log,
+            )
+        )
+        if self._cancel_requested:
+            return False
+        failures: list[str] = []
+        for job_result in queue_results:
+            for item in job_result.get("results", []) or []:
+                if bool(item.get("success")):
+                    continue
+                detail = str(item.get("detail") or item.get("stage") or "upload failed").strip()
+                if detail and detail not in failures:
+                    failures.append(detail)
+        if failures:
+            raise RuntimeError(" | ".join(failures[:3]))
+        return False
+
+    task_name = " + ".join(tracking_plan.modules.labels()) or "RunQueue"
+    self._run_background(
+        job,
+        task_name=task_name,
+        total_items=len(tracking_plan.tasks),
+        include_upload=bool(tracking_plan.modules.upload and (tracking_plan.modules.metadata or tracking_plan.modules.render)),
+    )
+
+
+def _patched_run_background_v2(self: DashboardApp, func, *, task_name: str, total_items: int, include_upload: bool = False) -> None:
+    if self._has_active_background_work():
+        messagebox.showinfo("任务进行中", self._current_run_summary())
+        return
+
+    self._start_run_tracking(task_name, total_items, include_upload=include_upload)
+
+    def runner() -> None:
+        try:
+            deferred_finish = bool(func())
+        except WorkflowCancelledError as exc:
+            error_text = str(exc)
+            self._log(f"[取消] {error_text}")
+            self._post_ui_action(lambda text=error_text: self._finish_run_tracking(success=False, summary=text, cancelled=True))
+            return
+        except Exception as exc:
+            error_text = str(exc)
+            self._log(f"[错误] {error_text}")
+            self._post_ui_action(lambda text=error_text: self._finish_run_tracking(success=False, summary=text))
+            self._post_ui_action(lambda text=error_text: messagebox.showerror("任务失败", text))
+            return
+        if deferred_finish:
+            return
+        if self._cancel_requested:
+            self._post_ui_action(lambda: self._finish_run_tracking(success=False, summary="当前批次已取消", cancelled=True))
+        else:
+            self._post_ui_action(lambda: self._finish_run_tracking(success=True, summary="任务已执行完成"))
+
+    self.worker_thread = threading.Thread(target=runner, daemon=True)
+    self.worker_thread.start()
+
+
+def _patched_refresh_schedule_controls_v3(self: DashboardApp) -> None:
+    add_state = "normal" if bool(self.add_schedule_enabled_var.get()) else "disabled"
+    for widget in (
+        getattr(self, "add_schedule_date_menu", None),
+        getattr(self, "add_schedule_time_menu", None),
+        getattr(self, "add_schedule_timezone_menu", None),
+    ):
+        if widget is not None:
+            widget.configure(state=add_state)
+
+    default_enabled = bool(self.schedule_enabled_var.get())
+    default_state = "normal" if default_enabled else "disabled"
+    for widget in (
+        getattr(self, "schedule_date_menu", None),
+        getattr(self, "schedule_time_menu", None),
+        getattr(self, "schedule_timezone_menu", None),
+        getattr(self, "schedule_interval_entry", None),
+    ):
+        if widget is not None:
+            widget.configure(state=default_state)
+
+    details_frame = getattr(self, "default_schedule_details_frame", None)
+    if details_frame is not None:
+        if default_enabled:
+            details_frame.grid()
+        else:
+            details_frame.grid_remove()
+
+
+def _patched_build_upload_tab_v3(self: DashboardApp) -> None:
+    base_tab = self.tabview.tab("上传")
+    base_tab.grid_columnconfigure(0, weight=1)
+    base_tab.grid_rowconfigure(0, weight=1)
+    tab = ctk.CTkScrollableFrame(base_tab)
+    tab.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+    tab.grid_columnconfigure(0, weight=1)
+
+    # ── 浏览器提供者选择条 ──
+    provider_frame = ctk.CTkFrame(tab)
+    provider_frame.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+    provider_frame.grid_columnconfigure(1, weight=1)
+    ctk.CTkLabel(provider_frame, text="浏览器管理器:").grid(row=0, column=0, sticky="w", padx=(16, 8), pady=8)
+    self.browser_provider_menu = ctk.CTkOptionMenu(
+        provider_frame,
+        variable=self.browser_provider_var,
+        values=["auto", "hubstudio", "bitbrowser"],
+        font=_dashboard_theme_font(),
+        dropdown_font=_dashboard_theme_font(),
+        command=lambda _val: self._on_browser_provider_change(),
+        width=180,
+    )
+    self.browser_provider_menu.grid(row=0, column=1, sticky="w", padx=0, pady=8)
+    self._browser_status_label = ctk.CTkLabel(provider_frame, text="", text_color="#9fb2c8")
+    self._browser_status_label.grid(row=0, column=2, sticky="w", padx=(16, 16), pady=8)
+
+    add_frame = ctk.CTkFrame(tab)
+    add_frame.grid(row=1, column=0, sticky="ew", padx=8, pady=(4, 8))
+    for column in range(5):
+        add_frame.grid_columnconfigure(column, weight=1)
+    ctk.CTkLabel(add_frame, text="添加分组到队列", font=ctk.CTkFont(size=24, weight="bold")).grid(
+        row=0, column=0, columnspan=5, sticky="w", padx=16, pady=(14, 12)
+    )
+    ctk.CTkLabel(add_frame, text="分组").grid(row=1, column=0, sticky="w", padx=(16, 8), pady=(0, 6))
+    ctk.CTkLabel(add_frame, text="窗口").grid(row=1, column=1, sticky="w", padx=8, pady=(0, 6))
+    ctk.CTkLabel(add_frame, text="素材目录").grid(row=1, column=2, sticky="w", padx=8, pady=(0, 6))
+    self.current_group_menu = ctk.CTkOptionMenu(
+        add_frame,
+        variable=self.current_group_var,
+        values=[""],
+        font=_dashboard_theme_font(),
+        dropdown_font=_dashboard_theme_font(),
+    )
+    self.current_group_menu.grid(row=2, column=0, sticky="ew", padx=(16, 8), pady=(0, 12))
+    ctk.CTkEntry(add_frame, textvariable=self.queue_windows_var).grid(row=2, column=1, sticky="ew", padx=8, pady=(0, 12))
+    source_bar = ctk.CTkFrame(add_frame, fg_color="transparent")
+    source_bar.grid(row=2, column=2, columnspan=2, sticky="ew", padx=(8, 16), pady=(0, 12))
+    source_bar.grid_columnconfigure(0, weight=1)
+    ctk.CTkEntry(source_bar, textvariable=self.source_dir_override_var).grid(
+        row=0, column=0, sticky="ew", padx=(0, 8), pady=0
+    )
+    ctk.CTkButton(
+        source_bar,
+        text="选择文件夹",
+        command=lambda: self._browse_directory_var(self.source_dir_override_var, "选择素材目录"),
+    ).grid(row=0, column=1, sticky="e", pady=0)
+
+    ctk.CTkButton(add_frame, text="刷新分组", command=self._refresh_groups).grid(
+        row=3, column=0, sticky="w", padx=(16, 8), pady=(0, 12)
+    )
+    ctk.CTkLabel(add_frame, text="API模板").grid(row=4, column=0, sticky="w", padx=(16, 8), pady=(0, 6))
+    ctk.CTkLabel(add_frame, text="提示词模板").grid(row=4, column=1, sticky="w", padx=8, pady=(0, 6))
+    ctk.CTkLabel(add_frame, text="视觉模板").grid(row=4, column=2, sticky="w", padx=8, pady=(0, 6))
+    ctk.CTkLabel(add_frame, text="路径模板").grid(row=4, column=3, sticky="w", padx=8, pady=(0, 6))
+    ctk.CTkLabel(add_frame, text="每窗口上传数量").grid(row=4, column=4, sticky="w", padx=(8, 16), pady=(0, 6))
+    self.queue_api_template_menu = ctk.CTkOptionMenu(
+        add_frame,
+        variable=self.queue_api_template_var,
+        values=["default"],
+        font=_dashboard_theme_font(),
+        dropdown_font=_dashboard_theme_font(),
+    )
+    self.queue_api_template_menu.grid(row=5, column=0, sticky="ew", padx=(16, 8), pady=(0, 12))
+    self.queue_prompt_template_menu = ctk.CTkOptionMenu(
+        add_frame,
+        variable=self.queue_prompt_template_var,
+        values=["default"],
+        font=_dashboard_theme_font(),
+        dropdown_font=_dashboard_theme_font(),
+    )
+    self.queue_prompt_template_menu.grid(row=5, column=1, sticky="ew", padx=8, pady=(0, 12))
+    self.queue_visual_mode_menu = ctk.CTkOptionMenu(
+        add_frame,
+        variable=self.queue_visual_mode_var,
+        values=[QUEUE_VISUAL_RANDOM, QUEUE_VISUAL_MANUAL, *sorted(self.visual_presets.keys(), key=str.lower)],
+        font=_dashboard_theme_font(),
+        dropdown_font=_dashboard_theme_font(),
+    )
+    self.queue_visual_mode_menu.grid(row=5, column=2, sticky="ew", padx=8, pady=(0, 12))
+    self.queue_path_template_menu = ctk.CTkOptionMenu(
+        add_frame,
+        variable=self.queue_path_template_var,
+        values=[""],
+        font=_dashboard_theme_font(),
+        dropdown_font=_dashboard_theme_font(),
+    )
+    self.queue_path_template_menu.grid(row=5, column=3, sticky="ew", padx=8, pady=(0, 12))
+    self.queue_videos_per_window_menu = ctk.CTkOptionMenu(
+        add_frame,
+        variable=self.queue_videos_per_window_var,
+        values=QUEUE_VIDEOS_PER_WINDOW_VALUES,
+        font=_dashboard_theme_font(),
+        dropdown_font=_dashboard_theme_font(),
+    )
+    self.queue_videos_per_window_menu.grid(row=5, column=4, sticky="ew", padx=(8, 16), pady=(0, 12))
+
+    steps_frame = ctk.CTkFrame(add_frame, fg_color="transparent")
+    steps_frame.grid(row=6, column=0, columnspan=5, sticky="ew", padx=16, pady=(0, 12))
+    for column in range(4):
+        steps_frame.grid_columnconfigure(column, weight=1 if column else 0)
+    ctk.CTkLabel(steps_frame, text="执行步骤:").grid(row=0, column=0, sticky="w", padx=(0, 12), pady=0)
+    ctk.CTkCheckBox(
+        steps_frame,
+        text="生成文案(标题/简介/缩略图)",
+        variable=self._step_generate_var,
+    ).grid(row=0, column=1, sticky="w", padx=(0, 12), pady=0)
+    ctk.CTkCheckBox(
+        steps_frame,
+        text="剪辑视频",
+        variable=self._step_render_var,
+    ).grid(row=0, column=2, sticky="w", padx=(0, 12), pady=0)
+    ctk.CTkCheckBox(
+        steps_frame,
+        text="上传YouTube",
+        variable=self._step_upload_var,
+    ).grid(row=0, column=3, sticky="w", pady=0)
+    ctk.CTkButton(add_frame, text="+ 添加到队列", command=self._add_current_group_to_queue, height=38).grid(
+        row=7, column=0, columnspan=5, sticky="ew", padx=16, pady=(0, 12)
+    )
+
+    table_frame = ctk.CTkFrame(tab)
+    table_frame.grid(row=2, column=0, sticky="nsew", padx=8, pady=8)
+    table_frame.grid_columnconfigure(0, weight=1)
+    ctk.CTkLabel(table_frame, text="运行队列", font=ctk.CTkFont(size=24, weight="bold")).grid(
+        row=0, column=0, sticky="w", padx=16, pady=(14, 10)
+    )
+    header_row = ctk.CTkFrame(table_frame, fg_color="transparent")
+    header_row.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 6))
+    for column, title in enumerate(["序号", "分组", "窗口", "浏览器", "每窗口数量", "API模板", "提示词模板", "视觉模板", "路径模板", "操作"]):
+        header_row.grid_columnconfigure(column, weight=1 if column in {1, 2, 3, 4, 5, 6, 7, 8} else 0)
+        ctk.CTkLabel(header_row, text=title, font=ctk.CTkFont(weight="bold"), anchor="w").grid(
+            row=0, column=column, sticky="w", padx=6, pady=(0, 4)
+        )
+    self.queue_list_frame = ctk.CTkScrollableFrame(table_frame, height=250)
+    self.queue_list_frame.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 14))
+    self.queue_list_frame.grid_columnconfigure(0, weight=1)
+
+    default_frame = ctk.CTkFrame(tab)
+    default_frame.grid(row=3, column=0, sticky="ew", padx=8, pady=8)
+    default_frame.grid_columnconfigure(0, weight=1)
+    toggle_bar = ctk.CTkFrame(default_frame, fg_color="transparent")
+    toggle_bar.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 6))
+    toggle_bar.grid_columnconfigure(0, weight=1)
+    ctk.CTkButton(
+        toggle_bar,
+        textvariable=self.default_rules_toggle_text_var,
+        command=self._toggle_default_rules_panel,
+        anchor="w",
+        fg_color="transparent",
+        hover_color="#24324a",
+    ).grid(row=0, column=0, sticky="ew")
+    self.default_rules_body = ctk.CTkFrame(default_frame, fg_color="transparent")
+    self.default_rules_body.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
+    for column in range(4):
+        self.default_rules_body.grid_columnconfigure(column, weight=1)
+    ctk.CTkLabel(self.default_rules_body, text="可见性").grid(row=0, column=0, sticky="w", padx=(8, 8), pady=(0, 6))
+    ctk.CTkLabel(self.default_rules_body, text="分类").grid(row=0, column=1, sticky="w", padx=8, pady=(0, 6))
+    ctk.CTkLabel(self.default_rules_body, text="儿童内容").grid(row=0, column=2, sticky="w", padx=8, pady=(0, 6))
+    ctk.CTkLabel(self.default_rules_body, text="AI 内容").grid(row=0, column=3, sticky="w", padx=(8, 16), pady=(0, 6))
+    ctk.CTkOptionMenu(
+        self.default_rules_body,
+        variable=self.default_visibility_var,
+        values=VISIBILITY_VALUES,
+        font=_dashboard_theme_font(),
+        dropdown_font=_dashboard_theme_font(),
+    ).grid(row=1, column=0, sticky="ew", padx=(8, 8), pady=(0, 12))
+    ctk.CTkOptionMenu(
+        self.default_rules_body,
+        variable=self.default_category_var,
+        values=CATEGORY_VALUES,
+        font=_dashboard_theme_font(),
+        dropdown_font=_dashboard_theme_font(),
+    ).grid(row=1, column=1, sticky="ew", padx=8, pady=(0, 12))
+    ctk.CTkOptionMenu(
+        self.default_rules_body,
+        variable=self.default_kids_var,
+        values=YES_NO_VALUES,
+        font=_dashboard_theme_font(),
+        dropdown_font=_dashboard_theme_font(),
+    ).grid(row=1, column=2, sticky="ew", padx=8, pady=(0, 12))
+    ctk.CTkOptionMenu(
+        self.default_rules_body,
+        variable=self.default_ai_var,
+        values=YES_NO_VALUES,
+        font=_dashboard_theme_font(),
+        dropdown_font=_dashboard_theme_font(),
+    ).grid(row=1, column=3, sticky="ew", padx=(8, 16), pady=(0, 12))
+    self.schedule_enabled_checkbox = ctk.CTkCheckBox(
+        self.default_rules_body,
+        text="启用定时发布",
+        variable=self.schedule_enabled_var,
+    )
+    self.schedule_enabled_checkbox.grid(row=2, column=0, sticky="w", padx=(8, 8), pady=(0, 8))
+    ctk.CTkCheckBox(
+        self.default_rules_body,
+        text="上传完成后自动关闭窗口",
+        variable=self.upload_auto_close_var,
+    ).grid(row=2, column=1, columnspan=3, sticky="w", padx=8, pady=(0, 8))
+    self.default_schedule_details_frame = ctk.CTkFrame(self.default_rules_body, fg_color="transparent")
+    self.default_schedule_details_frame.grid(row=3, column=0, columnspan=4, sticky="ew", padx=8, pady=(0, 4))
+    for column in range(7):
+        self.default_schedule_details_frame.grid_columnconfigure(column, weight=1 if column in {1, 3, 5} else 0)
+    ctk.CTkLabel(self.default_schedule_details_frame, text="首个发布时间:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 6))
+    ctk.CTkLabel(self.default_schedule_details_frame, text="日期").grid(row=0, column=1, sticky="w", padx=8, pady=(0, 6))
+    ctk.CTkLabel(self.default_schedule_details_frame, text="时间").grid(row=0, column=3, sticky="w", padx=8, pady=(0, 6))
+    ctk.CTkLabel(self.default_schedule_details_frame, text="时区").grid(row=0, column=5, sticky="w", padx=8, pady=(0, 6))
+    self.schedule_date_menu = ctk.CTkOptionMenu(
+        self.default_schedule_details_frame,
+        variable=self.schedule_date_var,
+        values=_schedule_date_values(),
+        font=_dashboard_theme_font(),
+        dropdown_font=_dashboard_theme_font(),
+    )
+    self.schedule_date_menu.grid(row=1, column=1, sticky="ew", padx=8, pady=(0, 10))
+    self.schedule_time_menu = ctk.CTkOptionMenu(
+        self.default_schedule_details_frame,
+        variable=self.schedule_time_var,
+        values=_schedule_time_values(),
+        font=_dashboard_theme_font(),
+        dropdown_font=_dashboard_theme_font(),
+    )
+    self.schedule_time_menu.grid(row=1, column=3, sticky="ew", padx=8, pady=(0, 10))
+    self.schedule_timezone_menu = ctk.CTkOptionMenu(
+        self.default_schedule_details_frame,
+        variable=self.schedule_timezone_var,
+        values=SCHEDULE_TIMEZONE_VALUES,
+        font=_dashboard_theme_font(),
+        dropdown_font=_dashboard_theme_font(),
+    )
+    self.schedule_timezone_menu.grid(row=1, column=5, sticky="ew", padx=8, pady=(0, 10))
+    ctk.CTkLabel(self.default_schedule_details_frame, text="后续间隔:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(0, 6))
+    self.schedule_interval_entry = ctk.CTkEntry(self.default_schedule_details_frame, textvariable=self.schedule_interval_var)
+    self.schedule_interval_entry.grid(row=2, column=1, sticky="ew", padx=8, pady=(0, 6))
+    ctk.CTkLabel(self.default_schedule_details_frame, text="分钟（多个视频依次间隔发布）").grid(
+        row=2, column=2, columnspan=5, sticky="w", padx=8, pady=(0, 6)
+    )
+    self.default_schedule_hint_label = ctk.CTkLabel(
+        self.default_schedule_details_frame,
+        textvariable=self.default_schedule_hint_var,
+        text_color="#9fb2c8",
+        justify="left",
+    )
+    self.default_schedule_hint_label.grid(row=3, column=0, columnspan=7, sticky="w", padx=(0, 8), pady=(0, 10))
+
+    control_frame = ctk.CTkFrame(tab)
+    control_frame.grid(row=3, column=0, sticky="ew", padx=8, pady=(8, 16))
+    for column in range(3):
+        control_frame.grid_columnconfigure(column, weight=1)
+    ctk.CTkButton(control_frame, text="▶ 开始运行", command=self._start_real_flow, height=40).grid(
+        row=0, column=0, sticky="ew", padx=(16, 8), pady=14
+    )
+    self.pause_button = ctk.CTkButton(
+        control_frame,
+        textvariable=self.pause_button_text_var,
+        command=self._toggle_pause_current_task,
+        height=40,
+    )
+    self.pause_button.grid(row=0, column=1, sticky="ew", padx=8, pady=14)
+    self.cancel_button = ctk.CTkButton(
+        control_frame,
+        text="⏹ 取消当前批次",
+        command=self._cancel_current_task,
+        height=40,
+        fg_color="#7a1f1f",
+        hover_color="#932525",
+    )
+    self.cancel_button.grid(row=0, column=2, sticky="ew", padx=(8, 16), pady=14)
+
+    self._refresh_default_rules_panel()
+    self._bind_scroll_frame_wheel(tab, base_tab, tab, add_frame, table_frame, default_frame, control_frame)
+
+
+def _patched_apply_current_group_context_v3(self: DashboardApp, *, preserve_selection: bool) -> None:
+    current_group = str(self.current_group_var.get() or "").strip()
+    live_serials = [
+        int(str(serial).strip())
+        for serial in (getattr(self, "_live_groups", {}) or {}).get(current_group, [])
+        if str(serial).strip().isdigit()
+    ]
+    available_serials = live_serials or [int(info.serial) for info in self.group_catalog.get(current_group, [])]
+    valid_serials = set(available_serials)
+    if preserve_selection:
+        existing = [serial for serial in _dashboard_parse_serials(self.queue_windows_var.get()) if serial in valid_serials]
+        serials = existing or available_serials
+    else:
+        serials = available_serials
+    self.queue_windows_var.set(", ".join(str(serial) for serial in serials))
+
+    self._apply_queue_path_template_selection()
+
+    # 只有在分组真正切换时才自动设置API/提示词模板（不是路径模板变化触发的）
+    prev_group = getattr(self, "_last_applied_group", None)
+    if not preserve_selection or prev_group != current_group:
+        api_name, content_name = self._queue_template_defaults_for_group(current_group)
+        self.queue_api_template_var.set(api_name)
+        self.queue_prompt_template_var.set(content_name)
+    self._last_applied_group = current_group
+
+
+def _on_browser_provider_change_impl(self: DashboardApp) -> None:
+    """处理浏览器管理器切换 — 更新 runtime provider 并刷新分组"""
+    choice = str(self.browser_provider_var.get() or "auto").strip().lower()
+    set_runtime_provider(choice if choice != "auto" else None)
+    self._save_state()
+    self._log(f"[浏览器] 切换到: {choice}")
+    # 同步更新 upload_config.json
+    try:
+        cfg_path = UPLOAD_CONFIG_FILE
+        cfg_data: dict = {}
+        if cfg_path.exists():
+            cfg_data = json.loads(cfg_path.read_text(encoding="utf-8"))
+        if choice == "auto":
+            cfg_data.pop("browser_provider", None)
+            cfg_data.pop("browser_api", None)
+        else:
+            from browser_api import DEFAULT_BROWSER_SETTINGS
+            cfg_data["browser_provider"] = choice
+            defaults = DEFAULT_BROWSER_SETTINGS.get(choice, {})
+            cfg_data["browser_api"] = {
+                "provider": choice,
+                "base_url": defaults.get("base_url", ""),
+                "list_endpoint": defaults.get("list_endpoint", ""),
+                "open_endpoint": defaults.get("open_endpoint", ""),
+                "stop_endpoint": defaults.get("stop_endpoint", ""),
+                "list_payload": defaults.get("list_payload", {}),
+                "open_payload": defaults.get("open_payload", {}),
+                "stop_payload": defaults.get("stop_payload", {}),
+                "open_payload_id_key": defaults.get("open_payload_id_key", ""),
+                "stop_payload_id_key": defaults.get("stop_payload_id_key", ""),
+            }
+        cfg_path.write_text(json.dumps(cfg_data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:
+        self._log(f"[浏览器] 保存配置失败: {exc}")
+
+    # 后台探测可用性并更新状态标签
+    import threading as _thr
+
+    def _probe_and_refresh():
+        try:
+            status_parts: list[str] = []
+            probes = probe_browser_providers()
+            for name, alive in probes.items():
+                status_parts.append(f"{name}: {'在线' if alive else '离线'}")
+            status_text = "  |  ".join(status_parts)
+        except Exception:
+            status_text = ""
+        try:
+            self.after(0, lambda: _update_status(status_text))
+        except RuntimeError:
+            pass
+
+    def _update_status(text: str):
+        label = getattr(self, "_browser_status_label", None)
+        if label is not None:
+            label.configure(text=text)
+        self._refresh_groups()
+
+    _thr.Thread(target=_probe_and_refresh, daemon=True).start()
+
+
+def _patched_refresh_groups_v3(self: DashboardApp) -> None:
+    """刷新分组 — 在后台线程查询浏览器管理器 API，避免阻塞UI"""
+
+    def _bg_query():
+        try:
+            return _build_live_group_catalog_from_browser()
+        except Exception as exc:
+            return {}, {}, str(exc)
+
+    def _apply_result(result):
+        group_catalog, live_groups, browser_error = result
+        self.group_catalog = group_catalog
+        self._live_groups = live_groups
+        groups = list(self.group_catalog.keys()) or list(self._live_groups.keys()) or [""]
+        for attr_name in ("current_group_menu", "prompt_group_menu"):
+            menu = getattr(self, attr_name, None)
+            if menu is not None:
+                menu.configure(values=groups)
+        if self.current_group_var.get() not in groups:
+            self.current_group_var.set(groups[0])
+        if self.prompt_group_var.get() not in groups:
+            self.prompt_group_var.set(self.current_group_var.get())
+        self._apply_current_group_context(preserve_selection=True)
+        self._refresh_queue_display()
+        self._save_state()
+        if browser_error is not None:
+            provider_name = get_runtime_provider() or "auto"
+            self._log(f"[分组] 浏览器管理器({provider_name})实时读取失败，已回退到配置文件: {browser_error}")
+
+    import threading as _thr
+
+    def _worker():
+        result = _bg_query()
+        try:
+            self.after(0, lambda: _apply_result(result))
+        except RuntimeError:
+            # tkinter 主循环未运行时（如测试环境），仅更新数据不操作GUI
+            group_catalog, live_groups, _ = result
+            self.group_catalog = group_catalog
+            self._live_groups = live_groups
+
+    _thr.Thread(target=_worker, daemon=True).start()
+
+
+def _patched_refresh_queue_display_v3(self: DashboardApp) -> None:
+    if self.queue_list_frame is None:
+        return
+    for child in self.queue_list_frame.winfo_children():
+        child.destroy()
+    if self.run_queue.is_empty():
+        ctk.CTkLabel(self.queue_list_frame, text="队列为空，请在上方添加分组任务", text_color="#9fb2c8").pack(
+            anchor="w",
+            padx=12,
+            pady=12,
+        )
+        return
+    for summary in self.run_queue.get_summary():
+        row = ctk.CTkFrame(self.queue_list_frame)
+        row.pack(fill="x", padx=4, pady=4)
+        for column in range(10):
+            row.grid_columnconfigure(column, weight=1 if column in {1, 2, 3, 4, 5, 6, 7, 8} else 0)
+        ctk.CTkLabel(row, text=str(summary["index"] + 1), anchor="w").grid(row=0, column=0, sticky="w", padx=6, pady=8)
+        ctk.CTkLabel(row, text=summary["group_tag"], anchor="w").grid(row=0, column=1, sticky="w", padx=6, pady=8)
+        ctk.CTkLabel(row, text=summary["window_serials_text"], anchor="w").grid(row=0, column=2, sticky="w", padx=6, pady=8)
+        ctk.CTkLabel(row, text=summary.get("browser_provider", "auto"), anchor="w").grid(row=0, column=3, sticky="w", padx=6, pady=8)
+        ctk.CTkLabel(row, text=str(summary["videos_per_window"]), anchor="w").grid(row=0, column=4, sticky="w", padx=6, pady=8)
+        ctk.CTkLabel(row, text=summary["api_template"], anchor="w").grid(row=0, column=5, sticky="w", padx=6, pady=8)
+        ctk.CTkLabel(row, text=summary["prompt_template"], anchor="w").grid(row=0, column=6, sticky="w", padx=6, pady=8)
+        ctk.CTkLabel(row, text=summary["visual_mode"], anchor="w").grid(row=0, column=7, sticky="w", padx=6, pady=8)
+        ctk.CTkLabel(row, text=summary["path_template"], anchor="w").grid(row=0, column=8, sticky="w", padx=6, pady=8)
+        action_bar = ctk.CTkFrame(row, fg_color="transparent")
+        action_bar.grid(row=0, column=9, sticky="e", padx=6, pady=8)
+        ctk.CTkButton(action_bar, text="设置", width=72, command=lambda index=summary["index"]: self._open_window_override_dialog(index)).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(
+            action_bar,
+            text="删除",
+            width=72,
+            command=lambda index=summary["index"]: self._remove_queue_job(index),
+            fg_color="#7a1f1f",
+            hover_color="#932525",
+        ).pack(side="left")
+
+
+def _patched_add_current_group_to_queue_v3(self: DashboardApp) -> None:
+    current_group = str(self.current_group_var.get() or "").strip()
+    if not current_group:
+        messagebox.showerror("无法加入队列", "请先选择一个分组。")
+        return
+    selected_serials = _dashboard_parse_serials(self.queue_windows_var.get())
+    if not selected_serials:
+        messagebox.showerror("无法加入队列", "请先填写至少一个窗口号。")
+        return
+
+    visual_mode = _visual_mode_to_value(self.queue_visual_mode_var.get())
+    visual_settings: dict[str, Any] | None = None
+    if visual_mode == "manual":
+        visual_settings = dict(self._collect_visual_settings())
+    elif visual_mode not in {"random", "manual"}:
+        visual_settings = dict(self.visual_presets.get(visual_mode) or {})
+
+    path_name, path_template = get_path_template(self.queue_path_template_var.get(), templates=self.path_templates)
+    resolved_source = str(self.source_dir_override_var.get() or "").strip() or resolve_source_dir(path_template, group_tag=current_group)
+    selected_modules = self._module_names_for_new_job()
+    selected_steps: list[str] = []
+    if "metadata" in selected_modules:
+        selected_steps.append("generate")
+    if "render" in selected_modules:
+        selected_steps.append("render")
+    if "upload" in selected_modules:
+        selected_steps.append("upload")
+    try:
+        videos_per_window = max(1, int(str(self.queue_videos_per_window_var.get() or "1").strip() or "1"))
+    except ValueError:
+        videos_per_window = 1
+    self.queue_videos_per_window_var.set(str(videos_per_window))
+    browser_provider = str(self.browser_provider_var.get() or "auto").strip().lower() or "auto"
+    job = GroupJob(
+        group_tag=current_group,
+        window_serials=selected_serials,
+        source_dir=resolved_source,
+        prompt_template=str(self.queue_prompt_template_var.get() or "default").strip() or "default",
+        api_template=str(self.queue_api_template_var.get() or "default").strip() or "default",
+        visual_mode=visual_mode,
+        visual_settings=visual_settings,
+        path_template=path_name,
+        videos_per_window=videos_per_window,
+        upload_defaults=self._current_upload_defaults_model(),
+        steps=selected_steps,
+        modules=selected_modules,
+        browser_provider=browser_provider,
+    )
+    self.run_queue.add_job(job)
+    self._apply_current_group_context(preserve_selection=False)
+    self._refresh_task_tree()
+
+
+def _patched_window_default_values_v3(self: DashboardApp, job: GroupJob, serial: int) -> dict[str, str]:
+    info = self._find_window_info(job.group_tag, serial)
+    defaults = self._current_upload_defaults_model()
+    override = job.get_window_override(serial)
+    visibility = str((override.visibility if override and override.visibility else defaults.visibility) or "private").strip() or "private"
+    category = str((override.category if override and override.category else defaults.category) or "Music").strip() or "Music"
+    kids = str((override.kids_content if override and override.kids_content else _yes_no_from_bool(defaults.is_for_kids)) or "no").strip() or "no"
+    ai = str((override.ai_content if override and override.ai_content else (defaults.ai_content or defaults.altered_content or "yes")) or "yes").strip() or "yes"
+    schedule_mode, schedule_date, schedule_time, _ = _resolve_window_schedule_override(override, defaults, visibility)
+    ypp = str((override.ypp if override and override.ypp else _yes_no_from_bool(bool(info.is_ypp))) or "no").strip() or "no"
+    return {
+        "ypp": ypp,
+        "visibility": visibility,
+        "category": category,
+        "kids_content": kids,
+        "ai_content": ai,
+        "schedule_mode": schedule_mode,
+        "schedule_date": schedule_date or str(defaults.schedule_date or "").strip() or _default_schedule_date(),
+        "schedule_time": schedule_time or str(defaults.schedule_time or "").strip() or "06:00",
+    }
+
+
+def _patched_open_window_override_dialog_v3(self: DashboardApp, index: int) -> None:
+    if index < 0 or index >= len(self.run_queue.jobs):
+        return
+    job = self.run_queue.jobs[index]
+    dialog = ctk.CTkToplevel(self)
+    dialog.title(f"单独设置 - {job.group_tag}")
+    dialog.geometry("1180x480")
+    dialog.transient(self)
+    dialog.grab_set()
+    dialog.grid_columnconfigure(0, weight=1)
+    dialog.grid_rowconfigure(1, weight=1)
+    ctk.CTkLabel(
+        dialog,
+        text=f"分组: {job.group_tag}  |  窗口: {', '.join(str(item) for item in job.window_serials)}",
+        font=ctk.CTkFont(size=18, weight="bold"),
+    ).grid(row=0, column=0, sticky="w", padx=16, pady=(16, 10))
+
+    table = ctk.CTkScrollableFrame(dialog)
+    table.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
+    for column in range(9):
+        table.grid_columnconfigure(column, weight=1)
+    headers = ["窗口", "YPP", "可见性", "分类", "儿童内容", "AI 内容", "定时发布", "日期", "时间"]
+    for column, title in enumerate(headers):
+        ctk.CTkLabel(table, text=title, font=ctk.CTkFont(weight="bold")).grid(row=0, column=column, sticky="w", padx=6, pady=(4, 8))
+
+    row_contexts: dict[int, dict[str, Any]] = {}
+    default_cache = {serial: self._window_default_values(job, serial) for serial in job.window_serials}
+
+    def refresh_row(serial: int) -> None:
+        context = row_contexts[serial]
+        if context["updating"]:
+            return
+        context["updating"] = True
+        try:
+            visibility = str(context["vars"]["visibility"].get() or "").strip()
+            mode_value = _window_schedule_mode_to_value(context["vars"]["schedule_mode"].get())
+            default_visibility = str(default_cache[serial]["visibility"] or "private").strip() or "private"
+            fallback_visibility = default_visibility if default_visibility != "schedule" else "private"
+
+            if visibility == "schedule" and mode_value == "none":
+                context["vars"]["schedule_mode"].set(_window_schedule_mode_to_choice("default"))
+                mode_value = "default"
+            elif visibility != "schedule" and mode_value != "none":
+                context["vars"]["schedule_mode"].set(_window_schedule_mode_to_choice("none"))
+                mode_value = "none"
+
+            if mode_value in {"default", "custom"} and visibility != "schedule":
+                context["vars"]["visibility"].set("schedule")
+                visibility = "schedule"
+            elif mode_value == "none" and visibility == "schedule":
+                context["vars"]["visibility"].set(fallback_visibility)
+                visibility = fallback_visibility
+
+            if mode_value == "custom":
+                if not str(context["vars"]["schedule_date"].get() or "").strip():
+                    context["vars"]["schedule_date"].set(default_cache[serial]["schedule_date"])
+                if not str(context["vars"]["schedule_time"].get() or "").strip():
+                    context["vars"]["schedule_time"].set(default_cache[serial]["schedule_time"])
+
+            widget_state = "normal" if mode_value == "custom" and visibility == "schedule" else "disabled"
+            context["date_widget"].configure(state=widget_state)
+            context["time_widget"].configure(state=widget_state)
+        finally:
+            context["updating"] = False
+
+    for row_index, serial in enumerate(job.window_serials, start=1):
+        defaults = default_cache[serial]
+        ctk.CTkLabel(table, text=str(serial)).grid(row=row_index, column=0, sticky="w", padx=6, pady=6)
+        vars_for_row = {
+            "ypp": ctk.StringVar(value=defaults["ypp"]),
+            "visibility": ctk.StringVar(value=defaults["visibility"]),
+            "category": ctk.StringVar(value=defaults["category"]),
+            "kids_content": ctk.StringVar(value=defaults["kids_content"]),
+            "ai_content": ctk.StringVar(value=defaults["ai_content"]),
+            "schedule_mode": ctk.StringVar(value=_window_schedule_mode_to_choice(defaults["schedule_mode"])),
+            "schedule_date": ctk.StringVar(value=defaults["schedule_date"]),
+            "schedule_time": ctk.StringVar(value=defaults["schedule_time"]),
+        }
+        widgets = [
+            ctk.CTkOptionMenu(table, variable=vars_for_row["ypp"], values=YES_NO_VALUES, font=_dashboard_theme_font(), dropdown_font=_dashboard_theme_font()),
+            ctk.CTkOptionMenu(table, variable=vars_for_row["visibility"], values=VISIBILITY_VALUES, font=_dashboard_theme_font(), dropdown_font=_dashboard_theme_font()),
+            ctk.CTkOptionMenu(table, variable=vars_for_row["category"], values=CATEGORY_VALUES, font=_dashboard_theme_font(), dropdown_font=_dashboard_theme_font()),
+            ctk.CTkOptionMenu(table, variable=vars_for_row["kids_content"], values=YES_NO_VALUES, font=_dashboard_theme_font(), dropdown_font=_dashboard_theme_font()),
+            ctk.CTkOptionMenu(table, variable=vars_for_row["ai_content"], values=YES_NO_VALUES, font=_dashboard_theme_font(), dropdown_font=_dashboard_theme_font()),
+            ctk.CTkOptionMenu(table, variable=vars_for_row["schedule_mode"], values=WINDOW_SCHEDULE_MODE_VALUES, font=_dashboard_theme_font(), dropdown_font=_dashboard_theme_font()),
+            ctk.CTkOptionMenu(table, variable=vars_for_row["schedule_date"], values=_schedule_date_values(), font=_dashboard_theme_font(), dropdown_font=_dashboard_theme_font()),
+            ctk.CTkOptionMenu(table, variable=vars_for_row["schedule_time"], values=_schedule_time_values(), font=_dashboard_theme_font(), dropdown_font=_dashboard_theme_font()),
+        ]
+        for column, widget in enumerate(widgets, start=1):
+            widget.grid(row=row_index, column=column, sticky="ew", padx=6, pady=6)
+        row_contexts[serial] = {
+            "vars": vars_for_row,
+            "date_widget": widgets[6],
+            "time_widget": widgets[7],
+            "updating": False,
+        }
+        vars_for_row["visibility"].trace_add("write", lambda *_args, serial=serial: refresh_row(serial))
+        vars_for_row["schedule_mode"].trace_add("write", lambda *_args, serial=serial: refresh_row(serial))
+        refresh_row(serial)
+
+    def reset_to_defaults() -> None:
+        for serial, context in row_contexts.items():
+            defaults = default_cache[serial]
+            context["vars"]["ypp"].set(defaults["ypp"])
+            context["vars"]["visibility"].set(defaults["visibility"])
+            context["vars"]["category"].set(defaults["category"])
+            context["vars"]["kids_content"].set(defaults["kids_content"])
+            context["vars"]["ai_content"].set(defaults["ai_content"])
+            context["vars"]["schedule_mode"].set(_window_schedule_mode_to_choice(defaults["schedule_mode"]))
+            context["vars"]["schedule_date"].set(defaults["schedule_date"])
+            context["vars"]["schedule_time"].set(defaults["schedule_time"])
+            refresh_row(serial)
+
+    def save_dialog() -> None:
+        job.clear_window_overrides()
+        for serial, context in row_contexts.items():
+            defaults = default_cache[serial]
+            vars_for_row = context["vars"]
+            visibility = str(vars_for_row["visibility"].get() or "").strip()
+            schedule_mode = _window_schedule_mode_to_value(vars_for_row["schedule_mode"].get())
+            schedule_date = str(vars_for_row["schedule_date"].get() or "").strip()
+            schedule_time = str(vars_for_row["schedule_time"].get() or "").strip()
+            if visibility != "schedule":
+                schedule_mode = "none"
+                schedule_date = ""
+                schedule_time = ""
+            elif schedule_mode != "custom":
+                schedule_date = ""
+                schedule_time = ""
+            override = WindowOverride(
+                serial=int(serial),
+                ypp="" if vars_for_row["ypp"].get() == defaults["ypp"] else vars_for_row["ypp"].get(),
+                visibility="" if visibility == defaults["visibility"] else visibility,
+                category="" if vars_for_row["category"].get() == defaults["category"] else vars_for_row["category"].get(),
+                kids_content="" if vars_for_row["kids_content"].get() == defaults["kids_content"] else vars_for_row["kids_content"].get(),
+                ai_content="" if vars_for_row["ai_content"].get() == defaults["ai_content"] else vars_for_row["ai_content"].get(),
+                schedule_mode="" if schedule_mode == defaults["schedule_mode"] else schedule_mode,
+                schedule_date="" if schedule_date == defaults["schedule_date"] else schedule_date,
+                schedule_time="" if schedule_time == defaults["schedule_time"] else schedule_time,
+            )
+            job.set_window_override(override)
+        dialog.destroy()
+        self._refresh_task_tree()
+
+    button_bar = ctk.CTkFrame(dialog, fg_color="transparent")
+    button_bar.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 16))
+    ctk.CTkButton(button_bar, text="全部使用默认值", command=reset_to_defaults).pack(side="left", padx=6)
+    ctk.CTkButton(button_bar, text="确定", command=save_dialog).pack(side="left", padx=6)
+    ctk.CTkButton(button_bar, text="取消", command=dialog.destroy).pack(side="left", padx=6)
+
+
+def _patched_build_window_tasks_from_job_v3(self: DashboardApp, job: GroupJob) -> list[WindowTask]:
+    upload_defaults = UploadDefaults.from_dict(self._current_upload_defaults_model().to_dict())
+    if job.upload_defaults:
+        upload_defaults = UploadDefaults.from_dict(job.upload_defaults.to_dict())
+    notify_subscribers = bool(self.default_notify_var.get())
+    tasks: list[WindowTask] = []
+    seen_serials: set[int] = set()
+    quantity = max(1, int(job.videos_per_window or 1))
+    for raw_serial in job.window_serials:
+        serial = int(raw_serial)
+        if serial in seen_serials:
+            continue
+        seen_serials.add(serial)
+        info = self._find_window_info(job.group_tag, serial)
+        override = job.get_window_override(serial)
+        visibility = str((override.visibility if override and override.visibility else upload_defaults.visibility) or "private").strip() or "private"
+        category = str((override.category if override and override.category else upload_defaults.category) or "Music").strip() or "Music"
+        kids_value = override.kids_content if override and override.kids_content else _yes_no_from_bool(upload_defaults.is_for_kids)
+        ai_value = override.ai_content if override and override.ai_content else (upload_defaults.ai_content or upload_defaults.altered_content or "yes")
+        _schedule_mode, _schedule_date, _schedule_time, schedule_text = _resolve_window_schedule_override(override, upload_defaults, visibility)
+        tasks.append(
+            create_task(
+                tag=job.group_tag,
+                serial=serial,
+                quantity=quantity,
+                is_ypp=_bool_from_yes_no(override.ypp) if override and str(override.ypp or "").strip() else bool(info.is_ypp),
+                title="",
+                visibility=visibility,
+                category=category,
+                made_for_kids=_bool_from_yes_no(kids_value),
+                altered_content=_bool_from_yes_no(ai_value),
+                notify_subscribers=notify_subscribers,
+                scheduled_publish_at=schedule_text,
+                schedule_timezone=str(upload_defaults.timezone or "").strip() if schedule_text else "",
+                source_dir=str(job.source_dir or "").strip(),
+                channel_name=info.channel_name,
+            )
+        )
+    return tasks
+
+
+def _patched_start_real_flow_v3(self: DashboardApp) -> None:
+    if self.run_queue.is_empty():
+        messagebox.showerror("无法开始运行", "队列为空，请先添加至少一个分组任务。")
+        return
+    self._refresh_task_tree()
+    if not self.window_tasks:
+        messagebox.showerror("无法开始运行", "队列中没有有效的窗口任务。")
+        return
+
+    queue_defaults = self._current_upload_defaults_model()
+    effective_jobs = self._effective_run_queue_jobs()
+    tracking_plan = self._build_tracking_plan_for_queue()
+    runtime_config = self._runtime_config_for_job(effective_jobs[0])
+    self._persist_prompt_form_for_active_tasks()
+    self._write_run_snapshot(config=runtime_config, run_plan=tracking_plan)
+    self._prepare_run_result_tracking(tracking_plan)
+
+    def handle_queue_progress(event: dict[str, Any]) -> None:
+        event_type = str(event.get("type") or "").strip()
+        if not event_type:
+            return
+        if event_type == "log":
+            message = str(event.get("message") or "").strip()
+            if message:
+                self._log(message)
+            return
+
+        group_tag = str(event.get("group_tag") or "").strip()
+        label = str(event.get("label") or "").strip()
+        serial_value = int(event.get("serial") or 0)
+        slot_index = int(event.get("slot_index") or 1)
+        total_slots = int(event.get("total_slots") or 1)
+
+        if event_type == "job_started":
+            self._run_phase = f"队列 {event.get('job_index', 0)}/{event.get('job_total', 0)}"
+            self._run_current_item = f"{group_tag} | {int(event.get('window_count') or 0)} 个窗口"
+            self._run_current_ratio = 0.0
+            self._log(f"[队列] {event.get('job_index', 0)}/{event.get('job_total', 0)} -> {group_tag} | windows={event.get('window_serials', [])}")
+            return
+        if event_type == "prepare_started":
+            self._run_phase = "生成文案 / 渲染"
+            self._run_current_item = f"{group_tag} | 准备上传素材"
+            self._run_current_ratio = 0.0
+            return
+        if event_type == "prepare_finished":
+            self._run_phase = "准备完成"
+            self._run_current_item = f"{group_tag} | 等待上传"
+            self._run_current_ratio = 0.0
+            return
+        if event_type == "window_started":
+            if label and not bool(event.get("has_prepare_step", True)):
+                self._run_progress_step_done(label, "render")
+            if group_tag and serial_value:
+                self._mark_run_stage(
+                    group_tag,
+                    serial_value,
+                    "upload",
+                    "running",
+                    "上传中",
+                    slot_index=slot_index,
+                    total_slots=total_slots,
+                )
+            slot_suffix = f" [{slot_index}/{total_slots}]" if total_slots > 1 else ""
+            self._run_phase = "上传"
+            self._run_current_item = f"{group_tag} / 窗口 {serial_value}{slot_suffix}"
+            self._run_current_ratio = 0.0
+            return
+        if event_type == "window_finished":
+            detail = str(event.get("detail") or event.get("stage") or "").strip()
+            if group_tag and serial_value:
+                self._mark_run_stage(
+                    group_tag,
+                    serial_value,
+                    "upload",
+                    "success" if bool(event.get("success")) else "failed",
+                    detail,
+                    slot_index=slot_index,
+                    total_slots=total_slots,
+                )
+            if label:
+                self._run_progress_step_done(label, "upload")
+            slot_suffix = f" [{slot_index}/{total_slots}]" if total_slots > 1 else ""
+            self._run_phase = "上传完成" if bool(event.get("success")) else "上传失败"
+            self._run_current_item = f"{group_tag} / 窗口 {serial_value}{slot_suffix} | {detail or '完成'}"
+            self._run_current_ratio = 0.0
+            return
+        if event_type == "group_finished":
+            self._run_phase = "分组完成"
+            self._run_current_item = f"{group_tag} | success={int(event.get('success_count') or 0)} | failed={int(event.get('failed_count') or 0)}"
+            return
+        if event_type == "job_error":
+            self._run_phase = "分组失败"
+            self._run_current_item = f"{group_tag} | {str(event.get('detail') or '').strip()}"
+
+    def job() -> bool:
+        queue_results = asyncio.run(
+            execute_run_queue(
+                self.run_queue,
+                queue_defaults,
+                control=self.execution_control,
+                before_job_callback=self._apply_job_prompt_bindings,
+                build_run_plan_for_job=lambda queue_job: self._build_run_plan_for_job(queue_job),
+                execution_result_callback=lambda _job, execution: self._ingest_execution_result(execution),
+                progress_callback=handle_queue_progress,
+                log=self._log,
+            )
+        )
+        if self._cancel_requested:
+            return False
+        failures: list[str] = []
+        for job_result in queue_results:
+            for item in job_result.get("results", []) or []:
+                if bool(item.get("success")):
+                    continue
+                detail = str(item.get("detail") or item.get("stage") or "upload failed").strip()
+                if detail and detail not in failures:
+                    failures.append(detail)
+        if failures:
+            raise RuntimeError(" | ".join(failures[:3]))
+        return False
+
+    task_name = " + ".join(tracking_plan.modules.labels()) or "RunQueue"
+    self._run_background(
+        job,
+        task_name=task_name,
+        total_items=len(tracking_plan.tasks),
+        include_upload=bool(tracking_plan.modules.upload and (tracking_plan.modules.metadata or tracking_plan.modules.render)),
+    )
+
+
+DashboardApp.__init__ = _patched_dashboard_init_v2
+DashboardApp.destroy = _patched_dashboard_destroy_v2
+DashboardApp._setup_cjk_font = _patched_setup_cjk_font_v2
+DashboardApp._apply_cjk_font_to_widgets = _patched_apply_cjk_font_to_widgets_v2
+DashboardApp._build_variables = _patched_build_variables_v2
+DashboardApp._bind_variable_events = _patched_bind_variable_events_v2
+DashboardApp._save_state = _patched_save_state_v2
+DashboardApp._refresh_bindings_box = _patched_refresh_bindings_box_v2
+DashboardApp._module_names_for_new_job = _patched_module_names_for_new_job_v2
+DashboardApp._run_background = _patched_run_background_v2
+DashboardApp._apply_run_status = _patched_apply_run_status_v2
+DashboardApp._start_run_tracking = _patched_start_run_tracking_v2
+DashboardApp._finish_run_tracking = _patched_finish_run_tracking_v2
+DashboardApp._build_layout = _patched_build_layout_v2
+DashboardApp._build_upload_tab = _patched_build_upload_tab_v3
+DashboardApp._build_prompt_tab = _patched_build_prompt_tab_v2
+DashboardApp._build_paths_tab = _patched_build_paths_tab_v2
+DashboardApp._build_visual_tab = _patched_build_visual_tab_v2
+DashboardApp._build_log_tab = _patched_build_log_tab_v2
+DashboardApp._refresh_default_rules_panel = _patched_refresh_default_rules_panel_v2
+DashboardApp._refresh_schedule_controls = _patched_refresh_schedule_controls_v3
+DashboardApp._toggle_default_rules_panel = _patched_toggle_default_rules_panel_v2
+DashboardApp._browse_directory_var = _patched_browse_directory_var_v2
+DashboardApp._refresh_path_template_controls = _patched_refresh_path_template_controls_v2
+DashboardApp._load_path_template_into_editor = _patched_load_path_template_into_editor_v2
+DashboardApp._on_path_template_listbox_select = _patched_on_path_template_listbox_select_v2
+DashboardApp._new_path_template = _patched_new_path_template_v2
+DashboardApp._save_current_path_template = _patched_save_current_path_template_v2
+DashboardApp._delete_current_path_template = _patched_delete_current_path_template_v2
+DashboardApp._apply_queue_path_template_selection = _patched_apply_queue_path_template_selection_v1
+DashboardApp._on_queue_path_template_change = _patched_on_queue_path_template_change_v2
+DashboardApp._apply_current_group_context = _patched_apply_current_group_context_v3
+DashboardApp._refresh_groups = _patched_refresh_groups_v3
+DashboardApp._on_browser_provider_change = _on_browser_provider_change_impl
+DashboardApp._remove_queue_job = _patched_remove_queue_job_v2
+DashboardApp._refresh_queue_display = _patched_refresh_queue_display_v3
+DashboardApp._add_current_group_to_queue = _patched_add_current_group_to_queue_v3
+DashboardApp._window_default_values = _patched_window_default_values_v3
+DashboardApp._open_window_override_dialog = _patched_open_window_override_dialog_v3
+DashboardApp._build_window_tasks_from_job = _patched_build_window_tasks_from_job_v3
+DashboardApp._runtime_config_for_job = _patched_runtime_config_for_job_v2
+DashboardApp._build_run_plan_for_job = _patched_build_run_plan_for_job_v2
+DashboardApp._build_tracking_plan_for_queue = _patched_build_tracking_plan_for_queue_v2
+DashboardApp._preview_plan = _patched_preview_plan_v2
+DashboardApp._on_visual_preset_change = _patched_on_visual_preset_change_v2
+DashboardApp._save_current_visual_preset = _patched_save_current_visual_preset_v2
+DashboardApp._delete_selected_visual_preset = _patched_delete_selected_visual_preset_v2
+DashboardApp._save_visual_settings = _patched_save_visual_settings_v2
+DashboardApp._apply_visual_preset_mega_bass = _patched_apply_visual_preset_mega_bass_v2
+DashboardApp._start_real_flow = _patched_start_real_flow_v3
 
 
 def main() -> int:

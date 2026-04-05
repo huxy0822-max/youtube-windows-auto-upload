@@ -1,4 +1,5 @@
-﻿from __future__ import annotations
+# -*- coding: utf-8 -*-
+from __future__ import annotations
 
 import json
 import os
@@ -34,8 +35,14 @@ from daily_scheduler import (
     mark_complete,
 )
 from effects_library import get_effect
-from group_upload_workflow import IMAGE_EXTENSIONS, load_channel_name_map, normalize_mmdd
-from metadata_service import get_used_metadata_scope, record_used_metadata
+try:
+    from group_upload_workflow import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, load_channel_name_map
+except ImportError:
+    VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm"}
+    IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+    def load_channel_name_map(*_args, **_kwargs):  # type: ignore[misc]
+        return {}
+from metadata_service import BatchDedup, get_used_metadata_scope, record_used_metadata
 from path_helpers import normalize_scheduler_config
 from prompt_studio import (
     default_api_preset,
@@ -53,6 +60,7 @@ SCRIPT_DIR = Path(__file__).parent
 SCHEDULER_CONFIG_FILE = SCRIPT_DIR / "scheduler_config.json"
 PROMPT_STUDIO_FILE = SCRIPT_DIR / "config" / "prompt_studio.json"
 CHANNEL_MAPPING_FILE = SCRIPT_DIR / "config" / "channel_mapping.json"
+VISUAL_PRESETS_FILE = SCRIPT_DIR / "config" / "visual_presets.json"
 
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
 PROGRESS_INTERVAL_SECONDS = 3.0
@@ -109,7 +117,12 @@ class ExecutionControl:
 
 
 def _suspend_process(pid: int) -> None:
-    if pid <= 0 or os.name != "nt":
+    if pid <= 0:
+        return
+    if os.name != "nt":
+        # macOS / Linux: 用 SIGSTOP 暂停进程
+        import signal
+        os.kill(pid, signal.SIGSTOP)
         return
     import ctypes
     from ctypes import wintypes
@@ -127,7 +140,12 @@ def _suspend_process(pid: int) -> None:
 
 
 def _resume_process(pid: int) -> None:
-    if pid <= 0 or os.name != "nt":
+    if pid <= 0:
+        return
+    if os.name != "nt":
+        # macOS / Linux: 用 SIGCONT 恢复进程
+        import signal
+        os.kill(pid, signal.SIGCONT)
         return
     import ctypes
     from ctypes import wintypes
@@ -270,10 +288,148 @@ def _coerce_float(value: Any, default: float) -> float:
         return default
 
 
+def _parse_toggle(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    if not text:
+        return default
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _visual_preset_token(name: str) -> str:
+    text = str(name or "").strip()
+    if not text or text.lower() == "none":
+        return "none"
+    snake = re.sub(r"(?<!^)(?=[A-Z])", "_", text).replace(" ", "_").lower()
+    if snake in {"megabass", "mega_bass"}:
+        return "mega_bass"
+    return snake
+
+
+def _load_visual_presets() -> dict[str, dict[str, Any]]:
+    raw = _read_json(VISUAL_PRESETS_FILE, {})
+    presets: dict[str, dict[str, Any]] = {}
+    for name, payload in raw.items():
+        clean_name = str(name or "").strip()
+        if clean_name and isinstance(payload, dict):
+            presets[clean_name] = dict(payload)
+    return presets
+
+
+def _normalize_visual_metric(value: Any, default: int, *, reference: int) -> int:
+    text = str(value or "").strip()
+    if not text:
+        return default
+    try:
+        number = float(text)
+    except Exception:
+        return _coerce_int(text, default)
+    if number == -1:
+        return -1
+    if "." in text and -1.0 < number <= 1.0:
+        return int(round(number * reference))
+    return int(round(number))
+
+
+def _resolve_effective_visual_settings(defaults: WorkflowDefaults) -> dict[str, Any]:
+    raw_settings = dict(defaults.visual_settings or {})
+    visual_mode = str(
+        raw_settings.get("visual_mode")
+        or raw_settings.get("preset")
+        or raw_settings.get("preset_name")
+        or "manual"
+    ).strip() or "manual"
+    if visual_mode == "random":
+        settings = dict(raw_settings)
+        settings["preset"] = "none"
+        settings["visual_mode"] = "random"
+        for key in (
+            "zoom",
+            "style",
+            "color_spectrum",
+            "color_timeline",
+            "color_tint",
+            "particle",
+            "text_font",
+            "text_pos",
+            "text_style",
+        ):
+            settings[key] = "random"
+        return settings
+    if visual_mode not in {"manual", "none"}:
+        preset_payload = dict(_load_visual_presets().get(visual_mode) or {})
+        if not preset_payload:
+            preset_payload = dict(raw_settings)
+        spectrum_raw = str(preset_payload.get("spectrum") or "").strip()
+        spectrum_toggle = (
+            _parse_toggle(spectrum_raw, True)
+            if spectrum_raw.lower() in {"0", "1", "true", "false", "yes", "no", "on", "off"}
+            else True
+        )
+        style_value = str(preset_payload.get("style") or "").strip()
+        if not style_value and spectrum_raw.lower() not in {"", "0", "1", "true", "false", "yes", "no", "on", "off"}:
+            style_value = spectrum_raw
+        particle_value = str(
+            preset_payload.get("particles") or preset_payload.get("particle") or "none"
+        ).strip()
+        bass_pulse = _parse_toggle(preset_payload.get("bass_pulse"), False)
+        if particle_value == "bass_pulse":
+            particle_value = "none"
+            bass_pulse = True
+        return {
+            "preset": visual_mode,
+            "visual_mode": visual_mode,
+            "spectrum": spectrum_toggle,
+            "timeline": _parse_toggle(preset_payload.get("timeline"), True),
+            "letterbox": _parse_toggle(preset_payload.get("letterbox"), False),
+            "zoom": str(preset_payload.get("zoom") or "normal").strip() or "normal",
+            "style": style_value or "bar",
+            "color_spectrum": str(
+                preset_payload.get("color_spectrum") or preset_payload.get("tint") or "WhiteGold"
+            ).strip() or "WhiteGold",
+            "color_timeline": str(
+                preset_payload.get("color_timeline") or preset_payload.get("tint") or "WhiteGold"
+            ).strip() or "WhiteGold",
+            "spectrum_y": _normalize_visual_metric(preset_payload.get("spectrum_y"), 530, reference=1080),
+            "spectrum_x": _normalize_visual_metric(preset_payload.get("spectrum_x"), -1, reference=1920),
+            "spectrum_w": _normalize_visual_metric(preset_payload.get("spectrum_w"), 1200, reference=1920),
+            "film_grain": _parse_toggle(preset_payload.get("film_grain"), False),
+            "grain_strength": str(preset_payload.get("grain_strength") or "15").strip() or "15",
+            "vignette": _parse_toggle(preset_payload.get("vignette"), False),
+            "color_tint": str(
+                preset_payload.get("color_tint") or preset_payload.get("tint") or "none"
+            ).strip() or "none",
+            "soft_focus": _parse_toggle(preset_payload.get("soft_focus"), False),
+            "soft_focus_sigma": str(preset_payload.get("soft_focus_sigma") or "1.5").strip() or "1.5",
+            "particle": particle_value or "none",
+            "particle_opacity": str(preset_payload.get("particle_opacity") or "0.6").strip() or "0.6",
+            "particle_speed": str(preset_payload.get("particle_speed") or "1.0").strip() or "1.0",
+            "text": str(preset_payload.get("sticker") or preset_payload.get("text") or "").strip(),
+            "text_font": str(preset_payload.get("text_font") or "default").strip() or "default",
+            "text_pos": str(preset_payload.get("text_pos") or "center").strip() or "center",
+            "text_size": str(preset_payload.get("text_size") or "60").strip() or "60",
+            "text_style": str(preset_payload.get("text_style") or "Classic").strip() or "Classic",
+            "bass_pulse": bass_pulse,
+            "bass_pulse_scale": str(preset_payload.get("bass_pulse_scale") or "0.03").strip() or "0.03",
+            "bass_pulse_brightness": str(
+                preset_payload.get("bass_pulse_brightness") or "0.04"
+            ).strip() or "0.04",
+        }
+    settings = dict(raw_settings)
+    settings["preset"] = "none"
+    settings["visual_mode"] = "manual"
+    return settings
+
+
 def _build_render_options_from_defaults(defaults: WorkflowDefaults) -> RenderOptions:
-    settings = defaults.visual_settings or {}
+    settings = _resolve_effective_visual_settings(defaults)
     opts = RenderOptions()
-    opts.fx_randomize = False
+    opts.fx_randomize = str(settings.get("visual_mode") or "").strip().lower() == "random"
 
     opts.fx_spectrum = bool(settings.get("spectrum", True))
     opts.fx_timeline = bool(settings.get("timeline", True))
@@ -299,7 +455,7 @@ def _build_render_options_from_defaults(defaults: WorkflowDefaults) -> RenderOpt
     opts.fx_text_pos = str(settings.get("text_pos", "center") or "center")
     opts.fx_text_size = settings.get("text_size", 60)
     opts.fx_text_style = str(settings.get("text_style", "Classic") or "Classic")
-    opts.fx_visual_preset = str(settings.get("preset", "none") or "none")
+    opts.fx_visual_preset = _visual_preset_token(str(settings.get("preset", "none") or "none"))
     opts.fx_bass_pulse = bool(settings.get("bass_pulse", False) or opts.fx_visual_preset == "mega_bass")
     opts.fx_bass_pulse_scale = settings.get("bass_pulse_scale", 0.03)
     opts.fx_bass_pulse_brightness = settings.get("bass_pulse_brightness", 0.04)
@@ -469,8 +625,8 @@ def ensure_prompt_presets(
     path: Path = PROMPT_STUDIO_FILE,
 ) -> dict[str, Any]:
     config = load_prompt_settings(path)
-    clean_api_name = api_name.strip() or "榛樿API妯℃澘"
-    clean_content_name = content_name.strip() or "榛樿鍐呭妯℃澘"
+    clean_api_name = api_name.strip() or "默认API模板"
+    clean_content_name = content_name.strip() or "默认内容模板"
     api_value = default_api_preset(clean_api_name)
     api_value.update(api_payload or {})
     api_value["name"] = clean_api_name
@@ -603,7 +759,7 @@ def build_window_plan(tasks: list[WindowTask], defaults: WorkflowDefaults) -> di
     default_upload_options = defaults.upload_defaults()
     if default_upload_options:
         preview_lines.append(
-            "榛樿涓婁紶瑙勫垯: "
+            "默认上传规则: "
             + ", ".join(f"{key}={value}" for key, value in default_upload_options.items())
         )
 
@@ -838,8 +994,7 @@ def _copy_if_needed(source: Path, target: Path) -> Path:
     target.parent.mkdir(parents=True, exist_ok=True)
     if source.resolve(strict=False) == target.resolve(strict=False):
         return target
-    if target.exists():
-        target.unlink()
+    target.unlink(missing_ok=True)
     shutil.copy2(source, target)
     return target
 
@@ -1164,6 +1319,54 @@ def _resolve_manifest_media_path(folder: Path, value: Any) -> Path | None:
     return path if path.is_absolute() else (folder / path)
 
 
+def _folder_matches_serial(folder: Path, serial: int) -> bool:
+    text = str(folder.name or "").strip()
+    if not text:
+        return False
+    return bool(re.search(rf"(^|[_\-\s]){int(serial)}($|[_\-\s])", text))
+
+
+def _iter_media_search_dirs(base_dir: Path, serial: int) -> list[Path]:
+    if not base_dir.exists() or not base_dir.is_dir():
+        return []
+    ordered: list[Path] = []
+    seen: set[str] = set()
+
+    def register(folder: Path) -> None:
+        try:
+            key = str(folder.resolve(strict=False)).lower()
+        except Exception:
+            key = str(folder).lower()
+        if key in seen or not folder.exists() or not folder.is_dir():
+            return
+        seen.add(key)
+        ordered.append(folder)
+
+    register(base_dir)
+    for child in sorted(
+        (item for item in base_dir.iterdir() if item.is_dir() and _folder_matches_serial(item, serial)),
+        key=lambda item: item.name.lower(),
+    ):
+        register(child)
+    for child in sorted(
+        (
+            item
+            for item in base_dir.rglob("*")
+            if item.is_dir() and _folder_matches_serial(item, serial)
+        ),
+        key=lambda item: (len(item.relative_to(base_dir).parts), item.name.lower()),
+    ):
+        register(child)
+    return ordered
+
+
+def _first_media_file(folder: Path, suffixes: set[str]) -> Path | None:
+    for item in sorted(folder.iterdir(), key=lambda value: value.name.lower()):
+        if item.is_file() and item.suffix.lower() in suffixes:
+            return item
+    return None
+
+
 def _normalized_text_key(value: Any) -> str:
     return "".join(str(value or "").strip().lower().split())
 
@@ -1243,28 +1446,32 @@ def _find_existing_video(
     preferred = _resolve_manifest_media_path(output_dir, channel.get("video"))
     if preferred and preferred.exists():
         return preferred
-    candidates: list[Path] = []
-    if task is not None:
-        slot_suffix = task_slot_token(task)
+    for folder in _iter_media_search_dirs(output_dir, serial) or [output_dir]:
+        candidates: list[Path] = []
+        if task is not None:
+            slot_suffix = task_slot_token(task)
+            candidates.extend(
+                [
+                    folder / _task_video_filename(date_mmdd, task),
+                    folder / f"{serial}{slot_suffix}.mp4",
+                ]
+            )
+            if slot_suffix:
+                candidates.extend(sorted(folder.glob(f"*_{serial}{slot_suffix}.mp4")))
+                candidates.extend(sorted(folder.glob(f"*_{serial}_{int(task.slot_index or 1):02d}.mp4")))
         candidates.extend(
             [
-                output_dir / _task_video_filename(date_mmdd, task),
-                output_dir / f"{serial}{slot_suffix}.mp4",
+                folder / f"{date_mmdd}_{serial}.mp4",
+                folder / f"{serial}.mp4",
             ]
         )
-        if slot_suffix:
-            candidates.extend(sorted(output_dir.glob(f"*_{serial}{slot_suffix}.mp4")))
-            candidates.extend(sorted(output_dir.glob(f"*_{serial}_{int(task.slot_index or 1):02d}.mp4")))
-    candidates.extend(
-        [
-            output_dir / f"{date_mmdd}_{serial}.mp4",
-            output_dir / f"{serial}.mp4",
-        ]
-    )
-    candidates.extend(sorted(output_dir.glob(f"*_{serial}.mp4")))
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
+        candidates.extend(sorted(folder.glob(f"*_{serial}.mp4")))
+        for candidate in candidates:
+            if candidate.exists() and candidate.is_file():
+                return candidate
+        fallback_video = _first_media_file(folder, VIDEO_EXTENSIONS)
+        if fallback_video is not None:
+            return fallback_video
     return None
 
 
@@ -1284,25 +1491,26 @@ def _claim_bootstrap_source_video(
         return None
     source_key = str(source_dir.resolve(strict=False)).lower()
     claimed = claimed_videos.setdefault(source_key, set())
-    preferred_candidates: list[Path] = [
-        source_dir / f"{date_mmdd}_{serial}.mp4",
-        source_dir / f"{serial}.mp4",
-    ]
-    preferred_candidates.extend(sorted(source_dir.glob(f"*_{serial}.mp4")))
-    all_candidates = preferred_candidates + _list_folder_media(source_dir, VIDEO_EXTENSIONS)
     seen: set[str] = set()
-    for candidate in all_candidates:
-        resolved = str(candidate.resolve(strict=False)).lower()
-        if resolved in seen:
-            continue
-        seen.add(resolved)
-        if not candidate.exists() or not candidate.is_file():
-            continue
-        if resolved in claimed:
-            continue
-        claimed.add(resolved)
-        target = output_dir / f"{date_mmdd}_{serial}{task_slot_token(task)}{candidate.suffix.lower()}"
-        return _copy_if_needed(candidate, target)
+    for folder in _iter_media_search_dirs(source_dir, serial) or [source_dir]:
+        preferred_candidates: list[Path] = [
+            folder / f"{date_mmdd}_{serial}.mp4",
+            folder / f"{serial}.mp4",
+        ]
+        preferred_candidates.extend(sorted(folder.glob(f"*_{serial}.mp4")))
+        all_candidates = preferred_candidates + _list_folder_media(folder, VIDEO_EXTENSIONS)
+        for candidate in all_candidates:
+            resolved = str(candidate.resolve(strict=False)).lower()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            if not candidate.exists() or not candidate.is_file():
+                continue
+            if resolved in claimed:
+                continue
+            claimed.add(resolved)
+            target = output_dir / f"{date_mmdd}_{serial}{task_slot_token(task)}{candidate.suffix.lower()}"
+            return _copy_if_needed(candidate, target)
     return None
 
 
@@ -1331,13 +1539,13 @@ def _find_bootstrap_source_image(
     for folder_text in [str(task.source_dir or "").strip(), str(output_dir)]:
         if not folder_text:
             continue
-        folder = Path(folder_text)
-        preferred = _load_source_dir_cover_paths(str(folder), date_mmdd, serial)
-        if preferred:
-            return preferred[0]
-        images = _list_folder_media(folder, IMAGE_EXTENSIONS)
-        if images:
-            return images[0]
+        for folder in _iter_media_search_dirs(Path(folder_text), serial) or [Path(folder_text)]:
+            preferred = _load_source_dir_cover_paths(str(folder), date_mmdd, serial)
+            if preferred:
+                return preferred[0]
+            images = _list_folder_media(folder, IMAGE_EXTENSIONS)
+            if images:
+                return images[0]
     return None
 
 
@@ -1351,18 +1559,18 @@ def _find_bootstrap_source_audio(
     for folder_text in [str(task.source_dir or "").strip(), str(output_dir)]:
         if not folder_text:
             continue
-        folder = Path(folder_text)
-        preferred_candidates = [
-            folder / f"{date_mmdd}_{serial}.mp3",
-            folder / f"{serial}.mp3",
-        ]
-        preferred_candidates.extend(sorted(folder.glob(f"*_{serial}.mp3")))
-        for candidate in preferred_candidates:
-            if candidate.exists() and candidate.is_file():
-                return candidate
-        audio_files = _list_folder_media(folder, AUDIO_EXTENSIONS)
-        if audio_files:
-            return audio_files[0]
+        for folder in _iter_media_search_dirs(Path(folder_text), serial) or [Path(folder_text)]:
+            preferred_candidates = [
+                folder / f"{date_mmdd}_{serial}.mp3",
+                folder / f"{serial}.mp3",
+            ]
+            preferred_candidates.extend(sorted(folder.glob(f"*_{serial}.mp3")))
+            for candidate in preferred_candidates:
+                if candidate.exists() and candidate.is_file():
+                    return candidate
+            audio_files = _list_folder_media(folder, AUDIO_EXTENSIONS)
+            if audio_files:
+                return audio_files[0]
     return None
 
 
@@ -1544,6 +1752,56 @@ def _generate_prompt_metadata(
     }
 
 
+def _generate_prompt_metadata_with_dedup(
+    *,
+    tag: str,
+    task: WindowTask,
+    defaults: WorkflowDefaults,
+    config: dict[str, Any] | None,
+    unique_seed: str,
+    title_fallback: str,
+    description_fallback: str,
+    used_titles: list[str],
+    used_descriptions: list[str],
+    used_thumbnail_prompts: list[str],
+    used_tag_signatures: list[str],
+    batch_dedup: BatchDedup | None,
+    log: LogFunc,
+) -> dict[str, Any]:
+    retry_limit = 3
+    dedup_titles = list(batch_dedup.used_titles) if batch_dedup else []
+    dedup_descriptions = list(batch_dedup.used_descriptions) if batch_dedup else []
+    duplicate_error = ""
+
+    for attempt in range(1, retry_limit + 1):
+        generated = _generate_prompt_metadata(
+            tag=tag,
+            task=task,
+            defaults=defaults,
+            config=config,
+            unique_seed=unique_seed if attempt == 1 else f"{unique_seed}|retry{attempt}",
+            title_fallback=title_fallback,
+            description_fallback=description_fallback,
+            used_titles=[*used_titles, *dedup_titles],
+            used_descriptions=[*used_descriptions, *dedup_descriptions],
+            used_thumbnail_prompts=used_thumbnail_prompts,
+            used_tag_signatures=used_tag_signatures,
+            log=log,
+        )
+        title = str(generated.get("title") or "").strip()
+        description = str(generated.get("description") or "").strip()
+        if batch_dedup and batch_dedup.is_duplicate(title, description):
+            duplicate_error = f"{tag}/{task.serial} duplicate metadata detected"
+            log(f"[Dedup] {tag}/{task.serial}: duplicate detected, retry {attempt}/{retry_limit}")
+            continue
+        if batch_dedup:
+            batch_dedup.record(title, description)
+        generated["attempts"] = attempt
+        return generated
+
+    raise RuntimeError(duplicate_error or f"{tag}/{task.serial} duplicate metadata retry exhausted")
+
+
 def _build_api_debug_payload(bundle: dict[str, Any] | None, *, unique_seed: str) -> dict[str, str]:
     api_preset = (bundle or {}).get("api_preset") or {}
     return {
@@ -1713,6 +1971,7 @@ def refresh_existing_output_metadata(
         current_descriptions: list[str] = []
         current_thumbnail_prompts: list[str] = []
         current_tag_signatures: list[str] = []
+        batch_dedup = BatchDedup()
 
         for task in tag_tasks:
             if control:
@@ -1725,6 +1984,20 @@ def refresh_existing_output_metadata(
 
             source_image = _resolve_manifest_media_path(output_dir, channel.get("source_image"))
             source_audio = _resolve_manifest_media_path(output_dir, channel.get("source_audio"))
+            if not source_image or not source_image.exists():
+                source_image = _find_bootstrap_source_image(
+                    task=task,
+                    output_dir=video_path.parent,
+                    date_mmdd=defaults.date_mmdd,
+                    serial=task.serial,
+                )
+            if not source_audio or not source_audio.exists():
+                source_audio = _find_bootstrap_source_audio(
+                    task=task,
+                    output_dir=video_path.parent,
+                    date_mmdd=defaults.date_mmdd,
+                    serial=task.serial,
+                )
             title = task.title.strip() or str(channel.get("title") or video_path.stem).strip() or video_path.stem
             description = task.description.strip() or str(channel.get("description") or "").strip()
             tag_list = [str(item).strip() for item in task.tag_list if str(item).strip()]
@@ -1770,7 +2043,7 @@ def refresh_existing_output_metadata(
                     if control:
                         control.check_cancelled()
                         control.wait_if_paused(log=log, label=f"{tag}/{task.serial} 文案生成")
-                    generated = _generate_prompt_metadata(
+                    generated = _generate_prompt_metadata_with_dedup(
                         tag=tag,
                         task=task,
                         defaults=defaults,
@@ -1782,6 +2055,7 @@ def refresh_existing_output_metadata(
                         used_descriptions=[*(history_scope.get("descriptions") or []), *current_descriptions],
                         used_thumbnail_prompts=[*(history_scope.get("thumbnail_prompts") or []), *current_thumbnail_prompts],
                         used_tag_signatures=[*(history_scope.get("tag_signatures") or []), *current_tag_signatures],
+                        batch_dedup=batch_dedup,
                         log=log,
                     )
                     bundle = generated["bundle"]
@@ -2084,7 +2358,6 @@ def _render_with_progress(
                 now = time.time()
                 ratio = 0.0 if target_duration <= 0 else min(out_seconds / target_duration, 1.0)
                 if (ratio - last_ratio) >= 0.05 or (now - last_report) >= PROGRESS_INTERVAL_SECONDS:
-                    ratio = 0.0 if target_duration <= 0 else min(out_seconds / target_duration, 1.0)
                     log(
                         f"[渲染] {output_path.name} 进度 {ratio * 100:.0f}% "
                         f"({out_seconds:.0f}/{target_duration:.0f}s)"
@@ -2397,6 +2670,7 @@ def execute_metadata_only_workflow(
             "descriptions": [],
             "thumbnail_prompts": [],
             "tag_signatures": [],
+            "batch_dedup": BatchDedup(),
         }
         tag_states[tag] = state
         result.output_dirs.append(str(output_dir))
@@ -2499,7 +2773,7 @@ def execute_metadata_only_workflow(
                     if control:
                         control.check_cancelled()
                         control.wait_if_paused(log=log, label=f"{tag}/{task_label} 文案生成")
-                    generated = _generate_prompt_metadata(
+                    generated = _generate_prompt_metadata_with_dedup(
                         tag=tag,
                         task=task,
                         defaults=defaults,
@@ -2511,6 +2785,7 @@ def execute_metadata_only_workflow(
                         used_descriptions=[*(history_scope.get("descriptions") or []), *state["descriptions"]],
                         used_thumbnail_prompts=[*(history_scope.get("thumbnail_prompts") or []), *state["thumbnail_prompts"]],
                         used_tag_signatures=[*(history_scope.get("tag_signatures") or []), *state["tag_signatures"]],
+                        batch_dedup=state["batch_dedup"],
                         log=log,
                     )
                     bundle = generated["bundle"]
@@ -2712,6 +2987,7 @@ def execute_direct_media_workflow(
             "descriptions": [],
             "thumbnail_prompts": [],
             "tag_signatures": [],
+            "batch_dedup": BatchDedup(),
         }
         tag_states[tag] = state
         return state
@@ -2726,12 +3002,12 @@ def execute_direct_media_workflow(
         audio_dir = Path(scope["audio_dir"])
         scope_tasks = list(scope["tasks"])
         if not image_dir.exists():
-            raise ValueError(f"{tag} 鐨勫簳鍥剧洰褰曚笉瀛樺湪: {image_dir}")
+            raise ValueError(f"{tag} 的底图目录不存在: {image_dir}")
         if not audio_dir.exists():
-            raise ValueError(f"{tag} 鐨勯煶涔愮洰褰曚笉瀛樺湪: {audio_dir}")
+            raise ValueError(f"{tag} 的音乐目录不存在: {audio_dir}")
         paired = _pair_media(scope_tasks, image_dir, audio_dir, shuffle=False)
         if not paired:
-            raise ValueError(f"{tag} 鐨勫浘/闊崇洰褰曟病鏈夊彲鐢ㄧ殑鍥鹃煶缁勫悎")
+            raise ValueError(f"{tag} 的图/音目录没有可用的图音组合")
         if len(paired) < len(scope_tasks):
             warning = f"{tag} only processed {len(paired)} windows; remaining windows will be skipped."
             result.warnings.append(warning)
@@ -2803,7 +3079,7 @@ def execute_direct_media_workflow(
                     if control:
                         control.check_cancelled()
                         control.wait_if_paused(log=log, label=f"{tag}/{task_label} 文案生成")
-                    generated = _generate_prompt_metadata(
+                    generated = _generate_prompt_metadata_with_dedup(
                         tag=tag,
                         task=task,
                         defaults=defaults,
@@ -2815,6 +3091,7 @@ def execute_direct_media_workflow(
                         used_descriptions=[*(history_scope.get("descriptions") or []), *state["descriptions"]],
                         used_thumbnail_prompts=[*(history_scope.get("thumbnail_prompts") or []), *state["thumbnail_prompts"]],
                         used_tag_signatures=[*(history_scope.get("tag_signatures") or []), *state["tag_signatures"]],
+                        batch_dedup=state["batch_dedup"],
                         log=log,
                     )
                     bundle = generated["bundle"]
