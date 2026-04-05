@@ -8080,11 +8080,15 @@ async def set_video_category(page, category: str) -> bool:
 
 
 async def set_notify_subscribers(page, enabled: bool) -> bool:
-    target_text = "Publish to subscriptions feed and notify subscribers"
+    target_texts = [
+        "Publish to subscriptions feed and notify subscribers",
+        "发布到订阅动态并通知订阅者",
+        "發佈到訂閱動態並通知訂閱者",
+    ]
     try:
         result = await page.evaluate(
             """
-            ([targetText, enabled]) => {
+            ([targetTexts, enabled]) => {
                 const visible = (el) => !!el && (
                     el.offsetParent !== null ||
                     el.offsetWidth > 0 ||
@@ -8135,7 +8139,7 @@ async def set_notify_subscribers(page, enabled: bool) -> bool:
                     for (const candidate of candidates) {
                         const container = candidate.closest?.("label, ytcp-checkbox-lit, tp-yt-paper-checkbox, div, span") || candidate;
                         const text = textOf(container);
-                        if (!text.includes(targetText)) continue;
+                        if (!targetTexts.some(t => text.includes(t))) continue;
                         const checked = isChecked(candidate) || isChecked(container);
                         if (checked === !!enabled) {
                             return { found: true, changed: false, checked };
@@ -8151,7 +8155,7 @@ async def set_notify_subscribers(page, enabled: bool) -> bool:
                 return { found: false, changed: false, checked: false };
             }
             """,
-            [target_text, bool(enabled)],
+            [target_texts, bool(enabled)],
         )
         if result.get("found"):
             log(f"订阅通知已设置为 {'开启' if enabled else '关闭'}", "OK")

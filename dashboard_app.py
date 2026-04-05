@@ -7773,12 +7773,14 @@ def _patched_window_default_values_v3(self: DashboardApp, job: GroupJob, serial:
     ai = str((override.ai_content if override and override.ai_content else (defaults.ai_content or defaults.altered_content or "yes")) or "yes").strip() or "yes"
     schedule_mode, schedule_date, schedule_time, _ = _resolve_window_schedule_override(override, defaults, visibility)
     ypp = str((override.ypp if override and override.ypp else _yes_no_from_bool(bool(info.is_ypp))) or "no").strip() or "no"
+    notify = str((override.notify_subscribers if override and override.notify_subscribers else (defaults.notify_subscribers or "no")) or "no").strip() or "no"
     return {
         "ypp": ypp,
         "visibility": visibility,
         "category": category,
         "kids_content": kids,
         "ai_content": ai,
+        "notify_subscribers": notify,
         "schedule_mode": schedule_mode,
         "schedule_date": schedule_date or str(defaults.schedule_date or "").strip() or _default_schedule_date(),
         "schedule_time": schedule_time or str(defaults.schedule_time or "").strip() or "06:00",
@@ -7804,9 +7806,9 @@ def _patched_open_window_override_dialog_v3(self: DashboardApp, index: int) -> N
 
     table = ctk.CTkScrollableFrame(dialog)
     table.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
-    for column in range(9):
+    for column in range(10):
         table.grid_columnconfigure(column, weight=1)
-    headers = ["窗口", "YPP", "可见性", "分类", "儿童内容", "AI 内容", "定时发布", "日期", "时间"]
+    headers = ["窗口", "YPP", "可见性", "分类", "儿童内容", "AI 内容", "通知订阅", "定时发布", "日期", "时间"]
     for column, title in enumerate(headers):
         ctk.CTkLabel(table, text=title, font=ctk.CTkFont(weight="bold")).grid(row=0, column=column, sticky="w", padx=6, pady=(4, 8))
 
@@ -7859,6 +7861,7 @@ def _patched_open_window_override_dialog_v3(self: DashboardApp, index: int) -> N
             "category": ctk.StringVar(value=defaults["category"]),
             "kids_content": ctk.StringVar(value=defaults["kids_content"]),
             "ai_content": ctk.StringVar(value=defaults["ai_content"]),
+            "notify_subscribers": ctk.StringVar(value=defaults.get("notify_subscribers", "no")),
             "schedule_mode": ctk.StringVar(value=_window_schedule_mode_to_choice(defaults["schedule_mode"])),
             "schedule_date": ctk.StringVar(value=defaults["schedule_date"]),
             "schedule_time": ctk.StringVar(value=defaults["schedule_time"]),
@@ -7869,6 +7872,7 @@ def _patched_open_window_override_dialog_v3(self: DashboardApp, index: int) -> N
             ctk.CTkOptionMenu(table, variable=vars_for_row["category"], values=CATEGORY_VALUES, font=_dashboard_theme_font(), dropdown_font=_dashboard_theme_font()),
             ctk.CTkOptionMenu(table, variable=vars_for_row["kids_content"], values=YES_NO_VALUES, font=_dashboard_theme_font(), dropdown_font=_dashboard_theme_font()),
             ctk.CTkOptionMenu(table, variable=vars_for_row["ai_content"], values=YES_NO_VALUES, font=_dashboard_theme_font(), dropdown_font=_dashboard_theme_font()),
+            ctk.CTkOptionMenu(table, variable=vars_for_row["notify_subscribers"], values=YES_NO_VALUES, font=_dashboard_theme_font(), dropdown_font=_dashboard_theme_font()),
             ctk.CTkOptionMenu(table, variable=vars_for_row["schedule_mode"], values=WINDOW_SCHEDULE_MODE_VALUES, font=_dashboard_theme_font(), dropdown_font=_dashboard_theme_font()),
             ctk.CTkOptionMenu(table, variable=vars_for_row["schedule_date"], values=_schedule_date_values(), font=_dashboard_theme_font(), dropdown_font=_dashboard_theme_font()),
             ctk.CTkOptionMenu(table, variable=vars_for_row["schedule_time"], values=_schedule_time_values(), font=_dashboard_theme_font(), dropdown_font=_dashboard_theme_font()),
@@ -7877,8 +7881,8 @@ def _patched_open_window_override_dialog_v3(self: DashboardApp, index: int) -> N
             widget.grid(row=row_index, column=column, sticky="ew", padx=6, pady=6)
         row_contexts[serial] = {
             "vars": vars_for_row,
-            "date_widget": widgets[6],
-            "time_widget": widgets[7],
+            "date_widget": widgets[7],
+            "time_widget": widgets[8],
             "updating": False,
         }
         vars_for_row["visibility"].trace_add("write", lambda *_args, serial=serial: refresh_row(serial))
@@ -7893,6 +7897,7 @@ def _patched_open_window_override_dialog_v3(self: DashboardApp, index: int) -> N
             context["vars"]["category"].set(defaults["category"])
             context["vars"]["kids_content"].set(defaults["kids_content"])
             context["vars"]["ai_content"].set(defaults["ai_content"])
+            context["vars"]["notify_subscribers"].set(defaults.get("notify_subscribers", "no"))
             context["vars"]["schedule_mode"].set(_window_schedule_mode_to_choice(defaults["schedule_mode"]))
             context["vars"]["schedule_date"].set(defaults["schedule_date"])
             context["vars"]["schedule_time"].set(defaults["schedule_time"])
@@ -7921,6 +7926,7 @@ def _patched_open_window_override_dialog_v3(self: DashboardApp, index: int) -> N
                 category="" if vars_for_row["category"].get() == defaults["category"] else vars_for_row["category"].get(),
                 kids_content="" if vars_for_row["kids_content"].get() == defaults["kids_content"] else vars_for_row["kids_content"].get(),
                 ai_content="" if vars_for_row["ai_content"].get() == defaults["ai_content"] else vars_for_row["ai_content"].get(),
+                notify_subscribers="" if vars_for_row["notify_subscribers"].get() == defaults.get("notify_subscribers", "no") else vars_for_row["notify_subscribers"].get(),
                 schedule_mode="" if schedule_mode == defaults["schedule_mode"] else schedule_mode,
                 schedule_date="" if schedule_date == defaults["schedule_date"] else schedule_date,
                 schedule_time="" if schedule_time == defaults["schedule_time"] else schedule_time,
@@ -7940,7 +7946,7 @@ def _patched_build_window_tasks_from_job_v3(self: DashboardApp, job: GroupJob) -
     upload_defaults = UploadDefaults.from_dict(self._current_upload_defaults_model().to_dict())
     if job.upload_defaults:
         upload_defaults = UploadDefaults.from_dict(job.upload_defaults.to_dict())
-    notify_subscribers = bool(self.default_notify_var.get())
+    default_notify = str(upload_defaults.notify_subscribers or "no").strip().lower()
     tasks: list[WindowTask] = []
     seen_serials: set[int] = set()
     quantity = max(1, int(job.videos_per_window or 1))
@@ -7955,6 +7961,7 @@ def _patched_build_window_tasks_from_job_v3(self: DashboardApp, job: GroupJob) -
         category = str((override.category if override and override.category else upload_defaults.category) or "Music").strip() or "Music"
         kids_value = override.kids_content if override and override.kids_content else _yes_no_from_bool(upload_defaults.is_for_kids)
         ai_value = override.ai_content if override and override.ai_content else (upload_defaults.ai_content or upload_defaults.altered_content or "yes")
+        notify_value = override.notify_subscribers if override and override.notify_subscribers else default_notify
         _schedule_mode, _schedule_date, _schedule_time, schedule_text = _resolve_window_schedule_override(override, upload_defaults, visibility)
         tasks.append(
             create_task(
@@ -7967,7 +7974,7 @@ def _patched_build_window_tasks_from_job_v3(self: DashboardApp, job: GroupJob) -
                 category=category,
                 made_for_kids=_bool_from_yes_no(kids_value),
                 altered_content=_bool_from_yes_no(ai_value),
-                notify_subscribers=notify_subscribers,
+                notify_subscribers=_bool_from_yes_no(notify_value),
                 scheduled_publish_at=schedule_text,
                 schedule_timezone=str(upload_defaults.timezone or "").strip() if schedule_text else "",
                 source_dir=str(job.source_dir or "").strip(),
