@@ -42,7 +42,7 @@ from prompt_studio import (
     pick_api_preset_name,
     pick_content_template_name,
 )
-from path_helpers import normalize_scheduler_config
+from path_helpers import normalize_scheduler_config, open_path_in_file_manager
 from path_templates import (
     DEFAULT_PATH_TEMPLATE_NAME,
     PATH_TEMPLATES_FILE,
@@ -669,6 +669,7 @@ class DashboardApp(ctk.CTk):
         self._run_plan_for_summary: Any = None
         self._run_execution_result: Any = None
         self._run_report_logged = False
+        self._closing = False
         self._audience_data_url: str = ""
         self._state = self._load_state()
         self.window_tasks: list[WindowTask] = []
@@ -3556,13 +3557,7 @@ class DashboardApp(ctk.CTk):
         else:
             target = Path(self.output_root_var.get())
         if target.exists():
-            import platform as _plat
-            if _plat.system() == "Darwin":
-                subprocess.call(["open", str(target)])
-            elif _plat.system() == "Windows":
-                os.startfile(target)
-            else:
-                subprocess.call(["xdg-open", str(target)])
+            open_path_in_file_manager(target)
 
 
     def _collect_output_dirs_from_result(self, result) -> dict[str, str]:
@@ -4784,6 +4779,7 @@ class DashboardApp(ctk.CTk):
         )
 
     def _on_close(self) -> None:
+        self._closing = True
         self._save_state()
         # 清理上传监控线程
         for thread in getattr(self, 'upload_monitor_threads', []):
@@ -7619,6 +7615,13 @@ def _on_browser_provider_change_impl(self: DashboardApp) -> None:
             pass
 
     def _update_status(text: str):
+        if getattr(self, "_closing", False):
+            return
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
         label = getattr(self, "_browser_status_label", None)
         if label is not None:
             label.configure(text=text)
@@ -7637,6 +7640,13 @@ def _patched_refresh_groups_v3(self: DashboardApp) -> None:
             return {}, {}, str(exc)
 
     def _apply_result(result):
+        if getattr(self, "_closing", False):
+            return
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
         group_catalog, live_groups, browser_error = result
         self.group_catalog = group_catalog
         self._live_groups = live_groups

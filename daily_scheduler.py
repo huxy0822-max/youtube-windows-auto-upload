@@ -11,6 +11,8 @@
 - 这次整理后，路径会优先解析到当前仓库内的 `config/`，不再默认写死 macOS 目录。
 """
 
+from __future__ import annotations
+
 import logging
 import os
 import sys
@@ -34,6 +36,7 @@ from group_upload_workflow import prepare_window_task_upload_batch
 from path_helpers import (
     default_scheduler_config,
     normalize_scheduler_config,
+    open_path_in_file_manager,
     resolve_upload_script,
 )
 
@@ -60,21 +63,25 @@ else:
     _BUNDLE_DIR = _SCRIPT_DIR
 
 # ============ 路径配置 (支持 scheduler_config.json 覆盖) ============
+def _default_platform_config() -> dict:
+    defaults = default_scheduler_config(_SCRIPT_DIR)
+    if IS_MAC:
+        for candidate in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
+            if Path(candidate).exists():
+                defaults["ffmpeg_bin"] = candidate
+                defaults["ffmpeg_path"] = candidate
+                break
+    return defaults
+
+
 def _load_platform_config():
     """加载平台配置。优先读取 scheduler_config.json，否则使用平台默认值。"""
     config_file = _SCRIPT_DIR / "scheduler_config.json"
     if config_file.exists():
         with open(config_file, 'r', encoding='utf-8') as f:
             return normalize_scheduler_config(json.load(f), _SCRIPT_DIR)
-    # macOS 默认值 (保持原有路径，零改动)
     if IS_MAC:
-        return normalize_scheduler_config({
-            "base_image_dir": "/Users/dazhilv/Downloads/base image",
-            "music_dir": "/Users/dazhilv/Downloads/Suno Downloads",
-            "output_root": "/Users/dazhilv/Downloads/AutoTask",
-            "upload_config": str((_SCRIPT_DIR / "config" / "upload_config.json").resolve(strict=False)),
-            "ffmpeg_bin": "/opt/homebrew/bin/ffmpeg",
-        }, _SCRIPT_DIR)
+        return normalize_scheduler_config(_default_platform_config(), _SCRIPT_DIR)
     # Windows/Linux 首次运行: GUI 向导让用户选择文件夹
     return _run_setup_wizard(config_file)
 
@@ -1809,10 +1816,8 @@ def main():
         print(f"  全部完成！")
         
     print(f"  输出目录: {OUTPUT_ROOT}")
-    if IS_MAC and not upload_procs:
-        subprocess.call(["open", str(OUTPUT_ROOT)])
-    elif IS_WINDOWS and not upload_procs:
-        os.startfile(str(OUTPUT_ROOT))
+    if not upload_procs:
+        open_path_in_file_manager(OUTPUT_ROOT)
 
 if __name__ == "__main__":
     main()

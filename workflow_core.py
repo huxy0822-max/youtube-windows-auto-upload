@@ -7,9 +7,10 @@ import random
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass as _dataclass, field
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -55,6 +56,13 @@ from prompt_studio import (
     save_prompt_studio_config,
 )
 from utils import get_all_tags, get_tag_info
+
+
+def dataclass(*args, **kwargs):
+    if sys.version_info < (3, 10) and "slots" in kwargs:
+        kwargs = dict(kwargs)
+        kwargs.pop("slots", None)
+    return _dataclass(*args, **kwargs)
 
 SCRIPT_DIR = Path(__file__).parent
 SCHEDULER_CONFIG_FILE = SCRIPT_DIR / "scheduler_config.json"

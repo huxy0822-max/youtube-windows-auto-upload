@@ -77,7 +77,10 @@ def probe_browser_providers() -> dict[str, bool]:
                 resp = requests.post(url, json=defaults["list_payload"], timeout=15)
                 alive = resp.status_code < 500
             except Exception:
-                alive = False
+                if provider_name == "bitbrowser":
+                    alive = _post_json_with_curl(url, defaults["list_payload"], timeout=15) is not None
+                else:
+                    alive = False
         results[provider_name] = alive
     return results
 
@@ -207,6 +210,7 @@ def _post_json(
     endpoint: str,
     payload: dict[str, Any],
     *,
+    provider: str = "",
     attempts: int = 3,
     timeout: int = 60,
 ) -> dict[str, Any]:
@@ -219,12 +223,68 @@ def _post_json(
             return response.json()
         except requests.RequestException as exc:
             last_error = exc
+            if provider == "bitbrowser":
+                curl_result = _post_json_with_curl(url, payload, timeout=timeout)
+                if curl_result is not None:
+                    return curl_result
             if attempt >= attempts:
                 break
             time.sleep(min(1.5 * attempt, 4.0))
     if last_error:
         raise last_error
     raise RuntimeError(f"Request failed: {url}")
+
+
+def _post_json_with_curl(url: str, payload: dict[str, Any], *, timeout: int = 60) -> dict[str, Any] | None:
+    """BitBrowser 在部分 macOS 环境对 requests 不稳定，curl 更稳。"""
+    payload_text = json.dumps(payload or {}, ensure_ascii=False, separators=(",", ":"))
+    try:
+        completed = subprocess.run(
+            [
+                "curl",
+                "-sS",
+                "-X",
+                "POST",
+                url,
+                "-H",
+                "Content-Type: application/json",
+                "--data-raw",
+                payload_text,
+                "--connect-timeout",
+                str(min(timeout, 10)),
+                "--max-time",
+                str(timeout),
+                "-w",
+                "\n%{http_code}",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout + 5,
+            check=False,
+        )
+    except Exception:
+        return None
+
+    if completed.returncode != 0:
+        return None
+
+    stdout = (completed.stdout or "").strip()
+    if not stdout:
+        return None
+
+    body, _, status_text = stdout.rpartition("\n")
+    try:
+        status_code = int(status_text.strip())
+    except Exception:
+        return None
+    if status_code >= 500:
+        return None
+    try:
+        return json.loads(body or "{}")
+    except Exception:
+        return None
 
 
 def _extract_error_message(result: Any) -> str:
@@ -562,7 +622,12 @@ def _parse_debug_port_from_result(result: Any) -> int | None:
 
 def list_browser_envs(upload_config_path: str | Path | None = None) -> list[dict[str, Any]]:
     settings = load_browser_settings(upload_config_path)
-    result = _post_json(settings["base_url"], settings["list_endpoint"], settings["list_payload"])
+    result = _post_json(
+        settings["base_url"],
+        settings["list_endpoint"],
+        settings["list_payload"],
+        provider=settings["provider"],
+    )
     if not _is_success(settings["provider"], result):
         raise RuntimeError(_extract_error_message(result))
     if settings["provider"] == "bitbrowser":
@@ -578,7 +643,12 @@ def list_browser_envs_for_provider(provider: str) -> list[dict[str, Any]]:
     defaults = DEFAULT_BROWSER_SETTINGS[provider]
     base_url = defaults["base_url"]
     try:
-        result = _post_json(base_url, defaults["list_endpoint"], defaults["list_payload"])
+        result = _post_json(
+            base_url,
+            defaults["list_endpoint"],
+            defaults["list_payload"],
+            provider=provider,
+        )
     except Exception as exc:
         logger.info("list_browser_envs_for_provider(%s) failed: %s", provider, exc)
         return []
@@ -628,7 +698,12 @@ def start_browser_debug_port(
     payload[settings["open_payload_id_key"]] = container_code
 
     try:
-        result = _post_json(settings["base_url"], settings["open_endpoint"], payload)
+        result = _post_json(
+            settings["base_url"],
+            settings["open_endpoint"],
+            payload,
+            provider=settings["provider"],
+        )
     except requests.RequestException:
         recovered = _recover_existing_debug_port(container_code) if settings["provider"] == "bitbrowser" else None
         if recovered is not None:
@@ -647,6 +722,7 @@ def start_browser_debug_port(
                     settings["base_url"],
                     settings["open_endpoint"],
                     payload,
+                    provider=settings["provider"],
                     attempts=2,
                 )
                 if _is_success(settings["provider"], retry_result):
@@ -679,7 +755,12 @@ def stop_browser_container(
     payload = dict(settings["stop_payload"])
     payload[settings["stop_payload_id_key"]] = container_code
 
-    result = _post_json(settings["base_url"], settings["stop_endpoint"], payload)
+    result = _post_json(
+        settings["base_url"],
+        settings["stop_endpoint"],
+        payload,
+        provider=settings["provider"],
+    )
     if not _is_success(settings["provider"], result):
         raise RuntimeError(_extract_error_message(result))
     if settings["provider"] == "bitbrowser":

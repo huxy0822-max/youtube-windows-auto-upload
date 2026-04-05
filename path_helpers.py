@@ -9,8 +9,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import platform
 import shutil
 import socket
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Iterable
@@ -85,14 +87,20 @@ def default_scheduler_config(base_dir: str | Path) -> dict[str, Any]:
     base = Path(base_dir).resolve(strict=False)
     output_root = (base / "workspace" / "AutoTask").resolve(strict=False)
     metadata_root = (base / "workspace" / "metadata").resolve(strict=False)
+    ffmpeg_bin = "ffmpeg"
+    if sys.platform == "darwin":
+        for candidate in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
+            if Path(candidate).exists():
+                ffmpeg_bin = candidate
+                break
     return {
         "music_dir": str((base / "workspace" / "music").resolve(strict=False)),
         "base_image_dir": str((base / "workspace" / "base_image").resolve(strict=False)),
         "metadata_root": str(metadata_root),
         "output_root": str(output_root),
         "upload_config": str(resolve_config_file(base, "upload_config.json")),
-        "ffmpeg_bin": "ffmpeg",
-        "ffmpeg_path": "ffmpeg",
+        "ffmpeg_bin": ffmpeg_bin,
+        "ffmpeg_path": ffmpeg_bin,
         "used_media_root": str((output_root / "_used_media").resolve(strict=False)),
         "render_cleanup_days": 5,
         "group_source_bindings": {},
@@ -241,3 +249,15 @@ def ensure_environment() -> dict[str, Any]:
         generate_default_config(result, config_path)
 
     return result
+
+
+def open_path_in_file_manager(path_value: str | Path) -> None:
+    path = Path(path_value).expanduser().resolve(strict=False)
+    system = platform.system()
+    if system == "Windows":
+        os.startfile(str(path))
+        return
+    if system == "Darwin":
+        subprocess.run(["open", str(path)], check=False)
+        return
+    subprocess.run(["xdg-open", str(path)], check=False)

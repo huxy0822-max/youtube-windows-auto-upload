@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass, field
+import sys
+from dataclasses import dataclass as _dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -32,6 +33,13 @@ from workflow_core import (
 )
 
 LogFunc = Callable[[str], None]
+
+
+def dataclass(*args, **kwargs):
+    if sys.version_info < (3, 10) and "slots" in kwargs:
+        kwargs = dict(kwargs)
+        kwargs.pop("slots", None)
+    return _dataclass(*args, **kwargs)
 
 MODULE_LABELS = {
     "metadata": "生成标题/简介/标签/缩略图",

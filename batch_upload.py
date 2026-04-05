@@ -9,6 +9,8 @@ YouTube 批量上传脚本
   python3 batch_upload.py --tag 大提琴 --date 1.28 --dry-run  # 只预览不执行
 """
 
+from __future__ import annotations
+
 import asyncio
 import argparse
 import contextvars
