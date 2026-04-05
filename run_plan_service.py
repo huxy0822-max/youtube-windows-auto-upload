@@ -656,12 +656,15 @@ async def execute_run_queue(
 
             # ========== 并行流水线：渲染与上传重叠执行 ==========
             # 窗口N渲染完立刻启动上传(后台)，同时窗口N+1开始渲染
-            # 上传之间串行（同一时间只上传一个，避免浏览器冲突）
+            # 关键：execute_run_plan 是同步阻塞的，必须用 run_in_executor
+            # 放到线程池执行，否则 asyncio.Task 在同步阻塞期间无法调度
             import asyncio as _aio
+            import concurrent.futures as _cf
 
             all_window_results: list[dict[str, Any]] = []
             window_total = len(job.window_serials)
-            _prev_upload_task: _aio.Task | None = None  # 前一个窗口的上传任务
+            _prev_upload_task: _aio.Task | None = None
+            _executor = _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="prepare")
 
             async def _do_upload(upload_job: GroupJob, win_serial: int) -> dict[str, Any]:
                 """后台执行单窗口上传"""
@@ -707,10 +710,13 @@ async def execute_run_queue(
                         },
                     )
 
-                    execution = execute_run_plan(
-                        build_run_plan_for_job(single_prepare_job),
-                        control=control,
-                        log=log,
+                    # 用 run_in_executor 把同步渲染放到线程池，
+                    # 这样事件循环不被阻塞，上传 Task 能并行执行
+                    _loop = _aio.get_running_loop()
+                    _plan = build_run_plan_for_job(single_prepare_job)
+                    execution = await _loop.run_in_executor(
+                        _executor,
+                        lambda: execute_run_plan(_plan, control=control, log=log),
                     )
 
                     prepared_output_dir = str(
@@ -791,6 +797,7 @@ async def execute_run_queue(
                     )
                 except Exception as last_exc:
                     log(f"[Pipeline] 最后窗口上传异常: {last_exc}")
+            _executor.shutdown(wait=False)
 
             job_result["results"] = all_window_results
             job_result["success_count"] = len([r for r in all_window_results if r.get("success")])
