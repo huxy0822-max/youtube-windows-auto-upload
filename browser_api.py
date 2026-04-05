@@ -150,6 +150,46 @@ def _load_upload_config(upload_config_path: str | Path | None = None) -> dict[st
         return json.load(handle)
 
 
+def _channel_mapping_path() -> Path:
+    env_path = str(os.environ.get("CHANNEL_MAPPING_PATH") or "").strip()
+    if env_path:
+        return Path(env_path)
+    return resolve_config_file(Path(__file__).resolve().parent, "channel_mapping.json")
+
+
+def _load_channel_mapping_lookup() -> tuple[dict[str, dict[str, Any]], dict[int, dict[str, Any]]]:
+    path = _channel_mapping_path()
+    if not path.exists():
+        return {}, {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}, {}
+
+    raw_channels = payload.get("channels") if isinstance(payload, dict) else {}
+    if not isinstance(raw_channels, dict):
+        return {}, {}
+
+    by_container: dict[str, dict[str, Any]] = {}
+    by_serial: dict[int, dict[str, Any]] = {}
+    for container_code, info in raw_channels.items():
+        if not isinstance(info, dict):
+            continue
+        serial = _as_int(info.get("serial_number"))
+        if serial is None:
+            continue
+        entry = {
+            "serial": serial,
+            "tag": str(info.get("tag") or "").strip(),
+            "channel_name": str(info.get("channel_name") or "").strip(),
+        }
+        clean_container = str(container_code or "").strip()
+        if clean_container:
+            by_container[clean_container] = entry
+        by_serial[serial] = entry
+    return by_container, by_serial
+
+
 def load_browser_settings(upload_config_path: str | Path | None = None) -> dict[str, Any]:
     config = _load_upload_config(upload_config_path)
     browser_cfg = config.get("browser_api", {}) if isinstance(config.get("browser_api"), dict) else {}
@@ -364,24 +404,30 @@ def _normalize_bitbrowser_envs(result: dict[str, Any]) -> list[dict[str, Any]]:
     else:
         items = []
 
+    by_container, by_serial = _load_channel_mapping_lookup()
     normalized: list[dict[str, Any]] = []
     for item in items:
+        container_code = str(
+            item.get("id")
+            or item.get("browserId")
+            or item.get("containerCode")
+            or ""
+        ).strip()
+        mapped = by_container.get(container_code) or {}
+        serial = (
+            _as_int(mapped.get("serial"))
+            or _as_int(item.get("serialNumber"))
+            or _as_int(item.get("browserSeq"))
+            or _as_int(item.get("sortNum"))
+            or _as_int(item.get("seq"))
+        )
+        fallback_entry = by_serial.get(int(serial), {}) if serial is not None else {}
         normalized.append(
             {
-                "serialNumber": _as_int(
-                    item.get("seq")
-                    or item.get("serialNumber")
-                    or item.get("browserSeq")
-                    or item.get("sortNum")
-                ),
-                "containerCode": str(
-                    item.get("id")
-                    or item.get("browserId")
-                    or item.get("containerCode")
-                    or ""
-                ),
-                "name": item.get("name") or item.get("browserName") or "",
-                "tag": item.get("groupName") or item.get("tag") or "",
+                "serialNumber": serial,
+                "containerCode": container_code,
+                "name": item.get("name") or item.get("browserName") or mapped.get("channel_name") or fallback_entry.get("channel_name") or "",
+                "tag": mapped.get("tag") or item.get("groupName") or item.get("tag") or fallback_entry.get("tag") or "",
                 "remark": item.get("remark") or item.get("browserRemark") or item.get("description") or "",
                 "_raw": item,
             }
