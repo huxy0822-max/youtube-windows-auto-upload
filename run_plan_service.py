@@ -715,8 +715,10 @@ async def execute_run_queue(
                         },
                     )
 
-                    execution = execute_run_plan(
-                        build_run_plan_for_job(single_prepare_job),
+                    prepare_plan = build_run_plan_for_job(single_prepare_job)
+                    execution = await _aio.to_thread(
+                        execute_run_plan,
+                        prepare_plan,
                         control=control,
                         log=log,
                     )

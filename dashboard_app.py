@@ -37,6 +37,8 @@ from effects_library import (
     list_zoom_modes,
 )
 from prompt_studio import (
+    default_api_preset,
+    default_content_template,
     find_explicit_api_preset_name,
     find_explicit_content_template_name,
     pick_api_preset_name,
@@ -83,6 +85,7 @@ from workflow_core import (
     get_metadata_root,
     load_prompt_settings,
     load_scheduler_settings,
+    save_prompt_settings,
     save_scheduler_settings,
     save_window_plan,
     set_group_binding,
@@ -1553,12 +1556,22 @@ class DashboardApp(ctk.CTk):
         self.prompt_group_menu = ctk.CTkOptionMenu(top, variable=self.prompt_group_var, values=[""])
         self.prompt_group_menu.grid(row=2, column=0, sticky="ew", padx=(16, 8), pady=(0, 12))
         ctk.CTkLabel(top, text="API 模板").grid(row=1, column=1, sticky="w", padx=8, pady=(0, 6))
-        self.api_preset_menu = ctk.CTkOptionMenu(top, variable=self.api_preset_var, values=[""])
+        self.api_preset_menu = ctk.CTkOptionMenu(
+            top,
+            variable=self.api_preset_var,
+            values=[""],
+            command=lambda value: self._load_api_preset_into_form(value),
+        )
         self.api_preset_menu.grid(row=2, column=1, sticky="ew", padx=8, pady=(0, 12))
         ctk.CTkLabel(top, text="内容模板").grid(row=1, column=2, sticky="w", padx=8, pady=(0, 6))
-        self.content_template_menu = ctk.CTkOptionMenu(top, variable=self.content_template_var, values=[""])
+        self.content_template_menu = ctk.CTkOptionMenu(
+            top,
+            variable=self.content_template_var,
+            values=[""],
+            command=lambda value: self._load_content_template_into_form(value),
+        )
         self.content_template_menu.grid(row=2, column=2, sticky="ew", padx=8, pady=(0, 12))
-        ctk.CTkButton(top, text="载入当前模板", command=self._load_prompt_for_group).grid(
+        ctk.CTkButton(top, text="载入当前模板", command=self._load_selected_prompt_templates).grid(
             row=2, column=3, sticky="ew", padx=8, pady=(0, 12)
         )
         ctk.CTkButton(top, text="绑定分组到 API 模板", command=self._bind_group_api).grid(
@@ -3367,47 +3380,104 @@ class DashboardApp(ctk.CTk):
             f"API={api_name} | 内容模板={content_name}"
         )
 
+    def _resolve_api_preset_name(self, requested: str = "") -> str:
+        api_presets = self.prompt_config.get("apiPresets") or {}
+        clean = str(requested or "").strip()
+        if clean in api_presets:
+            return clean
+        fallback = pick_api_preset_name(self.prompt_config, self.prompt_group_var.get())
+        return fallback if fallback in api_presets else next(iter(api_presets), "")
+
+    def _resolve_content_template_name(self, requested: str = "") -> str:
+        content_templates = self.prompt_config.get("contentTemplates") or {}
+        clean = str(requested or "").strip()
+        if clean in content_templates:
+            return clean
+        fallback = pick_content_template_name(self.prompt_config, self.prompt_group_var.get())
+        return fallback if fallback in content_templates else next(iter(content_templates), "")
+
+    def _load_api_preset_into_form(self, name: str | None = None, *, reload_config: bool = True) -> None:
+        if reload_config:
+            self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
+        api_name = self._resolve_api_preset_name(str(name or self.api_preset_var.get() or ""))
+        api_data = dict((self.prompt_config.get("apiPresets") or {}).get(api_name) or {})
+        was_loading = bool(getattr(self, "_loading_prompt_form", False))
+        self._loading_prompt_form = True
+        try:
+            if api_name:
+                self.api_preset_var.set(api_name)
+            self.provider_var.set(str(api_data.get("provider") or "openai_compatible"))
+            self.base_url_var.set(str(api_data.get("baseUrl") or ""))
+            self.model_var.set(str(api_data.get("model") or ""))
+            self.api_key_var.set(str(api_data.get("apiKey") or ""))
+            self.temperature_var.set(str(api_data.get("temperature") or "0.9"))
+            self.max_tokens_var.set(str(api_data.get("maxTokens") or "16000"))
+            self.auto_image_var.set(str(api_data.get("autoImageEnabled") or "0"))
+            self.image_base_url_var.set(str(api_data.get("imageBaseUrl") or ""))
+            self.image_api_key_var.set(str(api_data.get("imageApiKey") or ""))
+            self.image_model_var.set(str(api_data.get("imageModel") or ""))
+            self.image_concurrency_var.set(str(api_data.get("imageConcurrency") or "3"))
+        finally:
+            self._loading_prompt_form = was_loading
+        if not was_loading:
+            self.prompt_form_dirty = False
+
+    def _load_content_template_into_form(self, name: str | None = None, *, reload_config: bool = True) -> None:
+        if reload_config:
+            self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
+        content_name = self._resolve_content_template_name(str(name or self.content_template_var.get() or ""))
+        content_data = dict((self.prompt_config.get("contentTemplates") or {}).get(content_name) or {})
+        was_loading = bool(getattr(self, "_loading_prompt_form", False))
+        self._loading_prompt_form = True
+        try:
+            if content_name:
+                self.content_template_var.set(content_name)
+            self.music_genre_var.set(str(content_data.get("musicGenre") or ""))
+            self.angle_var.set(str(content_data.get("angle") or ""))
+            self.audience_var.set(str(content_data.get("audience") or ""))
+            self.content_language_var.set(str(content_data.get("outputLanguage") or "zh-TW"))
+            self.title_count_var.set(str(content_data.get("titleCount") or "3"))
+            self.desc_count_var.set(str(content_data.get("descCount") or "1"))
+            self.thumb_count_var.set(str(content_data.get("thumbCount") or "3"))
+            self.title_min_var.set(str(content_data.get("titleMin") or "80"))
+            self.title_max_var.set(str(content_data.get("titleMax") or "95"))
+            self.desc_len_var.set(str(content_data.get("descLen") or "300"))
+            self.tag_range_var.set(str(content_data.get("tagRange") or "10-20"))
+            self.master_prompt_box.delete("1.0", "end")
+            self.master_prompt_box.insert("1.0", str(content_data.get("masterPrompt") or ""))
+            self.title_library_box.delete("1.0", "end")
+            self.title_library_box.insert("1.0", str(content_data.get("titleLibrary") or ""))
+        finally:
+            self._loading_prompt_form = was_loading
+        if not was_loading:
+            self.prompt_form_dirty = False
+
     def _load_prompt_for_group(self) -> None:
         self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
         tag = self.prompt_group_var.get()
         api_name = pick_api_preset_name(self.prompt_config, tag)
         content_name = pick_content_template_name(self.prompt_config, tag)
         self._loading_prompt_form = True
-        self.api_preset_var.set(api_name)
-        self.content_template_var.set(content_name)
-
-        api_data = dict((self.prompt_config.get("apiPresets") or {}).get(api_name) or {})
-        content_data = dict((self.prompt_config.get("contentTemplates") or {}).get(content_name) or {})
-
-        self.provider_var.set(str(api_data.get("provider") or "openai_compatible"))
-        self.base_url_var.set(str(api_data.get("baseUrl") or ""))
-        self.model_var.set(str(api_data.get("model") or ""))
-        self.api_key_var.set(str(api_data.get("apiKey") or ""))
-        self.temperature_var.set(str(api_data.get("temperature") or "0.9"))
-        self.max_tokens_var.set(str(api_data.get("maxTokens") or "16000"))
-        self.auto_image_var.set(str(api_data.get("autoImageEnabled") or "0"))
-        self.image_base_url_var.set(str(api_data.get("imageBaseUrl") or ""))
-        self.image_api_key_var.set(str(api_data.get("imageApiKey") or ""))
-        self.image_model_var.set(str(api_data.get("imageModel") or ""))
-        self.image_concurrency_var.set(str(api_data.get("imageConcurrency") or "3"))
-
-        self.music_genre_var.set(str(content_data.get("musicGenre") or ""))
-        self.angle_var.set(str(content_data.get("angle") or ""))
-        self.audience_var.set(str(content_data.get("audience") or ""))
-        self.content_language_var.set(str(content_data.get("outputLanguage") or "zh-TW"))
-        self.title_count_var.set(str(content_data.get("titleCount") or "3"))
-        self.desc_count_var.set(str(content_data.get("descCount") or "1"))
-        self.thumb_count_var.set(str(content_data.get("thumbCount") or "3"))
-        self.title_min_var.set(str(content_data.get("titleMin") or "80"))
-        self.title_max_var.set(str(content_data.get("titleMax") or "95"))
-        self.desc_len_var.set(str(content_data.get("descLen") or "300"))
-        self.tag_range_var.set(str(content_data.get("tagRange") or "10-20"))
-        self.master_prompt_box.delete("1.0", "end")
-        self.master_prompt_box.insert("1.0", str(content_data.get("masterPrompt") or ""))
-        self.title_library_box.delete("1.0", "end")
-        self.title_library_box.insert("1.0", str(content_data.get("titleLibrary") or ""))
-        self._loading_prompt_form = False
+        try:
+            self._load_api_preset_into_form(api_name, reload_config=False)
+            self._load_content_template_into_form(content_name, reload_config=False)
+        finally:
+            self._loading_prompt_form = False
         self.prompt_form_dirty = False
+
+    def _load_selected_prompt_templates(self) -> None:
+        self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
+        self._loading_prompt_form = True
+        try:
+            self._load_api_preset_into_form(self.api_preset_var.get(), reload_config=False)
+            self._load_content_template_into_form(self.content_template_var.get(), reload_config=False)
+        finally:
+            self._loading_prompt_form = False
+        self.prompt_form_dirty = False
+        self._log(
+            f"[提示词] 已载入当前模板: API={self.api_preset_var.get()} | "
+            f"内容模板={self.content_template_var.get()}"
+        )
 
     def _save_api_preset(self) -> None:
         tag = self.prompt_group_var.get()
@@ -3415,13 +3485,12 @@ class DashboardApp(ctk.CTk):
         if not name:
             messagebox.showerror("保存失败", "请填写 API 模板名称")
             return
-        ensure_prompt_presets(
-            api_name=name,
-            api_payload=self._current_api_form(),
-            content_name=self.content_template_var.get().strip() or "默认内容模板",
-            content_payload=self._current_content_form(),
-            path=PROMPT_STUDIO_FILE,
-        )
+        self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
+        api_value = default_api_preset(name)
+        api_value.update(self._current_api_form())
+        api_value["name"] = name
+        self.prompt_config.setdefault("apiPresets", {})[name] = api_value
+        save_prompt_settings(self.prompt_config, PROMPT_STUDIO_FILE)
         self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
         self._refresh_prompt_dropdowns()
         self.api_preset_var.set(name)
@@ -3434,41 +3503,40 @@ class DashboardApp(ctk.CTk):
         if not name:
             messagebox.showerror("保存失败", "请填写内容模板名称")
             return
-        ensure_prompt_presets(
-            api_name=self.api_preset_var.get().strip() or "默认API模板",
-            api_payload=self._current_api_form(),
-            content_name=name,
-            content_payload=self._current_content_form(),
-            path=PROMPT_STUDIO_FILE,
-        )
+        self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
+        content_value = default_content_template(name)
+        content_value.update(self._current_content_form())
+        content_value["name"] = name
+        self.prompt_config.setdefault("contentTemplates", {})[name] = content_value
+        save_prompt_settings(self.prompt_config, PROMPT_STUDIO_FILE)
         self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
         self._refresh_prompt_dropdowns()
         self.content_template_var.set(name)
         self._log(f"[提示词] 已保存内容模板: {name}")
 
     def _bind_group_api(self) -> None:
-        ensure_prompt_presets(
-            api_name=self.api_preset_var.get().strip() or "默认API模板",
-            api_payload=self._current_api_form(),
-            content_name=self.content_template_var.get().strip() or "默认内容模板",
-            content_payload=self._current_content_form(),
-            tag=self.prompt_group_var.get(),
-            path=PROMPT_STUDIO_FILE,
-        )
         self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
-        self._log(f"[提示词] {self.prompt_group_var.get()} 已绑定 API 模板 {self.api_preset_var.get()}")
+        tag = self.prompt_group_var.get().strip()
+        api_name = self.api_preset_var.get().strip()
+        if not tag or api_name not in (self.prompt_config.get("apiPresets") or {}):
+            messagebox.showerror("绑定失败", "请选择分组和已保存的 API 模板")
+            return
+        self.prompt_config.setdefault("tagApiBindings", {})[tag] = api_name
+        save_prompt_settings(self.prompt_config, PROMPT_STUDIO_FILE)
+        self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
+        self._log(f"[提示词] {tag} 已绑定 API 模板 {api_name}")
 
     def _bind_group_content(self) -> None:
-        ensure_prompt_presets(
-            api_name=self.api_preset_var.get().strip() or "默认API模板",
-            api_payload=self._current_api_form(),
-            content_name=self.content_template_var.get().strip() or "默认内容模板",
-            content_payload=self._current_content_form(),
-            tag=self.prompt_group_var.get(),
-            path=PROMPT_STUDIO_FILE,
-        )
         self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
-        self._log(f"[提示词] {self.prompt_group_var.get()} 已绑定内容模板 {self.content_template_var.get()}")
+        tag = self.prompt_group_var.get().strip()
+        content_name = self.content_template_var.get().strip()
+        if not tag or content_name not in (self.prompt_config.get("contentTemplates") or {}):
+            messagebox.showerror("绑定失败", "请选择分组和已保存的内容模板")
+            return
+        self.prompt_config.setdefault("tagBindings", {})[tag] = content_name
+        save_prompt_settings(self.prompt_config, PROMPT_STUDIO_FILE)
+        self.prompt_config = load_prompt_settings(PROMPT_STUDIO_FILE)
+        self._log(f"[提示词] {tag} 已绑定内容模板 {content_name}")
 
     def _test_text_api(self) -> None:
         try:
@@ -6211,12 +6279,22 @@ def _patched_build_prompt_tab_v2(self: DashboardApp) -> None:
     self.prompt_group_menu = ctk.CTkOptionMenu(top, variable=self.prompt_group_var, values=[""])
     self.prompt_group_menu.grid(row=2, column=0, sticky="ew", padx=(16, 8), pady=(0, 12))
     ctk.CTkLabel(top, text="API 模板").grid(row=1, column=1, sticky="w", padx=8, pady=(0, 6))
-    self.api_preset_menu = ctk.CTkOptionMenu(top, variable=self.api_preset_var, values=[""])
+    self.api_preset_menu = ctk.CTkOptionMenu(
+        top,
+        variable=self.api_preset_var,
+        values=[""],
+        command=lambda value: self._load_api_preset_into_form(value),
+    )
     self.api_preset_menu.grid(row=2, column=1, sticky="ew", padx=8, pady=(0, 12))
     ctk.CTkLabel(top, text="内容模板").grid(row=1, column=2, sticky="w", padx=8, pady=(0, 6))
-    self.content_template_menu = ctk.CTkOptionMenu(top, variable=self.content_template_var, values=[""])
+    self.content_template_menu = ctk.CTkOptionMenu(
+        top,
+        variable=self.content_template_var,
+        values=[""],
+        command=lambda value: self._load_content_template_into_form(value),
+    )
     self.content_template_menu.grid(row=2, column=2, sticky="ew", padx=8, pady=(0, 12))
-    ctk.CTkButton(top, text="载入当前模板", command=self._load_prompt_for_group).grid(
+    ctk.CTkButton(top, text="载入当前模板", command=self._load_selected_prompt_templates).grid(
         row=2, column=3, sticky="ew", padx=8, pady=(0, 12)
     )
     ctk.CTkButton(top, text="绑定分组到 API 模板", command=self._bind_group_api).grid(
