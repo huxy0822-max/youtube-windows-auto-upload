@@ -5695,6 +5695,16 @@ def _patched_build_variables_v2(self: DashboardApp) -> None:
     self.queue_videos_per_window_var = ctk.StringVar(value=str(state.get("queue_videos_per_window") or "1").strip() or "1")
     # 浏览器提供者选择: auto / hubstudio / bitbrowser
     _saved_provider = str(state.get("browser_provider") or "auto").strip().lower() or "auto"
+    if _saved_provider not in {"auto", "hubstudio", "bitbrowser"}:
+        _saved_provider = "auto"
+    if _saved_provider == "hubstudio":
+        try:
+            probes = probe_browser_providers()
+            if probes.get("bitbrowser") and not probes.get("hubstudio"):
+                _saved_provider = "bitbrowser"
+                state["browser_provider"] = _saved_provider
+        except Exception:
+            pass
     self.browser_provider_var = ctk.StringVar(value=_saved_provider)
     # 启动时立即应用 provider 设置
     set_runtime_provider(_saved_provider if _saved_provider != "auto" else None)
