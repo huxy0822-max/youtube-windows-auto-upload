@@ -3238,6 +3238,139 @@ async def fill_visible_upload_field(page, field_name: str, text: str) -> bool:
     return False
 
 
+async def wait_for_upload_text_fields_ready(page, timeout_ms: int = 120000) -> bool:
+    """等待 YouTube 详情页的标题/简介真实输入框完成渲染。"""
+    deadline = time.monotonic() + max(1, timeout_ms) / 1000.0
+    title_selectors = (
+        "ytcp-uploads-dialog ytcp-social-suggestions-textbox#title-textarea div#textbox",
+        "ytcp-uploads-dialog #title-textarea #textbox",
+        "ytcp-social-suggestions-textbox#title-textarea div#textbox",
+        "#title-textarea #textbox",
+    )
+    description_selectors = (
+        "ytcp-uploads-dialog ytcp-social-suggestions-textbox#description-textarea div#textbox",
+        "ytcp-uploads-dialog #description-textarea #textbox",
+        "ytcp-social-suggestions-textbox#description-textarea div#textbox",
+        "#description-textarea #textbox",
+    )
+
+    async def _has_visible(selectors: tuple[str, ...]) -> bool:
+        for selector in selectors:
+            try:
+                locator = page.locator(selector).first
+                if await locator.count() > 0 and await locator.is_visible():
+                    return True
+            except Exception:
+                continue
+        return False
+
+    while time.monotonic() < deadline:
+        title_ready = await _has_visible(title_selectors)
+        description_ready = await _has_visible(description_selectors)
+        if title_ready and description_ready:
+            return True
+        await asyncio.sleep(1)
+    return False
+
+
+async def ensure_upload_show_more_expanded(page, timeout_ms: int = 45000) -> bool:
+    """展开详情页的 Show more，确保标签和分类区域可用。"""
+
+    async def _advanced_visible() -> bool:
+        try:
+            return bool(
+                await page.evaluate(
+                    """
+                    () => {
+                        const visible = (el) => !!el && (
+                            el.offsetParent !== null ||
+                            el.offsetWidth > 0 ||
+                            el.offsetHeight > 0 ||
+                            el.getClientRects().length > 0
+                        );
+                        return !!Array.from(document.querySelectorAll(
+                            "ytcp-form-select#category, #category-container, #tags-input, ytcp-video-tags"
+                        )).find(visible);
+                    }
+                    """
+                )
+            )
+        except Exception:
+            return False
+
+    async def _dom_click_show_more() -> bool:
+        try:
+            return bool(
+                await page.evaluate(
+                    """
+                    () => {
+                        const visible = (el) => !!el && (
+                            el.offsetParent !== null ||
+                            el.offsetWidth > 0 ||
+                            el.offsetHeight > 0 ||
+                            el.getClientRects().length > 0
+                        );
+                        const textOf = (el) => ((el && (el.innerText || el.textContent)) || "").trim();
+                        const showMoreRe = /show\\s*more|顯示更多|显示更多|更多/i;
+                        const candidates = Array.from(document.querySelectorAll(
+                            "ytcp-button#toggle-button, #toggle-button, button, ytcp-button"
+                        ));
+                        for (const node of candidates) {
+                            if (!visible(node)) continue;
+                            const text = textOf(node);
+                            const aria = node.getAttribute?.("aria-label") || node.querySelector?.("button")?.getAttribute?.("aria-label") || "";
+                            if (!showMoreRe.test(text + " " + aria)) continue;
+                            const target = node.querySelector?.("button") || node;
+                            try { target.scrollIntoView({ block: "center", inline: "center", behavior: "instant" }); } catch (_) {}
+                            try { target.click(); } catch (_) {}
+                            for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+                                try {
+                                    target.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, composed: true }));
+                                } catch (_) {}
+                            }
+                            return true;
+                        }
+                        return false;
+                    }
+                    """
+                )
+            )
+        except Exception as exc:
+            log(f"Show more DOM 兜底异常: {exc}", "DEBUG")
+            return False
+
+    deadline = time.monotonic() + max(1, timeout_ms) / 1000.0
+    while time.monotonic() < deadline:
+        if await _advanced_visible():
+            return True
+
+        await clear_blocking_overlays(page, "show-more")
+        clicked = False
+        for selector in (
+            "ytcp-uploads-dialog ytcp-button#toggle-button",
+            "ytcp-button#toggle-button",
+            "#toggle-button",
+        ):
+            try:
+                show_more = page.locator(selector).first
+                if await show_more.count() == 0 or not await show_more.is_visible():
+                    continue
+                clicked = await human_click(page, show_more, f"Show more ({selector})")
+                if clicked:
+                    break
+            except Exception as exc:
+                log(f"Show more 点击异常 ({selector}): {exc}", "DEBUG")
+
+        if not clicked:
+            clicked = await _dom_click_show_more()
+            if clicked:
+                log("Show more DOM 兜底点击成功", "OK")
+
+        await asyncio.sleep(1.5 if clicked else 1.0)
+
+    return await _advanced_visible()
+
+
 async def click_visible_upload_dialog_button(
     page,
     desc: str,
@@ -6394,6 +6527,10 @@ async def upload_single(
                 return make_upload_result(False, True, "上传详情页未就绪", "upload_details_not_ready")
             if not details_ready:
                 log("上传详情页仍未完全就绪，但已检测到文件已进入上传上下文，继续后续字段等待", "WARN")
+
+            fields_ready = await wait_for_upload_text_fields_ready(page, timeout_ms=120000)
+            if not fields_ready:
+                log("标题/简介输入框长时间未就绪，继续尝试 DOM 兜底填写", "WARN")
             
             await random_delay(2, 3)
             
@@ -6641,19 +6778,9 @@ async def upload_single(
             await random_delay(0.5, 1)
             
             # ========== 展开 Show more ==========
-            # 验证成功 (2026-01-30): 使用 scrollIntoViewIfNeeded + ID 选择器 (多语言通用)
-            show_more = page.locator("ytcp-button#toggle-button").first
-            if await show_more.count() > 0:
-                try:
-                    await show_more.scroll_into_view_if_needed()
-                    await asyncio.sleep(0.5)
-                    # 只有当它是收起状态时才点击 (虽然通常一开始都是收起的)
-                    # Show more 按钮本身存在，通过点击它展开。
-                    if await show_more.is_visible():
-                        await human_click(page, show_more, "Show more (#toggle-button)")
-                        await random_delay(2.0, 2.5)  # 等待展开动画
-                except Exception as e:
-                    log(f"Show more 点击失败: {e}", "WARN")
+            show_more_ready = await ensure_upload_show_more_expanded(page)
+            if not show_more_ready:
+                log("Show more 未确认展开，标签/分类将继续尝试兜底定位", "WARN")
 
             # ========== 标签 ==========
             if tags:
