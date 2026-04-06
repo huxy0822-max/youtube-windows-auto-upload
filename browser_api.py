@@ -76,6 +76,8 @@ def probe_browser_providers() -> dict[str, bool]:
             try:
                 resp = requests.post(url, json=defaults["list_payload"], timeout=15)
                 alive = resp.status_code < 500
+                if not alive and provider_name == "bitbrowser":
+                    alive = _post_json_with_curl(url, defaults["list_payload"], timeout=15) is not None
             except Exception:
                 if provider_name == "bitbrowser":
                     alive = _post_json_with_curl(url, defaults["list_payload"], timeout=15) is not None
