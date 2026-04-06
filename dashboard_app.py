@@ -492,10 +492,10 @@ def _build_live_group_catalog_from_browser(
         mapped = by_container.get(container_code) or {}
         raw_payload = env.get("_raw") if isinstance(env.get("_raw"), dict) else {}
         group_name = str(
-            env.get("groupName")
+            raw_payload.get("groupName")
+            or env.get("groupName")
             or env.get("group")
             or env.get("tag")
-            or raw_payload.get("groupName")
             or mapped.get("tag")
             or "未分组"
         ).strip() or "未分组"

@@ -416,6 +416,12 @@ def _normalize_bitbrowser_envs(result: dict[str, Any]) -> list[dict[str, Any]]:
             or ""
         ).strip()
         mapped = by_container.get(container_code) or {}
+        live_group = str(
+            item.get("groupName")
+            or item.get("tagName")
+            or item.get("tag")
+            or ""
+        ).strip()
         serial = (
             _as_int(mapped.get("serial"))
             or _as_int(item.get("serialNumber"))
@@ -429,7 +435,8 @@ def _normalize_bitbrowser_envs(result: dict[str, Any]) -> list[dict[str, Any]]:
                 "serialNumber": serial,
                 "containerCode": container_code,
                 "name": item.get("name") or item.get("browserName") or mapped.get("channel_name") or fallback_entry.get("channel_name") or "",
-                "tag": mapped.get("tag") or item.get("groupName") or item.get("tag") or fallback_entry.get("tag") or "",
+                "groupName": live_group or mapped.get("tag") or fallback_entry.get("tag") or "",
+                "tag": live_group or mapped.get("tag") or fallback_entry.get("tag") or "",
                 "remark": item.get("remark") or item.get("browserRemark") or item.get("description") or "",
                 "_raw": item,
             }
