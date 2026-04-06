@@ -209,8 +209,19 @@ TAG_DIR_ALIASES = {
 UPLOAD_SCRIPT = resolve_upload_script(_SCRIPT_DIR)
 
 # ============ 渲染配置 ============
-AUDIO_WORKERS = int(os.environ.get("AUDIO_WORKERS", 16))  # 音频合成并行数
-VIDEO_WORKERS = int(os.environ.get("VIDEO_WORKERS", 10))   # 视频渲染并行数
+def _default_worker_count(kind: str) -> int:
+    cores = max(1, os.cpu_count() or 4)
+    if IS_MAC:
+        # VideoToolbox 编码很快，但滤镜链仍吃 CPU/GPU 内存带宽。Mac 上过高并发会互相抢资源，
+        # 反而让单条视频变慢，所以默认收敛到更稳的队列宽度；仍允许环境变量手动覆盖。
+        if kind == "video":
+            return max(1, min(3, cores // 3 or 1))
+        return max(2, min(6, cores // 2 or 2))
+    return 10 if kind == "video" else 16
+
+
+AUDIO_WORKERS = int(os.environ.get("AUDIO_WORKERS", _default_worker_count("audio")))  # 音频合成并行数
+VIDEO_WORKERS = int(os.environ.get("VIDEO_WORKERS", _default_worker_count("video")))   # 视频渲染并行数
 SONG_COUNT = 20               # 每个母带默认用多少首歌
 MASTER_COUNT_PER_TAG = 5      # 每个环境默认生成多少个随机母带
 HISTORY_FILE = _SCRIPT_DIR / "render_history.json"
@@ -301,8 +312,16 @@ def _windows_has_nvenc_runtime() -> bool:
 if IS_MAC:
     VIDEO_CODEC = "h264_videotoolbox"
     VIDEO_BITRATE = "8000k"
-    VIDEO_SPATIAL_AQ = True
-    _CODEC_EXTRA_ARGS = ['-spatial_aq', '1']
+    VIDEO_SPATIAL_AQ = False
+    _CODEC_EXTRA_ARGS = [
+        "-realtime", "1",
+        "-prio_speed", "1",
+        "-power_efficient", "1",
+        "-allow_sw", "1",
+        "-profile:v", "high",
+        "-maxrate", "8000k",
+        "-bufsize", "16000k",
+    ]
 elif IS_WINDOWS and _windows_has_nvenc_runtime():
     VIDEO_CODEC = "h264_nvenc"
     VIDEO_BITRATE = "8000k"
@@ -788,8 +807,8 @@ class RenderOptions:
     upload_fill_thumbnails: bool = True
     upload_sync_daily_content: bool = True
     fx_randomize: bool = False
-    fx_spectrum: bool = True
-    fx_timeline: bool = True
+    fx_spectrum: bool | str = True
+    fx_timeline: bool | str = True
     fx_letterbox: bool | str = False
     fx_zoom: str = "normal"
     fx_color_spectrum: str = "random"
@@ -798,11 +817,11 @@ class RenderOptions:
     fx_spectrum_x: int = -1
     fx_spectrum_w: int = 1200
     fx_style: str = "bar"
-    fx_film_grain: bool = False
+    fx_film_grain: bool | str = False
     fx_grain_strength: int = 15
-    fx_vignette: bool = False
+    fx_vignette: bool | str = False
     fx_color_tint: str = "none"
-    fx_soft_focus: bool = False
+    fx_soft_focus: bool | str = False
     fx_soft_focus_sigma: float = 1.5
     fx_particle: str = "none"
     fx_particle_opacity: float = 0.6
@@ -813,7 +832,7 @@ class RenderOptions:
     fx_text_size: int = 60
     fx_text_style: str = "Classic"
     fx_visual_preset: str = "none"
-    fx_bass_pulse: bool = False
+    fx_bass_pulse: bool | str = False
     fx_bass_pulse_scale: float = 0.03
     fx_bass_pulse_brightness: float = 0.04
 
@@ -821,18 +840,29 @@ def parse_arguments() -> RenderOptions:
     global SONG_COUNT
     opts = RenderOptions()
     date_arg = None
+
+    def parse_toggle_value(value: str, *, default: bool) -> bool | str:
+        text = str(value or "").strip().lower()
+        if text == "random":
+            return "random"
+        if text in {"1", "true", "yes", "y", "on"}:
+            return True
+        if text in {"0", "false", "no", "n", "off"}:
+            return False
+        return default
     
     for arg in sys.argv[1:]:
         if arg == '--no-spectrum':     opts.fx_spectrum = False
+        elif arg.startswith('--spectrum='):
+            opts.fx_spectrum = parse_toggle_value(arg.split('=', 1)[1], default=True)
         elif arg == '--no-timeline':  opts.fx_timeline = False
+        elif arg.startswith('--timeline='):
+            opts.fx_timeline = parse_toggle_value(arg.split('=', 1)[1], default=True)
         elif arg == '--randomize-effects': opts.fx_randomize = True
         elif arg == '--fixed-effects': opts.fx_randomize = False
         elif arg.startswith('--letterbox'):
             if '=' in arg:
-                val = arg.split('=')[1]
-                if val.lower() == 'random': opts.fx_letterbox = 'random'
-                elif val.lower() == 'true': opts.fx_letterbox = True
-                else: opts.fx_letterbox = False
+                opts.fx_letterbox = parse_toggle_value(arg.split('=', 1)[1], default=False)
             else:
                 opts.fx_letterbox = True
         elif arg.startswith('--zoom='):  opts.fx_zoom = arg.split('=')[1]
@@ -847,13 +877,26 @@ def parse_arguments() -> RenderOptions:
         elif arg.startswith('--spectrum-w='): opts.fx_spectrum_w = int(arg.split('=')[1])
         elif arg.startswith('--style='): opts.fx_style = arg.split('=')[1]
         elif arg.startswith('--film-grain='):
-            opts.fx_film_grain = True
-            opts.fx_grain_strength = int(arg.split('=')[1])
+            value = arg.split('=', 1)[1]
+            if value.strip().lower() == "random":
+                opts.fx_film_grain = "random"
+            elif re.fullmatch(r"\s*(?:0|false|no|off)\s*", value, re.I):
+                opts.fx_film_grain = False
+            else:
+                opts.fx_film_grain = True
+                opts.fx_grain_strength = int(value)
         elif arg == '--vignette': opts.fx_vignette = True
+        elif arg.startswith('--vignette='): opts.fx_vignette = parse_toggle_value(arg.split('=', 1)[1], default=False)
         elif arg.startswith('--color-tint='): opts.fx_color_tint = arg.split('=')[1]
         elif arg.startswith('--soft-focus='):
-            opts.fx_soft_focus = True
-            opts.fx_soft_focus_sigma = float(arg.split('=')[1])
+            value = arg.split('=', 1)[1]
+            if value.strip().lower() == "random":
+                opts.fx_soft_focus = "random"
+            elif re.fullmatch(r"\s*(?:0|false|no|off)\s*", value, re.I):
+                opts.fx_soft_focus = False
+            else:
+                opts.fx_soft_focus = True
+                opts.fx_soft_focus_sigma = float(value)
         elif arg.startswith('--particle='): opts.fx_particle = arg.split('=')[1]
         elif arg.startswith('--particle-opacity='): opts.fx_particle_opacity = float(arg.split('=')[1])
         elif arg.startswith('--song-count='): SONG_COUNT = int(arg.split('=')[1])
@@ -864,6 +907,7 @@ def parse_arguments() -> RenderOptions:
         elif arg.startswith('--text-style='): opts.fx_text_style = arg.split('=')[1]
         elif arg.startswith('--visual-preset='): opts.fx_visual_preset = arg.split('=', 1)[1]
         elif arg == '--bass-pulse': opts.fx_bass_pulse = True
+        elif arg.startswith('--bass-pulse='): opts.fx_bass_pulse = parse_toggle_value(arg.split('=', 1)[1], default=False)
         elif arg.startswith('--bass-pulse-scale='): opts.fx_bass_pulse_scale = float(arg.split('=')[1])
         elif arg.startswith('--bass-pulse-brightness='): opts.fx_bass_pulse_brightness = float(arg.split('=')[1])
         elif arg.startswith('--tags=') or arg.startswith('--tag='):
@@ -935,6 +979,20 @@ def build_effect_kwargs(opts: RenderOptions, *, rng=None) -> dict:
                 return default
         return raw if raw not in (None, "") else default
 
+    def choose_flag(value, *, default: bool, probability_true: float) -> bool:
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text == "random":
+                return rng.random() < probability_true
+            if text in {"1", "true", "yes", "y", "on"}:
+                return True
+            if text in {"0", "false", "no", "n", "off"}:
+                return False
+            return default
+        if isinstance(value, bool):
+            return value
+        return bool(value) if value is not None else default
+
     def choose_int(value, *, default: int, minimum: int | None = None, maximum: int | None = None):
         raw = value
         if isinstance(raw, str):
@@ -1000,9 +1058,9 @@ def build_effect_kwargs(opts: RenderOptions, *, rng=None) -> dict:
         return picked
 
     kwargs = {
-        "spectrum": opts.fx_spectrum,
-        "timeline": opts.fx_timeline,
-        "letterbox": opts.fx_letterbox,
+        "spectrum": choose_flag(opts.fx_spectrum, default=True, probability_true=0.90),
+        "timeline": choose_flag(opts.fx_timeline, default=True, probability_true=0.80),
+        "letterbox": choose_flag(opts.fx_letterbox, default=False, probability_true=0.35),
         "visual_preset": getattr(opts, "fx_visual_preset", "none"),
         "zoom": choose_value(opts.fx_zoom, default="normal", choices=list_zoom_modes()),
         "color_spectrum": choose_value(opts.fx_color_spectrum, default="WhiteGold", choices=list_palette_names()),
@@ -1015,11 +1073,11 @@ def build_effect_kwargs(opts: RenderOptions, *, rng=None) -> dict:
         "text_pos": choose_value(opts.fx_text_pos, default="center", choices=list_text_positions()),
         "text_size": choose_int(opts.fx_text_size, default=60, minimum=18, maximum=180),
         "text_style": choose_value(opts.fx_text_style, default="Classic", choices=list_text_styles()),
-        "film_grain": opts.fx_film_grain,
+        "film_grain": choose_flag(opts.fx_film_grain, default=False, probability_true=0.35),
         "grain_strength": choose_int(opts.fx_grain_strength, default=15, minimum=0, maximum=60),
-        "vignette": opts.fx_vignette,
+        "vignette": choose_flag(opts.fx_vignette, default=False, probability_true=0.35),
         "color_tint": choose_value(opts.fx_color_tint, default="none", choices=list_tint_names()),
-        "soft_focus": opts.fx_soft_focus,
+        "soft_focus": choose_flag(opts.fx_soft_focus, default=False, probability_true=0.25),
         "soft_focus_sigma": choose_float(opts.fx_soft_focus_sigma, default=1.5, minimum=0.3, maximum=6.0),
         "particle": choose_value(
             opts.fx_particle,
@@ -1029,7 +1087,11 @@ def build_effect_kwargs(opts: RenderOptions, *, rng=None) -> dict:
         "particle_opacity": choose_float(opts.fx_particle_opacity, default=0.6, minimum=0.0, maximum=1.0),
         "particle_speed": choose_float(opts.fx_particle_speed, default=1.0, minimum=0.2, maximum=3.0),
         "text_font": choose_value(opts.fx_text_font, default="default", choices=list_font_names()),
-        "bass_pulse": bool(getattr(opts, "fx_bass_pulse", False) or str(getattr(opts, "fx_visual_preset", "")) == "mega_bass"),
+        "bass_pulse": (
+            True
+            if str(getattr(opts, "fx_visual_preset", "")) == "mega_bass"
+            else choose_flag(getattr(opts, "fx_bass_pulse", False), default=False, probability_true=0.35)
+        ),
         "bass_pulse_scale": choose_float(getattr(opts, "fx_bass_pulse_scale", 0.03), default=0.03, minimum=0.0, maximum=0.12, precision=3),
         "bass_pulse_brightness": choose_float(getattr(opts, "fx_bass_pulse_brightness", 0.04), default=0.04, minimum=0.0, maximum=0.12, precision=3),
     }

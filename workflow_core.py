@@ -309,6 +309,13 @@ def _parse_toggle(value: Any, default: bool) -> bool:
     return default
 
 
+def _visual_toggle_setting(value: Any, default: bool) -> bool | str:
+    text = str(value or "").strip().lower()
+    if text == "random":
+        return "random"
+    return _parse_toggle(value, default)
+
+
 def _visual_preset_token(name: str) -> str:
     text = str(name or "").strip()
     if not text or text.lower() == "none":
@@ -357,15 +364,22 @@ def _resolve_effective_visual_settings(defaults: WorkflowDefaults) -> dict[str, 
         settings["preset"] = "none"
         settings["visual_mode"] = "random"
         for key in (
+            "spectrum",
+            "timeline",
+            "letterbox",
             "zoom",
             "style",
             "color_spectrum",
             "color_timeline",
+            "film_grain",
+            "vignette",
             "color_tint",
+            "soft_focus",
             "particle",
             "text_font",
             "text_pos",
             "text_style",
+            "bass_pulse",
         ):
             settings[key] = "random"
         return settings
@@ -439,9 +453,9 @@ def _build_render_options_from_defaults(defaults: WorkflowDefaults) -> RenderOpt
     opts = RenderOptions()
     opts.fx_randomize = str(settings.get("visual_mode") or "").strip().lower() == "random"
 
-    opts.fx_spectrum = bool(settings.get("spectrum", True))
-    opts.fx_timeline = bool(settings.get("timeline", True))
-    opts.fx_letterbox = bool(settings.get("letterbox", False))
+    opts.fx_spectrum = _visual_toggle_setting(settings.get("spectrum", True), True)
+    opts.fx_timeline = _visual_toggle_setting(settings.get("timeline", True), True)
+    opts.fx_letterbox = _visual_toggle_setting(settings.get("letterbox", False), False)
     opts.fx_zoom = str(settings.get("zoom", "normal") or "normal")
     opts.fx_style = str(settings.get("style", "bar") or "bar")
     opts.fx_color_spectrum = str(settings.get("color_spectrum", "WhiteGold") or "WhiteGold")
@@ -449,11 +463,11 @@ def _build_render_options_from_defaults(defaults: WorkflowDefaults) -> RenderOpt
     opts.fx_spectrum_y = settings.get("spectrum_y", 530)
     opts.fx_spectrum_x = settings.get("spectrum_x", -1)
     opts.fx_spectrum_w = settings.get("spectrum_w", 1200)
-    opts.fx_film_grain = bool(settings.get("film_grain", False))
+    opts.fx_film_grain = _visual_toggle_setting(settings.get("film_grain", False), False)
     opts.fx_grain_strength = settings.get("grain_strength", 15)
-    opts.fx_vignette = bool(settings.get("vignette", False))
+    opts.fx_vignette = _visual_toggle_setting(settings.get("vignette", False), False)
     opts.fx_color_tint = str(settings.get("color_tint", "none") or "none")
-    opts.fx_soft_focus = bool(settings.get("soft_focus", False))
+    opts.fx_soft_focus = _visual_toggle_setting(settings.get("soft_focus", False), False)
     opts.fx_soft_focus_sigma = settings.get("soft_focus_sigma", 1.5)
     opts.fx_particle = str(settings.get("particle", "none") or "none")
     opts.fx_particle_opacity = settings.get("particle_opacity", 0.6)
@@ -464,7 +478,11 @@ def _build_render_options_from_defaults(defaults: WorkflowDefaults) -> RenderOpt
     opts.fx_text_size = settings.get("text_size", 60)
     opts.fx_text_style = str(settings.get("text_style", "Classic") or "Classic")
     opts.fx_visual_preset = _visual_preset_token(str(settings.get("preset", "none") or "none"))
-    opts.fx_bass_pulse = bool(settings.get("bass_pulse", False) or opts.fx_visual_preset == "mega_bass")
+    opts.fx_bass_pulse = (
+        "random"
+        if str(settings.get("bass_pulse") or "").strip().lower() == "random"
+        else bool(settings.get("bass_pulse", False) or opts.fx_visual_preset == "mega_bass")
+    )
     opts.fx_bass_pulse_scale = settings.get("bass_pulse_scale", 0.03)
     opts.fx_bass_pulse_brightness = settings.get("bass_pulse_brightness", 0.04)
     return opts

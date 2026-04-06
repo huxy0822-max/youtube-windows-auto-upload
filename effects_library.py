@@ -82,6 +82,28 @@ MEGA_BASS_STYLE_VARIANTS = [
     "mega_glow_band",
 ]
 
+SPECTRUM_STYLE_LIBRARY = {
+    "bar": {"mode": "cline", "height": 170, "alpha": 0.92, "glow": 0},
+    "bar_mirror": {"mode": "p2p", "height": 190, "alpha": 0.90, "glow": 0},
+    "wave": {"mode": "line", "height": 160, "alpha": 0.92, "glow": 0},
+    "circular": {"mode": "cline", "height": 190, "alpha": 0.92, "glow": 5},
+    "neon_line": {"mode": "cline", "height": 150, "alpha": 0.96, "glow": 7},
+    "soft_ribbon": {"mode": "line", "height": 210, "alpha": 0.82, "glow": 8},
+    "laser_dots": {"mode": "point", "height": 150, "alpha": 0.92, "glow": 6},
+    "pulse_scope": {"mode": "p2p", "height": 180, "alpha": 0.90, "glow": 5},
+    "thin_sparkline": {"mode": "cline", "height": 96, "alpha": 0.88, "glow": 4},
+    "wide_bars": {"mode": "cline", "height": 235, "alpha": 0.90, "glow": 3},
+}
+
+GENERATED_STICKER_EFFECTS = {
+    "neon_corner_ticks": "四角霓虹定位线",
+    "bottom_glow_plate": "底部半透明发光托盘",
+    "laser_sweep": "横向激光扫描光条",
+    "retro_scanlines": "复古扫描线纹理",
+    "club_frame": "夜店感细边框",
+    "subtle_vinyl_dust": "轻微唱片颗粒",
+}
+
 MEGA_BASS_PALETTE_NAMES = [
     "MegaBassPurple",
     "MegaBassGreen",
@@ -131,7 +153,7 @@ TINT_FILTERS = {
 
 def list_effects() -> list[str]:
     """返回当前支持的基础风格名。"""
-    return ["bar", "bar_mirror", "wave", "circular"]
+    return list(SPECTRUM_STYLE_LIBRARY.keys())
 
 
 def discover_particle_files() -> dict[str, str]:
@@ -168,7 +190,7 @@ def get_random_effects() -> dict[str, str]:
 
 
 def list_particle_effects() -> list[str]:
-    return ["none", *discover_particle_files().keys()]
+    return ["none", *GENERATED_STICKER_EFFECTS.keys(), *discover_particle_files().keys()]
 
 
 def list_text_positions() -> list[str]:
@@ -202,7 +224,8 @@ def list_mega_bass_font_names() -> list[str]:
 
 def list_mega_bass_particle_effects() -> list[str]:
     particle_files = discover_particle_files()
-    return [item for item in MEGA_BASS_PRIMARY_PARTICLES if item in particle_files]
+    generated = ["neon_corner_ticks", "laser_sweep", "club_frame", "bottom_glow_plate"]
+    return [*generated, *[item for item in MEGA_BASS_PRIMARY_PARTICLES if item in particle_files]]
 
 
 def list_mega_bass_palette_names() -> list[str]:
@@ -265,8 +288,8 @@ def _pick_flag(value, *, probability_true: float = 0.5, rng=None) -> bool:
 def _pick_style(name: str, *, rng=None) -> str:
     rng = rng or random
     if name == "random":
-        return rng.choice(["bar", "wave", "circular", "bar_mirror"])
-    return name
+        return rng.choice(list_effects())
+    return name if name in SPECTRUM_STYLE_LIBRARY or name in MEGA_BASS_STYLE_VARIANTS else "bar"
 
 
 def _pick_particle(name: str, *, visual_preset: str = "none", rng=None) -> str:
@@ -274,12 +297,12 @@ def _pick_particle(name: str, *, visual_preset: str = "none", rng=None) -> str:
     particle_files = discover_particle_files()
     if name == "random":
         if visual_preset == "mega_bass":
-            choices = [item for item in MEGA_BASS_PRIMARY_PARTICLES if item in particle_files]
+            choices = list_mega_bass_particle_effects()
             if choices:
                 return rng.choice(choices)
-        choices = list(particle_files.keys())
+        choices = [*GENERATED_STICKER_EFFECTS.keys(), *particle_files.keys()]
         return rng.choice(choices) if choices else "none"
-    return name if name in particle_files or name == "none" else "none"
+    return name if name in particle_files or name in GENERATED_STICKER_EFFECTS or name == "none" else "none"
 
 
 def _pick_tint(name: str, *, rng=None) -> str:
@@ -496,7 +519,48 @@ def get_effect(
         current = next_label
 
     particle_files = discover_particle_files()
-    if particle_name != "none":
+    if particle_name in GENERATED_STICKER_EFFECTS:
+        next_label = "base6_generated"
+        accent = timeline_palette["timeline"]
+        if particle_name == "neon_corner_ticks":
+            chains.append(
+                f"[{current}]drawbox=x=62:y=62:w=310:h=5:color={accent}@{particle_opacity:.2f}:t=fill,"
+                f"drawbox=x=62:y=62:w=5:h=160:color={accent}@{particle_opacity:.2f}:t=fill,"
+                f"drawbox=x=1548:y=62:w=310:h=5:color={accent}@{particle_opacity:.2f}:t=fill,"
+                f"drawbox=x=1853:y=62:w=5:h=160:color={accent}@{particle_opacity:.2f}:t=fill,"
+                f"drawbox=x=62:y=1013:w=310:h=5:color={accent}@{particle_opacity:.2f}:t=fill,"
+                f"drawbox=x=62:y=858:w=5:h=160:color={accent}@{particle_opacity:.2f}:t=fill,"
+                f"drawbox=x=1548:y=1013:w=310:h=5:color={accent}@{particle_opacity:.2f}:t=fill,"
+                f"drawbox=x=1853:y=858:w=5:h=160:color={accent}@{particle_opacity:.2f}:t=fill[{next_label}]"
+            )
+        elif particle_name == "bottom_glow_plate":
+            chains.append(
+                f"[{current}]drawbox=x=220:y=820:w=1480:h=156:color=black@0.20:t=fill,"
+                f"drawbox=x=220:y=972:w=1480:h=4:color={accent}@{particle_opacity:.2f}:t=fill[{next_label}]"
+            )
+        elif particle_name == "laser_sweep":
+            sweep_x = f"mod(t*{260 * particle_speed:.2f}\\,2160)-240"
+            chains.append(
+                f"[{current}]drawbox=x='{sweep_x}':y=0:w=14:h=1080:color={accent}@{min(0.28, particle_opacity):.2f}:t=fill,"
+                f"drawbox=x='mod(t*{180 * particle_speed:.2f}\\,2200)-280':y=0:w=4:h=1080:color=white@0.18:t=fill[{next_label}]"
+            )
+        elif particle_name == "retro_scanlines":
+            chains.append(
+                f"[{current}]drawgrid=w=1920:h=18:t=1:c=white@{min(0.12, particle_opacity * 0.22):.3f}[{next_label}]"
+            )
+        elif particle_name == "club_frame":
+            chains.append(
+                f"[{current}]drawbox=x=34:y=34:w=1852:h=4:color={accent}@{particle_opacity:.2f}:t=fill,"
+                f"drawbox=x=34:y=1042:w=1852:h=4:color={accent}@{particle_opacity:.2f}:t=fill,"
+                f"drawbox=x=34:y=34:w=4:h=1012:color={accent}@{particle_opacity:.2f}:t=fill,"
+                f"drawbox=x=1882:y=34:w=4:h=1012:color={accent}@{particle_opacity:.2f}:t=fill[{next_label}]"
+            )
+        else:
+            chains.append(
+                f"[{current}]noise=alls={max(1, int(6 + 12 * particle_opacity))}:allf=t+u[{next_label}]"
+            )
+        current = next_label
+    elif particle_name != "none":
         overlay_file = OVERLAY_DIR / particle_files.get(particle_name, "")
         if overlay_file.exists():
             overlay_plan = _particle_overlay_plan(particle_name, visual_preset=visual_preset, rng=rng)
@@ -654,12 +718,31 @@ def get_effect(
             chains.append(f"[{current}][{spec_glow}]overlay=x={x_expr}:y={spectrum_y}[base7_glow]")
             chains.append(f"[base7_glow][{spec_core}]overlay=x={x_expr}:y={core_y}[{next_label}]")
         else:
-            mode = "line" if style in {"wave", "circular"} else "cline"
-            chains.append(
-                f"[1:a]showwaves=s={spec_width}x{spec_height}:mode={mode}:colors={spectrum_palette['spectrum']},"
-                f"format=rgba,colorkey=0x000000:0.08:0.02,colorchannelmixer=aa=0.92[{spec_label}]"
-            )
-            chains.append(f"[{current}][{spec_label}]overlay=x={x_expr}:y={spectrum_y}[{next_label}]")
+            preset = SPECTRUM_STYLE_LIBRARY.get(style, SPECTRUM_STYLE_LIBRARY["bar"])
+            mode = str(preset["mode"])
+            spec_height = int(preset["height"])
+            core_alpha = float(preset["alpha"])
+            glow_sigma = int(preset["glow"])
+            if glow_sigma > 0:
+                raw_label = "spectrum_raw"
+                spec_core = "spectrum_core"
+                spec_glow = "spectrum_glow"
+                chains.append(
+                    f"[1:a]showwaves=s={spec_width}x{spec_height}:mode={mode}:colors={spectrum_palette['spectrum']},"
+                    f"format=rgba,colorkey=0x000000:0.08:0.02,split=2[{raw_label}a][{raw_label}b]"
+                )
+                chains.append(
+                    f"[{raw_label}a]gblur=sigma={glow_sigma},colorchannelmixer=aa={min(0.58, core_alpha * 0.62):.2f}[{spec_glow}]"
+                )
+                chains.append(f"[{raw_label}b]colorchannelmixer=aa={core_alpha:.2f}[{spec_core}]")
+                chains.append(f"[{current}][{spec_glow}]overlay=x={x_expr}:y={spectrum_y}[base7_glow]")
+                chains.append(f"[base7_glow][{spec_core}]overlay=x={x_expr}:y={spectrum_y}[{next_label}]")
+            else:
+                chains.append(
+                    f"[1:a]showwaves=s={spec_width}x{spec_height}:mode={mode}:colors={spectrum_palette['spectrum']},"
+                    f"format=rgba,colorkey=0x000000:0.08:0.02,colorchannelmixer=aa={core_alpha:.2f}[{spec_label}]"
+                )
+                chains.append(f"[{current}][{spec_label}]overlay=x={x_expr}:y={spectrum_y}[{next_label}]")
         current = next_label
 
     if timeline:

@@ -8765,7 +8765,7 @@ def _build_group_upload_options(metadata_dict: dict[str, Any], defaults: UploadD
     upload_options = metadata_dict.get("upload_options") if isinstance(metadata_dict.get("upload_options"), dict) else {}
     default_kids = bool(defaults.is_for_kids)
     default_altered = _coerce_yes_no_bool(defaults.altered_content, default=True)
-    default_notify = _coerce_yes_no_bool(metadata_dict.get("notify_subscribers", False), default=False)
+    default_notify = _coerce_yes_no_bool(getattr(defaults, "notify_subscribers", False), default=False)
     default_auto_close = _coerce_yes_no_bool(defaults.auto_close_after, default=False)
     visibility = str(upload_options.get("visibility") or defaults.visibility or "private").strip().lower() or "private"
     scheduled_publish_at = str(upload_options.get("scheduled_publish_at") or "").strip() or _compose_job_schedule_text(defaults)
@@ -8780,7 +8780,7 @@ def _build_group_upload_options(metadata_dict: dict[str, Any], defaults: UploadD
         ),
         "altered_content": _coerce_yes_no_bool(upload_options.get("altered_content", defaults.altered_content), default=default_altered),
         "notify_subscribers": _coerce_yes_no_bool(
-            upload_options.get("notify_subscribers", metadata_dict.get("notify_subscribers", False)),
+            upload_options.get("notify_subscribers", metadata_dict.get("notify_subscribers", getattr(defaults, "notify_subscribers", False))),
             default=default_notify,
         ),
         "category": str(upload_options.get("category") or defaults.category or "Music").strip() or "Music",
@@ -8846,6 +8846,8 @@ def _build_upload_options_for_serial(
         upload_options["made_for_kids"] = _coerce_yes_no_bool(override.kids_content, default=False)
     if str(override.ai_content or "").strip():
         upload_options["altered_content"] = _coerce_yes_no_bool(override.ai_content, default=True)
+    if str(override.notify_subscribers or "").strip():
+        upload_options["notify_subscribers"] = _coerce_yes_no_bool(override.notify_subscribers, default=False)
     schedule_text = _resolve_schedule_for_override(override, defaults, str(upload_options.get("visibility") or "").strip().lower())
     upload_options["scheduled_publish_at"] = schedule_text or None
     return upload_options

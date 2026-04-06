@@ -58,6 +58,7 @@ class UploadDefaults:
     is_for_kids: bool = False
     ai_content: str = "yes"
     altered_content: str = "yes"
+    notify_subscribers: bool = False
     schedule_date: Optional[str] = None
     schedule_time: Optional[str] = None
     timezone: str = "Asia/Taipei"
@@ -70,6 +71,7 @@ class UploadDefaults:
             "is_for_kids": bool(self.is_for_kids),
             "ai_content": str(self.ai_content or "").strip() or "yes",
             "altered_content": str(self.altered_content or "").strip() or "yes",
+            "notify_subscribers": bool(self.notify_subscribers),
             "schedule_date": str(self.schedule_date or "").strip() or None,
             "schedule_time": str(self.schedule_time or "").strip() or None,
             "timezone": str(self.timezone or "").strip() or "Asia/Taipei",
@@ -85,6 +87,7 @@ class UploadDefaults:
             is_for_kids=bool(payload.get("is_for_kids", False)),
             ai_content=str(payload.get("ai_content") or "yes").strip() or "yes",
             altered_content=str(payload.get("altered_content") or "yes").strip() or "yes",
+            notify_subscribers=bool(payload.get("notify_subscribers", False)),
             schedule_date=str(payload.get("schedule_date") or "").strip() or None,
             schedule_time=str(payload.get("schedule_time") or "").strip() or None,
             timezone=str(payload.get("timezone") or "Asia/Taipei").strip() or "Asia/Taipei",
@@ -100,6 +103,7 @@ class WindowOverride:
     category: str = ""
     kids_content: str = ""
     ai_content: str = ""
+    notify_subscribers: str = ""
     schedule_mode: str = ""
     schedule_date: str = ""
     schedule_time: str = ""
@@ -112,6 +116,7 @@ class WindowOverride:
                 str(self.category or "").strip(),
                 str(self.kids_content or "").strip(),
                 str(self.ai_content or "").strip(),
+                str(self.notify_subscribers or "").strip(),
                 str(self.schedule_mode or "").strip(),
                 str(self.schedule_date or "").strip(),
                 str(self.schedule_time or "").strip(),
@@ -126,6 +131,7 @@ class WindowOverride:
             "category": str(self.category or "").strip(),
             "kids_content": str(self.kids_content or "").strip(),
             "ai_content": str(self.ai_content or "").strip(),
+            "notify_subscribers": str(self.notify_subscribers or "").strip(),
             "schedule_mode": str(self.schedule_mode or "").strip(),
             "schedule_date": str(self.schedule_date or "").strip(),
             "schedule_time": str(self.schedule_time or "").strip(),
@@ -145,6 +151,7 @@ class WindowOverride:
             category=str(payload.get("category") or "").strip(),
             kids_content=str(payload.get("kids_content") or "").strip(),
             ai_content=str(payload.get("ai_content") or "").strip(),
+            notify_subscribers=str(payload.get("notify_subscribers") or "").strip(),
             schedule_mode=str(payload.get("schedule_mode") or "").strip(),
             schedule_date=str(payload.get("schedule_date") or "").strip(),
             schedule_time=str(payload.get("schedule_time") or "").strip(),
