@@ -6815,6 +6815,11 @@ async def upload_single(
             notify_ok = await set_notify_subscribers(page, notify_subscribers)
             if not notify_ok:
                 log("未能确认订阅通知开关状态，继续后续流程", "WARN")
+
+            log("设置允许嵌入 = Off...")
+            embedding_ok = await set_allow_embedding(page, False)
+            if not embedding_ok:
+                log("未能确认允许嵌入开关状态，继续后续流程", "WARN")
             
             await random_delay(0.5, 1)
             
@@ -8237,12 +8242,12 @@ async def set_notify_subscribers(page, enabled: bool) -> bool:
                 const clickEl = (el) => {
                     if (!(el instanceof HTMLElement) || !visible(el)) return false;
                     try { el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" }); } catch (_) {}
-                    try { el.click(); } catch (_) {}
-                    for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+                    for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup"]) {
                         try {
                             el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, composed: true }));
                         } catch (_) {}
                     }
+                    try { el.click(); } catch (_) {}
                     return true;
                 };
 
@@ -8287,6 +8292,160 @@ async def set_notify_subscribers(page, enabled: bool) -> bool:
             return True
     except Exception as exc:
         log(f"设置订阅通知失败: {exc}", "WARN")
+    return False
+
+
+async def set_allow_embedding(page, enabled: bool = False) -> bool:
+    """默认关闭视频嵌入，避免上传后被外站嵌入。"""
+    label_patterns = [
+        r"allow\s+embedding",
+        r"允許嵌入",
+        r"允许嵌入",
+    ]
+    try:
+        result = await page.evaluate(
+            """
+            ({ labelPatterns, enabled }) => {
+                const visible = (el) => !!el && (
+                    el.offsetParent !== null ||
+                    el.offsetWidth > 0 ||
+                    el.offsetHeight > 0 ||
+                    el.getClientRects().length > 0
+                );
+                const textOf = (el) => ((el && (el.innerText || el.textContent)) || "").trim();
+                const attrOf = (el) => [
+                    el?.getAttribute?.("aria-label") || "",
+                    el?.getAttribute?.("title") || "",
+                    el?.id || "",
+                ].join(" ");
+                const labelRe = new RegExp(labelPatterns.join("|"), "i");
+                const roots = [document];
+                const seen = new Set([document]);
+
+                const surroundingText = (node) => {
+                    const chunks = [textOf(node), attrOf(node)];
+                    let current = node;
+                    for (let depth = 0; current && depth < 6; depth += 1) {
+                        chunks.push(textOf(current), attrOf(current));
+                        const parent = current.parentElement || current.getRootNode?.().host || null;
+                        if (parent) {
+                            chunks.push(textOf(parent), attrOf(parent));
+                            for (const sibling of Array.from(parent.children || [])) {
+                                chunks.push(textOf(sibling), attrOf(sibling));
+                            }
+                        }
+                        current = parent;
+                    }
+                    return chunks.join(" ");
+                };
+
+                const isChecked = (node) => {
+                    const value = (
+                        node?.getAttribute?.("aria-checked") ||
+                        node?.getAttribute?.("checked") ||
+                        node?.querySelector?.("[aria-checked]")?.getAttribute?.("aria-checked") ||
+                        ""
+                    ).toString().toLowerCase();
+                    if (value === "true") return true;
+                    if (value === "false") return false;
+                    if (node instanceof HTMLInputElement && node.type === "checkbox") return !!node.checked;
+                    const input = node?.querySelector?.("input[type='checkbox']");
+                    if (input) return !!input.checked;
+                    return false;
+                };
+
+                const setCheckedState = (node, value) => {
+                    if (!node) return;
+                    try {
+                        if (node instanceof HTMLInputElement && node.type === "checkbox") {
+                            node.checked = !!value;
+                            node.dispatchEvent(new Event("input", { bubbles: true }));
+                            node.dispatchEvent(new Event("change", { bubbles: true }));
+                        }
+                    } catch (_) {}
+                    try {
+                        if (
+                            node.getAttribute?.("aria-checked") !== null ||
+                            node.getAttribute?.("role") === "checkbox"
+                        ) {
+                            node.setAttribute("aria-checked", value ? "true" : "false");
+                        }
+                    } catch (_) {}
+                    try {
+                        const input = node.querySelector?.("input[type='checkbox']");
+                        if (input) {
+                            input.checked = !!value;
+                            input.dispatchEvent(new Event("input", { bubbles: true }));
+                            input.dispatchEvent(new Event("change", { bubbles: true }));
+                        }
+                    } catch (_) {}
+                    try {
+                        const ariaNode = node.querySelector?.("[aria-checked]");
+                        if (ariaNode) {
+                            ariaNode.setAttribute("aria-checked", value ? "true" : "false");
+                        }
+                    } catch (_) {}
+                };
+
+                const clickEl = (el) => {
+                    if (!(el instanceof HTMLElement) || !visible(el)) return false;
+                    try { el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" }); } catch (_) {}
+                    for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup"]) {
+                        try {
+                            el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, composed: true }));
+                        } catch (_) {}
+                    }
+                    try { el.click(); } catch (_) {}
+                    return true;
+                };
+
+                while (roots.length) {
+                    const root = roots.shift();
+                    const allNodes = root.querySelectorAll ? root.querySelectorAll("*") : [];
+                    for (const node of allNodes) {
+                        if (node && node.shadowRoot && !seen.has(node.shadowRoot)) {
+                            seen.add(node.shadowRoot);
+                            roots.push(node.shadowRoot);
+                        }
+                    }
+
+                    const candidates = Array.from(
+                        root.querySelectorAll
+                            ? root.querySelectorAll("ytcp-checkbox-lit, tp-yt-paper-checkbox, [role='checkbox'], input[type='checkbox']")
+                            : []
+                    ).filter(visible);
+                    for (const candidate of candidates) {
+                        const text = surroundingText(candidate);
+                        if (!labelRe.test(text)) continue;
+                        const container =
+                            candidate.closest?.("label, ytcp-checkbox-lit, tp-yt-paper-checkbox, div, span") ||
+                            candidate;
+                        const checked = isChecked(candidate) || isChecked(container);
+                        if (checked === !!enabled) {
+                            return { found: true, changed: false, checked };
+                        }
+                        const target =
+                            candidate.querySelector?.("#checkbox-container") ||
+                            candidate.querySelector?.("[role='checkbox']") ||
+                            candidate.querySelector?.("input[type='checkbox']") ||
+                            candidate;
+                        const clicked = clickEl(target);
+                        setCheckedState(candidate, !!enabled);
+                        setCheckedState(container, !!enabled);
+                        setCheckedState(target, !!enabled);
+                        return { found: true, changed: clicked, checked: !!enabled };
+                    }
+                }
+                return { found: false, changed: false, checked: false };
+            }
+            """,
+            {"labelPatterns": label_patterns, "enabled": bool(enabled)},
+        )
+        if result.get("found"):
+            log(f"允许嵌入已设置为 {'开启' if enabled else '关闭'}", "OK")
+            return True
+    except Exception as exc:
+        log(f"设置允许嵌入失败: {exc}", "WARN")
     return False
 
 
