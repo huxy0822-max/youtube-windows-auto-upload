@@ -15,7 +15,9 @@ import difflib
 import hashlib
 import json
 import logging
+import os
 import re
+import subprocess
 import time
 import urllib.parse
 import unicodedata
@@ -94,6 +96,53 @@ def _post_json(
             timeout=timeout,
             params=params,
         )
+
+
+def _post_json_with_curl(
+    url: str,
+    *,
+    headers: dict[str, Any] | None = None,
+    json_payload: dict[str, Any] | None = None,
+    timeout: int | float = DEFAULT_TIMEOUT_SECONDS,
+) -> tuple[int, str]:
+    marker = "\n__HTTP_STATUS__:"
+    timeout_seconds = max(1, int(float(timeout)))
+    cmd = [
+        "curl",
+        "-sS",
+        "--retry",
+        "0",
+        "--connect-timeout",
+        str(min(15, timeout_seconds)),
+        "--max-time",
+        str(timeout_seconds),
+        "-X",
+        "POST",
+        "-w",
+        marker + "%{http_code}",
+    ]
+    for key, value in (headers or {}).items():
+        cmd.extend(["-H", f"{key}: {value}"])
+    cmd.extend(["--data-binary", "@-", url])
+    completed = subprocess.run(
+        cmd,
+        input=json.dumps(json_payload or {}, ensure_ascii=False),
+        text=True,
+        capture_output=True,
+        timeout=timeout_seconds + 5,
+    )
+    if completed.returncode != 0:
+        err = (completed.stderr or completed.stdout or "").strip()
+        raise RuntimeError(f"curl exit {completed.returncode}: {err[:240]}")
+    stdout = completed.stdout or ""
+    body, sep, raw_status = stdout.rpartition(marker)
+    if not sep:
+        raise RuntimeError("curl response missing HTTP status")
+    try:
+        status_code = int(raw_status.strip() or "0")
+    except ValueError as exc:
+        raise RuntimeError(f"curl invalid HTTP status: {raw_status!r}") from exc
+    return status_code, body
 
 
 def load_metadata_history(path: Path = METADATA_HISTORY_FILE) -> dict[str, Any]:
@@ -520,8 +569,14 @@ def _build_compact_generation_prompt(
     angle_text = str(content_template.get("angle") or "").strip()
     audience_text = str(content_template.get("audience") or "").strip()
     genre_text = str(content_template.get("musicGenre") or "").strip()
-    title_library = str(content_template.get("titleLibrary") or "").strip()
-    master_prompt = str(render_master_prompt(content_template) or "").strip()
+    master_prompt = _compact_master_rules(
+        content_template,
+        limit=_int_value(os.environ.get("CONTENT_GEN_MASTER_RULES_LIMIT"), 1200),
+    )
+    title_library = _compact_title_library(
+        content_template,
+        limit=_int_value(os.environ.get("CONTENT_GEN_TITLE_LIBRARY_LIMIT"), 900),
+    )
     seed_text = str(unique_seed or "").strip()
     image_hint = "这次有参考图片，可参考画面信息。" if image_data_url else "这次没有参考图片，请只根据文字内容构思。"
     return (
@@ -549,6 +604,41 @@ def _build_compact_generation_prompt(
         "4. 只允许输出一个合法 JSON 对象，不要输出解释、不要输出 markdown、不要输出代码块。\n\n"
         "返回 JSON schema：\n"
         '{"usedAngle":"string","titles":["string"],"descriptions":["string"],"seoHashtags":["#tag"],"tagList":["keyword"],"thumbnails":[{"forTitle":"string","prompt":"string"}]}'
+    )
+
+
+def _build_minimal_generation_prompt(
+    content_template: dict,
+    *,
+    unique_seed: str = "",
+) -> str:
+    tag_range = parse_tag_range(str(content_template.get("tagRange") or "10-20"))
+    output_language = str(content_template.get("outputLanguage") or "zh-TW")
+    language_ui, language_english = language_meta(output_language)
+    title_count = _int_value(content_template.get("titleCount"), 1)
+    desc_count = _int_value(content_template.get("descCount"), 1)
+    thumb_count = _int_value(content_template.get("thumbCount"), 1)
+    payload = {
+        "seed": str(unique_seed or "").strip(),
+        "musicGenre": str(content_template.get("musicGenre") or "").strip(),
+        "audience": str(content_template.get("audience") or "").strip(),
+        "angle": str(content_template.get("angle") or "").strip(),
+        "language": language_ui,
+        "titleCount": title_count,
+        "descriptionCount": desc_count,
+        "thumbnailPromptCount": thumb_count,
+        "tagCount": {"min": tag_range[0], "max": tag_range[1]},
+        "thumbnailTextLanguage": language_english,
+    }
+    return (
+        "Return strict JSON only. Generate YouTube metadata for one music video. "
+        "Do not explain. Titles, description and tags must use Traditional Chinese. "
+        "Thumbnail prompts may be English, and each must end with "
+        f"'Use {language_english} text in the image.'\n"
+        f"Input: {json.dumps(payload, ensure_ascii=False)}\n"
+        'Schema: {"usedAngle":"string","titles":["string"],"descriptions":["string"],'
+        '"seoHashtags":["#tag"],"tagList":["keyword"],'
+        '"thumbnails":[{"forTitle":"string","prompt":"string"}]}'
     )
 
 
@@ -646,6 +736,9 @@ def _call_json_stage(
             max_attempts = 1
         else:
             max_attempts = 3
+        env_stage_attempts = _int_value(os.environ.get("TEXT_API_STAGE_ATTEMPTS"), 0)
+        if env_stage_attempts > 0:
+            max_attempts = max(1, env_stage_attempts)
         for api_attempt in range(1, max_attempts + 1):
             try:
                 raw = call_text_model(active_preset, prompt, image_data_url=image_data_url)
@@ -676,8 +769,14 @@ def _build_title_stage_prompt(
     title_min = _int_value(content_template.get("titleMin"), 80)
     title_max = _int_value(content_template.get("titleMax"), 95)
     language_ui, _ = language_meta(str(content_template.get("outputLanguage") or "zh-TW"))
-    master_prompt = str(render_master_prompt(content_template) or "").strip()
-    title_library = str(content_template.get("titleLibrary") or "").strip()
+    master_prompt = _compact_master_rules(
+        content_template,
+        limit=_int_value(os.environ.get("CONTENT_GEN_STAGE_MASTER_RULES_LIMIT"), 350),
+    )
+    title_library = _compact_title_library(
+        content_template,
+        limit=_int_value(os.environ.get("CONTENT_GEN_STAGE_TITLE_LIBRARY_LIMIT"), 250),
+    )
     payload = {
         "seed": str(unique_seed or "").strip(),
         "count": int(max(1, count)),
@@ -715,8 +814,14 @@ def _build_description_stage_prompt(
 ) -> str:
     tag_range = parse_tag_range(str(content_template.get("tagRange") or "10-20"))
     language_ui, _ = language_meta(str(content_template.get("outputLanguage") or "zh-TW"))
-    master_prompt = str(render_master_prompt(content_template) or "").strip()
-    title_library = str(content_template.get("titleLibrary") or "").strip()
+    master_prompt = _compact_master_rules(
+        content_template,
+        limit=_int_value(os.environ.get("CONTENT_GEN_STAGE_MASTER_RULES_LIMIT"), 350),
+    )
+    title_library = _compact_title_library(
+        content_template,
+        limit=_int_value(os.environ.get("CONTENT_GEN_STAGE_TITLE_LIBRARY_LIMIT"), 250),
+    )
     payload = {
         "seed": str(unique_seed or "").strip(),
         "title": str(title or "").strip(),
@@ -752,8 +857,14 @@ def _build_thumbnail_prompt_stage(
     count: int,
 ) -> str:
     _, language_english = language_meta(str(content_template.get("outputLanguage") or "zh-TW"))
-    master_prompt = str(render_master_prompt(content_template) or "").strip()
-    title_library = str(content_template.get("titleLibrary") or "").strip()
+    master_prompt = _compact_master_rules(
+        content_template,
+        limit=_int_value(os.environ.get("CONTENT_GEN_STAGE_MASTER_RULES_LIMIT"), 350),
+    )
+    title_library = _compact_title_library(
+        content_template,
+        limit=_int_value(os.environ.get("CONTENT_GEN_STAGE_TITLE_LIBRARY_LIMIT"), 250),
+    )
     payload = {
         "seed": str(unique_seed or "").strip(),
         "titles": [str(item or "").strip() for item in titles if str(item or "").strip()][: max(1, count)],
@@ -1219,9 +1330,14 @@ def _call_openai_compatible(api_preset: dict, user_prompt: str, image_data_url: 
         timeout_seconds = max(timeout_seconds, 420)
     timeout_seconds = max(timeout_seconds, DEFAULT_TIMEOUT_SECONDS)
     timeout_seconds = min(timeout_seconds, 420)
+    env_timeout_seconds = _int_value(os.environ.get("TEXT_API_TIMEOUT_SECONDS"), 0)
+    if env_timeout_seconds > 0:
+        timeout_seconds = max(1, env_timeout_seconds)
     retryable_codes = {408, 429, 500, 502, 503, 504}
+    request_attempts = max(1, _int_value(os.environ.get("TEXT_API_REQUEST_ATTEMPTS"), 2))
+    curl_fallback_enabled = str(os.environ.get("OPENAI_COMPATIBLE_CURL_FALLBACK") or "1").strip().lower() not in {"0", "false", "no"}
     for url in _build_openai_chat_urls(str(api_preset.get("baseUrl") or "")):
-        for attempt in range(2):
+        for attempt in range(request_attempts):
             try:
                 response = _post_json(
                     url,
@@ -1253,7 +1369,39 @@ def _call_openai_compatible(api_preset: dict, user_prompt: str, image_data_url: 
                     break
             except Exception as exc:
                 last_error = str(exc)
-            if attempt < 1:
+                if curl_fallback_enabled and _is_transient_text_api_error(exc):
+                    try:
+                        status_code, response_text = _post_json_with_curl(
+                            url,
+                            headers=headers,
+                            json_payload=payload,
+                            timeout=timeout_seconds,
+                        )
+                        try:
+                            data = json.loads(response_text)
+                        except Exception as json_exc:
+                            logger.warning(f"curl API 响应 JSON 解析失败，保留原始文本: {json_exc}")
+                            data = {"raw_text": response_text}
+                        if 200 <= status_code < 300:
+                            text = _extract_openai_response_text(data)
+                            if text:
+                                return text
+                            last_error = _describe_openai_error(
+                                status_code=status_code,
+                                data=data,
+                                url=url,
+                            )
+                        else:
+                            last_error = _describe_openai_error(
+                                status_code=status_code,
+                                data=data,
+                                url=url,
+                            )
+                        if status_code not in retryable_codes:
+                            break
+                    except Exception as curl_exc:
+                        last_error = f"{last_error}; curl fallback failed: {curl_exc}"
+            if attempt < request_attempts - 1:
                 time.sleep(2 + attempt)
     raise RuntimeError(f"OpenAI-compatible 调用失败: {last_error}")
 
@@ -1477,6 +1625,61 @@ def _is_transient_text_api_error(exc: Exception) -> bool:
     return any(hint in text for hint in hints)
 
 
+def _metadata_result_from_payload(
+    *,
+    api_preset: dict,
+    content_template: dict,
+    raw_text: str,
+    payload: dict[str, Any],
+    stage: str,
+) -> dict[str, Any]:
+    used_angle = str(payload.get("usedAngle") or content_template.get("angle") or "").strip()
+    titles = [str(item).strip() for item in payload.get("titles", []) if str(item).strip()]
+    descriptions = [
+        str(item).strip()
+        for item in payload.get("descriptions", [])
+        if str(item).strip()
+    ]
+    seo_hashtags = [
+        str(item).strip()
+        for item in payload.get("seoHashtags", [])
+        if str(item).strip()
+    ]
+    tag_list = [
+        str(item).strip()
+        for item in payload.get("tagList", [])
+        if str(item).strip()
+    ]
+    thumbnail_prompt_rows = [
+        {
+            "for_title": str((item or {}).get("forTitle") or "").strip(),
+            "prompt": str((item or {}).get("prompt") or "").strip(),
+        }
+        for item in payload.get("thumbnails", [])
+        if str((item or {}).get("prompt") or "").strip()
+    ]
+    if not titles:
+        raise RuntimeError(f"文案生成失败: stage={stage} provider=api error=API 未返回标题")
+    if not descriptions:
+        raise RuntimeError(f"文案生成失败: stage={stage} provider=api error=API 未返回简介")
+    if not tag_list:
+        raise RuntimeError(f"文案生成失败: stage={stage} provider=api error=API 未返回标签")
+    if not thumbnail_prompt_rows:
+        raise RuntimeError(f"文案生成失败: stage={stage} provider=api error=API 未返回缩略图提示词")
+    return {
+        "api_preset": api_preset,
+        "content_template": content_template,
+        "raw_text": raw_text,
+        "used_angle": used_angle,
+        "titles": titles,
+        "descriptions": descriptions,
+        "seo_hashtags": seo_hashtags,
+        "tag_list": tag_list,
+        "generation_source": "api",
+        "thumbnail_prompts": thumbnail_prompt_rows,
+    }
+
+
 def generate_content_bundle(
     prompt_studio_path: Path,
     tag: str,
@@ -1524,69 +1727,68 @@ def generate_content_bundle(
         avoid_thumbnail_prompts=None,
         avoid_tag_signatures=None,
     )
-    emit(
-        f"[API] {tag}: stage=metadata_bundle -> provider={api_preset.get('provider', '')} "
-        f"model={api_preset.get('model', '')} chars={len(bundle_prompt)}"
-    )
-    raw_bundle, bundle_payload = _call_json_stage(
-        api_preset=api_preset,
-        prompt=bundle_prompt,
-        stage="metadata_bundle",
-        image_data_url=image_data_url,
-        max_tokens_cap=2200,
-    )
-    emit(f"[API] {tag}: stage=metadata_bundle <- ok chars={len(raw_bundle)}")
-    bundle_payload = _repair_output_if_needed(
-        bundle_payload,
-        api_preset,
+    if str(os.environ.get("CONTENT_GEN_FORCE_MINIMAL") or "").strip().lower() not in {"1", "true", "yes"}:
+        emit(
+            f"[API] {tag}: stage=metadata_bundle -> provider={api_preset.get('provider', '')} "
+            f"model={api_preset.get('model', '')} chars={len(bundle_prompt)}"
+        )
+        try:
+            raw_bundle, bundle_payload = _call_json_stage(
+                api_preset=api_preset,
+                prompt=bundle_prompt,
+                stage="metadata_bundle",
+                image_data_url=image_data_url,
+                max_tokens_cap=1200,
+            )
+            emit(f"[API] {tag}: stage=metadata_bundle <- ok chars={len(raw_bundle)}")
+            bundle_payload = _repair_output_if_needed(
+                bundle_payload,
+                api_preset,
+                content_template,
+                image_data_url=image_data_url,
+            )
+            return _metadata_result_from_payload(
+                api_preset=api_preset,
+                content_template=content_template,
+                raw_text=raw_bundle,
+                payload=bundle_payload,
+                stage="metadata_bundle",
+            )
+        except Exception as exc:
+            if "invalid api key" in str(exc).lower() or "401" in str(exc).lower():
+                raise
+            emit(f"[API] {tag}: stage=metadata_bundle -> failed ({exc}); fallback=minimal_api")
+    else:
+        emit(f"[API] {tag}: stage=metadata_bundle -> skipped by CONTENT_GEN_FORCE_MINIMAL")
+
+    minimal_prompt = _build_minimal_generation_prompt(
         content_template,
-        image_data_url=image_data_url,
+        unique_seed=f"{unique_seed}|minimal",
     )
-    used_angle = str(bundle_payload.get("usedAngle") or content_template.get("angle") or "").strip()
-    titles = [str(item).strip() for item in bundle_payload.get("titles", []) if str(item).strip()]
-    descriptions = [
-        str(item).strip()
-        for item in bundle_payload.get("descriptions", [])
-        if str(item).strip()
-    ]
-    seo_hashtags = [
-        str(item).strip()
-        for item in bundle_payload.get("seoHashtags", [])
-        if str(item).strip()
-    ]
-    tag_list = [
-        str(item).strip()
-        for item in bundle_payload.get("tagList", [])
-        if str(item).strip()
-    ]
-    thumbnail_prompt_rows = [
-        {
-            "for_title": str((item or {}).get("forTitle") or "").strip(),
-            "prompt": str((item or {}).get("prompt") or "").strip(),
-        }
-        for item in bundle_payload.get("thumbnails", [])
-        if str((item or {}).get("prompt") or "").strip()
-    ]
-    if not titles:
-        raise RuntimeError("文案生成失败: stage=metadata_bundle provider=api error=API 未返回标题")
-    if not descriptions:
-        raise RuntimeError("文案生成失败: stage=metadata_bundle provider=api error=API 未返回简介")
-    if not tag_list:
-        raise RuntimeError("文案生成失败: stage=metadata_bundle provider=api error=API 未返回标签")
-    if not thumbnail_prompt_rows:
-        raise RuntimeError("文案生成失败: stage=metadata_bundle provider=api error=API 未返回缩略图提示词")
-    return {
-        "api_preset": api_preset,
-        "content_template": content_template,
-        "raw_text": raw_bundle,
-        "used_angle": used_angle,
-        "titles": titles,
-        "descriptions": descriptions,
-        "seo_hashtags": seo_hashtags,
-        "tag_list": tag_list,
-        "generation_source": "api",
-        "thumbnail_prompts": thumbnail_prompt_rows,
-    }
+    emit(
+        f"[API] {tag}: stage=metadata_minimal -> provider={api_preset.get('provider', '')} "
+        f"model={api_preset.get('model', '')} chars={len(minimal_prompt)}"
+    )
+    try:
+        raw_minimal, minimal_payload = _call_json_stage(
+            api_preset=api_preset,
+            prompt=minimal_prompt,
+            stage="metadata_minimal",
+            image_data_url=image_data_url,
+            max_tokens_cap=900,
+        )
+        emit(f"[API] {tag}: stage=metadata_minimal <- ok chars={len(raw_minimal)}")
+        return _metadata_result_from_payload(
+            api_preset=api_preset,
+            content_template=content_template,
+            raw_text=raw_minimal,
+            payload=minimal_payload,
+            stage="metadata_minimal",
+        )
+    except Exception as exc:
+        if "invalid api key" in str(exc).lower() or "401" in str(exc).lower():
+            raise
+        emit(f"[API] {tag}: stage=metadata_minimal -> failed ({exc}); fallback=staged_api")
 
     title_prompt = _build_title_stage_prompt(
         content_template,

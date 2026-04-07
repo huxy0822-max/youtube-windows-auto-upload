@@ -3939,6 +3939,19 @@ async def wait_for_safe_close_after_publish(
         last_snapshot = snapshot
         summary = summarize_upload_monitor(snapshot)
         is_safe = is_safe_to_close_after_publish(snapshot)
+        if (
+            not is_safe
+            and poll_count >= max(3, UPLOAD_SAFE_CLOSE_STABLE_POLLS + 1)
+            and snapshot.get("status") == "unknown"
+            and not snapshot.get("dialog_visible")
+            and not snapshot.get("active_uploading")
+            and not snapshot.get("active_checking")
+            and not snapshot.get("progress_component_present")
+        ):
+            snapshot["status"] = "post_submit_dialog_closed"
+            snapshot["upload_completed"] = True
+            summary = f"{summary} | 提交后弹窗已关闭，按安全完成处理"
+            is_safe = True
 
         if summary != last_summary or poll_count == 1 or poll_count % 3 == 0:
             log(f"序号 {serial}: 监控#{poll_count} {summary}", "OK" if is_safe else "WAIT")
@@ -9040,6 +9053,14 @@ def _load_container_registry_for_serials(group_tag: str, serial_numbers: list[in
             continue
         if serial in wanted:
             registry[serial] = dict(container)
+    if wanted.difference(registry):
+        for container in get_all_containers():
+            try:
+                serial = int(container.get("serialNumber") or 0)
+            except (TypeError, ValueError):
+                continue
+            if serial in wanted and serial not in registry:
+                registry[serial] = dict(container)
     if wanted.difference(registry):
         for serial, container in load_channel_mapping_registry().items():
             if serial in wanted and serial not in registry:
