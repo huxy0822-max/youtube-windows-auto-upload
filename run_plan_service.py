@@ -4,6 +4,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
+import sys
 from typing import Any, Callable
 
 from archive_manager import ArchiveManager
@@ -35,6 +36,7 @@ from workflow_core import (
 )
 
 LogFunc = Callable[[str], None]
+_DATACLASS_KWARGS = {"slots": True} if sys.version_info >= (3, 10) else {}
 
 MODULE_LABELS = {
     "metadata": "生成标题/简介/标签/缩略图",
@@ -47,7 +49,7 @@ def _noop_log(_message: str) -> None:
     return
 
 
-@dataclass(slots=True)
+@dataclass(**_DATACLASS_KWARGS)
 class ModuleSelection:
     metadata: bool = False
     render: bool = False
@@ -67,7 +69,7 @@ class ModuleSelection:
         return [label for key, label in MODULE_LABELS.items() if self.as_dict().get(key)]
 
 
-@dataclass(slots=True)
+@dataclass(**_DATACLASS_KWARGS)
 class MediaScope:
     tag: str
     image_dir: str
@@ -76,7 +78,7 @@ class MediaScope:
     source_overrides: list[str] = field(default_factory=list)
 
 
-@dataclass(slots=True)
+@dataclass(**_DATACLASS_KWARGS)
 class RunPlan:
     logical_tasks: list[WindowTask]
     tasks: list[WindowTask]
@@ -91,7 +93,7 @@ class RunPlan:
     media_scopes: list[MediaScope] = field(default_factory=list)
 
 
-@dataclass(slots=True)
+@dataclass(**_DATACLASS_KWARGS)
 class ValidationReport:
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -105,7 +107,7 @@ class ValidationReport:
             raise ValueError("\n".join(self.errors))
 
 
-@dataclass(slots=True)
+@dataclass(**_DATACLASS_KWARGS)
 class ExecutionResult:
     run_plan: RunPlan
     validation: ValidationReport

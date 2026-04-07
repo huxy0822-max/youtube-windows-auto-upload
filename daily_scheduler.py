@@ -11,6 +11,8 @@
 - 这次整理后，路径会优先解析到当前仓库内的 `config/`，不再默认写死 macOS 目录。
 """
 
+from __future__ import annotations
+
 import logging
 import os
 import sys

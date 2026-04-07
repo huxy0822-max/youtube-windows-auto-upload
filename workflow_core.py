@@ -7,6 +7,7 @@ import random
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import concurrent.futures as _cf
@@ -71,6 +72,7 @@ THUMBNAIL_CANVAS = (1280, 720)
 LogFunc = Callable[[str], None]
 ArtifactReadyCallback = Callable[["WindowTask", Path, Path], None]
 MetadataReadyCallback = Callable[["WindowTask", Path, dict[str, Any]], None]
+_DATACLASS_KWARGS = {"slots": True} if sys.version_info >= (3, 10) else {}
 
 
 def _noop_log(_message: str) -> None:
@@ -81,7 +83,7 @@ class WorkflowCancelledError(RuntimeError):
     pass
 
 
-@dataclass(slots=True)
+@dataclass(**_DATACLASS_KWARGS)
 class RenderCodecProfile:
     name: str
     video_codec: str
@@ -151,7 +153,7 @@ def _resolve_render_profile(config: dict[str, Any] | None = None) -> RenderCodec
     return default_profile if has_hw_encoder else _cpu_render_profile()
 
 
-@dataclass(slots=True)
+@dataclass(**_DATACLASS_KWARGS)
 class ExecutionControl:
     pause_event: threading.Event = field(default_factory=threading.Event)
     cancel_event: threading.Event = field(default_factory=threading.Event)
@@ -244,7 +246,7 @@ def _read_json(path: Path, fallback: Any) -> Any:
         return fallback
 
 
-@dataclass(slots=True)
+@dataclass(**_DATACLASS_KWARGS)
 class WindowInfo:
     tag: str
     serial: int
@@ -252,7 +254,7 @@ class WindowInfo:
     is_ypp: bool = False
 
 
-@dataclass(slots=True)
+@dataclass(**_DATACLASS_KWARGS)
 class WindowTask:
     tag: str
     serial: int
@@ -320,7 +322,7 @@ class WindowTask:
         return row
 
 
-@dataclass(slots=True)
+@dataclass(**_DATACLASS_KWARGS)
 class WorkflowDefaults:
     date_mmdd: str
     visibility: str = "public"
@@ -567,14 +569,14 @@ def _build_render_options_from_defaults(defaults: WorkflowDefaults) -> RenderOpt
     return opts
 
 
-@dataclass(slots=True)
+@dataclass(**_DATACLASS_KWARGS)
 class SimulationOptions:
     simulate_seconds: int = 90
     consume_sources: bool = False
     save_manifest: bool = True
 
 
-@dataclass(slots=True)
+@dataclass(**_DATACLASS_KWARGS)
 class RenderedItem:
     tag: str
     serial: int
@@ -667,7 +669,7 @@ def expand_window_tasks_by_round(tasks: list[WindowTask]) -> list[WindowTask]:
     return _expand_window_tasks_by_round(tasks)
 
 
-@dataclass(slots=True)
+@dataclass(**_DATACLASS_KWARGS)
 class WorkflowResult:
     date_mmdd: str
     plan_path: str

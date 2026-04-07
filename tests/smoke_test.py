@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import io
+import subprocess
 import sys
 import tempfile
 import time
@@ -17,6 +18,36 @@ from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+_TK_RUNTIME_AVAILABLE: bool | None = None
+
+
+def _tk_runtime_available() -> bool:
+    """macOS 自带 Python 的 Tk 可能进程级退出，用子进程预检避免拖垮整套 smoke。"""
+    global _TK_RUNTIME_AVAILABLE
+    if _TK_RUNTIME_AVAILABLE is not None:
+        return _TK_RUNTIME_AVAILABLE
+    code = "import tkinter as tk; root = tk.Tk(); root.withdraw(); root.destroy()"
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", code],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+        _TK_RUNTIME_AVAILABLE = completed.returncode == 0
+        if not _TK_RUNTIME_AVAILABLE:
+            reason = (completed.stderr or "").strip().splitlines()[-1:] or ["Tk runtime unavailable"]
+            print(f"↷ Tk 运行时不可用，跳过 GUI 实例化测试: {reason[0]}")
+    except Exception as exc:
+        _TK_RUNTIME_AVAILABLE = False
+        print(f"↷ Tk 运行时预检失败，跳过 GUI 实例化测试: {exc}")
+    return bool(_TK_RUNTIME_AVAILABLE)
+
+
+def _skip_if_tk_unavailable() -> bool:
+    return not _tk_runtime_available()
 
 
 def test_imports() -> None:
@@ -430,6 +461,8 @@ def test_dashboard_instantiation() -> None:
 
 def test_dashboard_upload_step_selection() -> None:
     """测试上传页执行步骤勾选框"""
+    if _skip_if_tk_unavailable():
+        return
     import dashboard_app
 
     app = dashboard_app.DashboardApp()
@@ -464,6 +497,8 @@ def test_dashboard_upload_step_selection() -> None:
 
 def test_dashboard_upload_defaults_notify_flag() -> None:
     """默认规则里的通知订阅者应进入 UploadDefaults"""
+    if _skip_if_tk_unavailable():
+        return
     import dashboard_app
 
     app = dashboard_app.DashboardApp()
@@ -484,6 +519,8 @@ def test_dashboard_upload_defaults_notify_flag() -> None:
 
 def test_dashboard_path_template_does_not_reset_prompt_bindings() -> None:
     """切换路径模板时不应重置 API/提示词模板选择"""
+    if _skip_if_tk_unavailable():
+        return
     import dashboard_app
 
     app = dashboard_app.DashboardApp()
@@ -682,6 +719,8 @@ def test_batch_upload_bool_coercion() -> None:
 
 def test_no_quick_start() -> None:
     """确认快捷开始 Tab 已删除"""
+    if _skip_if_tk_unavailable():
+        return
     import dashboard_app
 
     app = dashboard_app.DashboardApp()
