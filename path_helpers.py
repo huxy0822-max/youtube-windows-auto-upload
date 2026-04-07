@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-仓库内路径解析辅助函数。
-
-这套项目原本夹杂了“当前仓库内路径”和“外部兄弟目录路径”两种假设，
-在 Windows 上尤其容易失效。这里统一做三件事：
-1. 相对路径一律按当前仓库根目录解析。
-2. 配置文件优先从当前仓库 `config/` 查找，再兼容旧目录结构。
-3. 外部上传脚本路径做多候选查找，避免写死 macOS 绝对路径。
+仓库内路径解析与环境检测辅助函数。
 """
 
 from __future__ import annotations
 
+import json
+import logging
+import os
+import shutil
+import socket
+import sys
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
+from urllib import error, request
+
+logger = logging.getLogger(__name__)
+
+BITBROWSER_DEFAULT_PORT = 54345
+HUBSTUDIO_DEFAULT_PORT = 6873
+HTTP_PROBE_TIMEOUT = 0.8
 
 
 def normalize_path(value: str | Path | None, base_dir: str | Path) -> Path:
@@ -52,7 +60,12 @@ def resolve_config_file(base_dir: str | Path, filename: str) -> Path:
         base / "上传视频自动化" / "config" / filename,
         base.parent / "上传视频自动化" / "config" / filename,
     ]
-    return first_existing(candidates) or candidates[0]
+    found = first_existing(candidates)
+    if found:
+        return found
+    default = candidates[0]
+    logger.info("配置文件 %s 未找到，使用默认路径: %s", filename, default)
+    return default
 
 
 def resolve_upload_script(base_dir: str | Path) -> Path:
@@ -67,13 +80,15 @@ def resolve_upload_script(base_dir: str | Path) -> Path:
     return first_existing(candidates) or candidates[0]
 
 
-def default_scheduler_config(base_dir: str | Path) -> dict:
+def default_scheduler_config(base_dir: str | Path) -> dict[str, Any]:
     """生成适合当前仓库的默认调度配置。"""
     base = Path(base_dir).resolve(strict=False)
     output_root = (base / "workspace" / "AutoTask").resolve(strict=False)
+    metadata_root = (base / "workspace" / "metadata").resolve(strict=False)
     return {
         "music_dir": str((base / "workspace" / "music").resolve(strict=False)),
         "base_image_dir": str((base / "workspace" / "base_image").resolve(strict=False)),
+        "metadata_root": str(metadata_root),
         "output_root": str(output_root),
         "upload_config": str(resolve_config_file(base, "upload_config.json")),
         "ffmpeg_bin": "ffmpeg",
@@ -84,14 +99,16 @@ def default_scheduler_config(base_dir: str | Path) -> dict:
     }
 
 
-def normalize_scheduler_config(raw_cfg: dict | None, base_dir: str | Path) -> dict:
+def normalize_scheduler_config(raw_cfg: dict | None, base_dir: str | Path) -> dict[str, Any]:
     """把调度配置中的目录项都规范成绝对路径。"""
     cfg = default_scheduler_config(base_dir)
     if raw_cfg:
         cfg.update(raw_cfg)
+    if not str(cfg.get("metadata_root") or "").strip():
+        cfg["metadata_root"] = cfg.get("base_image_dir") or cfg["metadata_root"]
 
     base = Path(base_dir).resolve(strict=False)
-    for key in ("music_dir", "base_image_dir", "output_root", "upload_config", "used_media_root"):
+    for key in ("music_dir", "base_image_dir", "metadata_root", "output_root", "upload_config", "used_media_root"):
         cfg[key] = str(normalize_path(cfg.get(key), base))
 
     ffmpeg_bin = cfg.get("ffmpeg_bin") or cfg.get("ffmpeg_path") or "ffmpeg"
@@ -114,3 +131,113 @@ def normalize_scheduler_config(raw_cfg: dict | None, base_dir: str | Path) -> di
             normalized_bindings[str(tag)] = str(normalize_path(text, base))
     cfg["group_source_bindings"] = normalized_bindings
     return cfg
+
+
+def _amf_dll_candidates() -> list[Path]:
+    system_root = Path(os.environ.get("SystemRoot") or r"C:\Windows")
+    program_files = Path(os.environ.get("ProgramFiles") or r"C:\Program Files")
+    program_files_x86 = Path(os.environ.get("ProgramFiles(x86)") or r"C:\Program Files (x86)")
+    return [
+        system_root / "System32" / "amfrt64.dll",
+        system_root / "SysWOW64" / "amfrt64.dll",
+        program_files / "AMD" / "CNext" / "CNext" / "amfrt64.dll",
+        program_files_x86 / "AMD" / "CNext" / "CNext" / "amfrt64.dll",
+    ]
+
+
+def detect_gpu() -> str:
+    """检测当前机器更适合的硬件编码后端。"""
+    if sys.platform == "darwin":
+        return "videotoolbox"
+    if sys.platform == "win32":
+        if shutil.which("nvidia-smi"):
+            return "nvenc"
+        if first_existing(_amf_dll_candidates()):
+            return "amf"
+    return "cpu"
+
+
+def _is_port_open(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=HTTP_PROBE_TIMEOUT):
+            return True
+    except OSError:
+        return False
+
+
+def _probe_http_endpoint(url: str) -> bool:
+    try:
+        with request.urlopen(request.Request(url, method="GET"), timeout=HTTP_PROBE_TIMEOUT):
+            return True
+    except error.HTTPError as exc:
+        return exc.code in {200, 400, 401, 403, 404, 405}
+    except Exception:
+        return False
+
+
+def detect_browser_api() -> dict[str, Any] | None:
+    """检测 BitBrowser / HubStudio 本地 API。"""
+    probes = [
+        (
+            "bitbrowser",
+            BITBROWSER_DEFAULT_PORT,
+            [
+                f"http://127.0.0.1:{BITBROWSER_DEFAULT_PORT}/browser/list",
+                f"http://127.0.0.1:{BITBROWSER_DEFAULT_PORT}/api/browser/list",
+                f"http://127.0.0.1:{BITBROWSER_DEFAULT_PORT}",
+            ],
+        ),
+        (
+            "hubstudio",
+            HUBSTUDIO_DEFAULT_PORT,
+            [
+                f"http://127.0.0.1:{HUBSTUDIO_DEFAULT_PORT}/api/v1/env/list",
+                f"http://127.0.0.1:{HUBSTUDIO_DEFAULT_PORT}",
+            ],
+        ),
+    ]
+    for provider, port, urls in probes:
+        if not _is_port_open(port):
+            continue
+        if any(_probe_http_endpoint(url) for url in urls):
+            return {
+                "provider": provider,
+                "port": port,
+                "base_url": f"http://127.0.0.1:{port}",
+            }
+    return None
+
+
+def generate_default_config(result: dict[str, Any], config_path: Path) -> dict[str, Any]:
+    """根据检测结果生成默认 scheduler_config.json。"""
+    config = default_scheduler_config(config_path.parent)
+    ffmpeg_path = str(result.get("ffmpeg") or "").strip()
+    if ffmpeg_path:
+        config["ffmpeg_bin"] = ffmpeg_path
+        config["ffmpeg_path"] = ffmpeg_path
+    config["gpu"] = str(result.get("gpu") or "cpu")
+    browser_api = result.get("browser_api") if isinstance(result.get("browser_api"), dict) else None
+    if browser_api:
+        config["browser_api"] = {
+            "provider": str(browser_api.get("provider") or "").strip(),
+            "base_url": str(browser_api.get("base_url") or "").strip(),
+            "port": int(browser_api.get("port") or 0),
+        }
+    config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+    return config
+
+
+def ensure_environment() -> dict[str, Any]:
+    """首次运行时自动检测环境并生成默认配置。"""
+    result: dict[str, Any] = {
+        "platform": sys.platform,
+        "ffmpeg": shutil.which("ffmpeg"),
+        "gpu": detect_gpu(),
+        "browser_api": detect_browser_api(),
+    }
+
+    config_path = Path(__file__).resolve().parent / "scheduler_config.json"
+    if not config_path.exists():
+        generate_default_config(result, config_path)
+
+    return result

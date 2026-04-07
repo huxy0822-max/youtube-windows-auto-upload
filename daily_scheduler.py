@@ -11,6 +11,7 @@
 - 这次整理后，路径会优先解析到当前仓库内的 `config/`，不再默认写死 macOS 目录。
 """
 
+import logging
 import os
 import sys
 import json
@@ -21,18 +22,23 @@ import argparse
 import subprocess
 import threading
 import ctypes
+import math
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import platform
+import numpy as np
 from group_upload_workflow import prepare_window_task_upload_batch
 from path_helpers import (
     default_scheduler_config,
     normalize_scheduler_config,
     resolve_upload_script,
 )
+from reactive_spectrum import list_reactive_spectrum_presets
+
+logger = logging.getLogger(__name__)
 
 # ============ 平台检测 ============
 IS_WINDOWS = platform.system() == "Windows"
@@ -288,41 +294,61 @@ def _windows_has_nvenc_runtime() -> bool:
 # ============ FFmpeg 编码参数 (平台自适应) ============
 if IS_MAC:
     VIDEO_CODEC = "h264_videotoolbox"
-    VIDEO_BITRATE = "5000k"
+    VIDEO_BITRATE = "8000k"
     VIDEO_SPATIAL_AQ = True
     _CODEC_EXTRA_ARGS = ['-spatial_aq', '1']
 elif IS_WINDOWS and _windows_has_nvenc_runtime():
     VIDEO_CODEC = "h264_nvenc"
-    VIDEO_BITRATE = "5000k"
+    VIDEO_BITRATE = "8000k"
     VIDEO_SPATIAL_AQ = False
     _CODEC_EXTRA_ARGS = [
         "-preset", "p4",
         "-tune", "hq",
         "-rc", "vbr",
+        "-maxrate", "8000k",
+        "-bufsize", "16000k",
     ]
 elif IS_WINDOWS and _ffmpeg_has_encoder("h264_amf") and _windows_has_amf_runtime():
     VIDEO_CODEC = "h264_amf"
-    VIDEO_BITRATE = "5000k"
+    VIDEO_BITRATE = "8000k"
     VIDEO_SPATIAL_AQ = False
     _CODEC_EXTRA_ARGS = [
         "-usage", "transcoding",
         "-quality", "balanced",
         "-profile:v", "high",
         "-rc", "cbr",
-        "-maxrate", "6500k",
-        "-bufsize", "12000k",
+        "-maxrate", "8000k",
+        "-bufsize", "16000k",
     ]
 else:
     VIDEO_CODEC = "libx264"           # CPU 编码 (最大兼容性)
-    VIDEO_BITRATE = "5000k"
+    VIDEO_BITRATE = "8000k"
     VIDEO_SPATIAL_AQ = False
-    _CODEC_EXTRA_ARGS = ['-preset', 'veryfast']
+    _CODEC_EXTRA_ARGS = ['-preset', 'veryfast', '-maxrate', '8000k', '-bufsize', '16000k']
 AUDIO_BITRATE = "320k"
 AUDIO_SAMPLERATE = "44100"
 
 # ============ 特效库导入 ============
 sys.path.insert(0, str(_BUNDLE_DIR))
-from effects_library import get_effect, list_effects, PALETTES, ZOOM_SPEEDS
+from effects_library import (
+    PALETTES,
+    ZOOM_SPEEDS,
+    get_effect,
+    list_effects,
+    list_font_names,
+    list_mega_bass_font_names,
+    list_mega_bass_palette_names,
+    list_mega_bass_particle_effects,
+    list_mega_bass_style_variants,
+    list_palette_names,
+    list_particle_effects,
+    list_spectrum_assets,
+    list_sticker_effects,
+    list_text_positions,
+    list_text_styles,
+    list_tint_names,
+    list_zoom_modes,
+)
 
 # ============ 完成标记系统 ============
 # 用 .done 标记文件代替文件大小启发式判断，彻底避免渲染中断后误跳过不完整文件
@@ -340,8 +366,8 @@ def read_done_duration(filepath: Path) -> float:
         text = marker.read_text(encoding='utf-8').strip()
         if '|dur=' in text:
             return float(text.split('|dur=')[1])
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"读取 .done 标记文件失败 {marker}: {e}")
     return 0.0
 
 def is_complete(filepath: Path) -> bool:
@@ -437,8 +463,8 @@ def get_audio_duration(filepath) -> float:
             dur = float(out_val)
             if dur > 0:
                 return dur
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"ffprobe 获取时长失败，尝试 ffmpeg 全解码: {e}")
 
     # 方法 2: ffmpeg 全解码 (最可靠，对任何格式都准确)
     try:
@@ -462,9 +488,9 @@ def get_audio_duration(filepath) -> float:
                 dur = float(h) * 3600 + float(m) * 60 + float(s)
                 if dur > 0:
                     return dur
-    except Exception:
-        pass
-    
+    except Exception as e:
+        logger.warning(f"ffmpeg 全解码获取时长失败 {Path(filepath).name}: {e}")
+
     print(f"  ⚠️ 无法获取时长 {Path(filepath).name}, 默认180s")
     return 180.0
 
@@ -571,7 +597,8 @@ def build_master_audio_task(tag: str, mp3_pool: list, output_path: Path, task_id
         list_file.unlink(missing_ok=True)
         for lnk in temp_links:
             try: lnk.unlink(missing_ok=True)
-            except: pass
+            except Exception as e:
+                logger.warning(f"清理临时链接失败: {e}")
         actual_dur = get_audio_duration(output_path)
         elapsed = time.time() - start_time
         print(f"  ✅ [{tag}] 母带 #{task_id} 完成: 实际时长 {actual_dur:.0f}s ({actual_dur/60:.1f}min), 耗时 {elapsed:.1f}s")
@@ -650,7 +677,8 @@ def render_video_task(tag: str, image_path, audio_path, output_path, filter_comp
         for tmp in [tmp_img, tmp_aud]:
             if tmp:
                 try: tmp.unlink(missing_ok=True)
-                except: pass
+                except Exception as e:
+                    logger.warning(f"清理临时文件失败: {e}")
         
         # 冷却: 让 CPU 短暂喘息，防止持续满载导致热功耗过高
         # 特别是在多并行时，这能给电池充电的机会
@@ -772,14 +800,24 @@ class RenderOptions:
     fx_color_tint: str = "none"
     fx_soft_focus: bool = False
     fx_soft_focus_sigma: float = 1.5
+    fx_spectrum_asset: str = "code"
+    fx_reactive_spectrum_enabled: bool = False
+    fx_reactive_spectrum_preset: str = "random"
     fx_particle: str = "none"
     fx_particle_opacity: float = 0.6
     fx_particle_speed: float = 1.0
+    fx_sticker: str = "none"
+    fx_sticker_count: str = "2,4"
+    fx_sticker_opacity: str = "0.35,0.55"
     fx_text_font: str = "default"
     fx_text: str = ""
     fx_text_pos: str = "center"
     fx_text_size: int = 60
     fx_text_style: str = "Classic"
+    fx_visual_preset: str = "none"
+    fx_bass_pulse: bool = False
+    fx_bass_pulse_scale: float = 0.03
+    fx_bass_pulse_brightness: float = 0.04
 
 def parse_arguments() -> RenderOptions:
     global SONG_COUNT
@@ -809,6 +847,10 @@ def parse_arguments() -> RenderOptions:
         elif arg.startswith('--spectrum-y='): opts.fx_spectrum_y = int(arg.split('=')[1])
         elif arg.startswith('--spectrum-x='): opts.fx_spectrum_x = int(arg.split('=')[1])
         elif arg.startswith('--spectrum-w='): opts.fx_spectrum_w = int(arg.split('=')[1])
+        elif arg.startswith('--spectrum-asset='): opts.fx_spectrum_asset = arg.split('=', 1)[1]
+        elif arg == '--reactive-spectrum': opts.fx_reactive_spectrum_enabled = True
+        elif arg == '--no-reactive-spectrum': opts.fx_reactive_spectrum_enabled = False
+        elif arg.startswith('--reactive-spectrum-preset='): opts.fx_reactive_spectrum_preset = arg.split('=', 1)[1]
         elif arg.startswith('--style='): opts.fx_style = arg.split('=')[1]
         elif arg.startswith('--film-grain='):
             opts.fx_film_grain = True
@@ -820,12 +862,19 @@ def parse_arguments() -> RenderOptions:
             opts.fx_soft_focus_sigma = float(arg.split('=')[1])
         elif arg.startswith('--particle='): opts.fx_particle = arg.split('=')[1]
         elif arg.startswith('--particle-opacity='): opts.fx_particle_opacity = float(arg.split('=')[1])
+        elif arg.startswith('--sticker='): opts.fx_sticker = arg.split('=', 1)[1]
+        elif arg.startswith('--sticker-count='): opts.fx_sticker_count = arg.split('=', 1)[1]
+        elif arg.startswith('--sticker-opacity='): opts.fx_sticker_opacity = arg.split('=', 1)[1]
         elif arg.startswith('--song-count='): SONG_COUNT = int(arg.split('=')[1])
         elif arg.startswith('--text-font='): opts.fx_text_font = arg.split('=')[1]
         elif arg.startswith('--text='): opts.fx_text = arg.split('=', 1)[1]
         elif arg.startswith('--text-pos='): opts.fx_text_pos = arg.split('=')[1]
         elif arg.startswith('--text-size='): opts.fx_text_size = int(arg.split('=')[1])
         elif arg.startswith('--text-style='): opts.fx_text_style = arg.split('=')[1]
+        elif arg.startswith('--visual-preset='): opts.fx_visual_preset = arg.split('=', 1)[1]
+        elif arg == '--bass-pulse': opts.fx_bass_pulse = True
+        elif arg.startswith('--bass-pulse-scale='): opts.fx_bass_pulse_scale = float(arg.split('=')[1])
+        elif arg.startswith('--bass-pulse-brightness='): opts.fx_bass_pulse_brightness = float(arg.split('=')[1])
         elif arg.startswith('--tags=') or arg.startswith('--tag='):
             raw = arg.split('=', 1)[1]
             tags = [t.strip() for t in re.split(r'[，,]', raw) if t.strip()]
@@ -882,64 +931,233 @@ def parse_arguments() -> RenderOptions:
     return opts
 
 
-def build_effect_kwargs(opts: RenderOptions) -> dict:
+def build_effect_kwargs(opts: RenderOptions, *, rng=None) -> dict:
+    rng = rng or random
+
+    def choose_value(value, *, default=None, choices: list | None = None):
+        raw = value
+        if isinstance(raw, str):
+            raw = raw.strip()
+            if raw.lower() == "random":
+                if choices:
+                    return rng.choice(list(choices))
+                return default
+        return raw if raw not in (None, "") else default
+
+    def choose_int(value, *, default: int, minimum: int | None = None, maximum: int | None = None):
+        raw = value
+        if isinstance(raw, str):
+            text = raw.strip()
+            matched = re.fullmatch(r"\s*(-?\d+)\s*[-,~]\s*(-?\d+)\s*", text)
+            if matched:
+                left = int(matched.group(1))
+                right = int(matched.group(2))
+                low, high = sorted((left, right))
+                picked = rng.randint(low, high)
+                if minimum is not None:
+                    picked = max(minimum, picked)
+                if maximum is not None:
+                    picked = min(maximum, picked)
+                return picked
+            if text.lower() == "random" and minimum is not None and maximum is not None:
+                return rng.randint(minimum, maximum)
+            try:
+                picked = int(text)
+            except Exception:
+                picked = default
+        else:
+            try:
+                picked = int(raw)
+            except Exception:
+                picked = default
+        if minimum is not None:
+            picked = max(minimum, picked)
+        if maximum is not None:
+            picked = min(maximum, picked)
+        return picked
+
+    def choose_float(value, *, default: float, minimum: float | None = None, maximum: float | None = None, precision: int = 2):
+        raw = value
+        if isinstance(raw, str):
+            text = raw.strip()
+            matched = re.fullmatch(r"\s*(-?\d+(?:\.\d+)?)\s*[-,~]\s*(-?\d+(?:\.\d+)?)\s*", text)
+            if matched:
+                left = float(matched.group(1))
+                right = float(matched.group(2))
+                low, high = sorted((left, right))
+                picked = round(rng.uniform(low, high), precision)
+                if minimum is not None:
+                    picked = max(minimum, picked)
+                if maximum is not None:
+                    picked = min(maximum, picked)
+                return picked
+            if text.lower() == "random" and minimum is not None and maximum is not None:
+                return round(rng.uniform(minimum, maximum), precision)
+            try:
+                picked = float(text)
+            except Exception:
+                picked = default
+        else:
+            try:
+                picked = float(raw)
+            except Exception:
+                picked = default
+        if minimum is not None:
+            picked = max(minimum, picked)
+        if maximum is not None:
+            picked = min(maximum, picked)
+        return picked
+
     kwargs = {
         "spectrum": opts.fx_spectrum,
+        "spectrum_asset": choose_value(
+            getattr(opts, "fx_spectrum_asset", "code"),
+            default="code",
+            choices=list_spectrum_assets(),
+        ),
+        "reactive_spectrum_enabled": bool(getattr(opts, "fx_reactive_spectrum_enabled", False)),
+        "reactive_spectrum_preset": choose_value(
+            getattr(opts, "fx_reactive_spectrum_preset", "random"),
+            default="random",
+            choices=list_reactive_spectrum_presets(),
+        ),
         "timeline": opts.fx_timeline,
         "letterbox": opts.fx_letterbox,
-        "zoom": opts.fx_zoom,
-        "color_spectrum": opts.fx_color_spectrum,
-        "color_timeline": opts.fx_color_timeline,
-        "spectrum_y": opts.fx_spectrum_y,
-        "spectrum_x": opts.fx_spectrum_x,
-        "spectrum_w": opts.fx_spectrum_w,
-        "style": opts.fx_style,
+        "visual_preset": getattr(opts, "fx_visual_preset", "none"),
+        "zoom": choose_value(opts.fx_zoom, default="normal", choices=list_zoom_modes()),
+        "color_spectrum": choose_value(opts.fx_color_spectrum, default="WhiteGold", choices=list_palette_names()),
+        "color_timeline": choose_value(opts.fx_color_timeline, default="WhiteGold", choices=list_palette_names()),
+        "spectrum_y": choose_int(opts.fx_spectrum_y, default=530, minimum=0, maximum=1000),
+        "spectrum_x": choose_int(opts.fx_spectrum_x, default=-1, minimum=-1, maximum=1800),
+        "spectrum_w": choose_int(opts.fx_spectrum_w, default=1200, minimum=360, maximum=1800),
+        "style": choose_value(opts.fx_style, default="bar", choices=list_effects()),
         "text": opts.fx_text,
-        "text_pos": opts.fx_text_pos,
-        "text_size": opts.fx_text_size,
-        "text_style": opts.fx_text_style,
+        "text_pos": choose_value(opts.fx_text_pos, default="center", choices=list_text_positions()),
+        "text_size": choose_int(opts.fx_text_size, default=60, minimum=18, maximum=180),
+        "text_style": choose_value(opts.fx_text_style, default="Classic", choices=list_text_styles()),
         "film_grain": opts.fx_film_grain,
-        "grain_strength": opts.fx_grain_strength,
+        "grain_strength": choose_int(opts.fx_grain_strength, default=15, minimum=0, maximum=60),
         "vignette": opts.fx_vignette,
-        "color_tint": opts.fx_color_tint,
+        "color_tint": choose_value(opts.fx_color_tint, default="none", choices=list_tint_names()),
         "soft_focus": opts.fx_soft_focus,
-        "soft_focus_sigma": opts.fx_soft_focus_sigma,
-        "particle": opts.fx_particle,
-        "particle_opacity": opts.fx_particle_opacity,
-        "particle_speed": opts.fx_particle_speed,
-        "text_font": opts.fx_text_font,
+        "soft_focus_sigma": choose_float(opts.fx_soft_focus_sigma, default=1.5, minimum=0.3, maximum=6.0),
+        "particle": choose_value(
+            opts.fx_particle,
+            default="none",
+            choices=[item for item in list_particle_effects() if item not in {"none", "random"}],
+        ),
+        "particle_opacity": choose_float(opts.fx_particle_opacity, default=0.6, minimum=0.0, maximum=1.0),
+        "particle_speed": choose_float(opts.fx_particle_speed, default=1.0, minimum=0.2, maximum=3.0),
+        "sticker": choose_value(
+            getattr(opts, "fx_sticker", "none"),
+            default="none",
+            choices=list_sticker_effects(),
+        ),
+        "sticker_count": str(getattr(opts, "fx_sticker_count", "2,4") or "2,4"),
+        "sticker_opacity": str(getattr(opts, "fx_sticker_opacity", "0.35,0.55") or "0.35,0.55"),
+        "text_font": choose_value(opts.fx_text_font, default="default", choices=list_font_names()),
+        "bass_pulse": bool(getattr(opts, "fx_bass_pulse", False) or str(getattr(opts, "fx_visual_preset", "")) == "mega_bass"),
+        "bass_pulse_scale": choose_float(getattr(opts, "fx_bass_pulse_scale", 0.03), default=0.03, minimum=0.0, maximum=0.12, precision=3),
+        "bass_pulse_brightness": choose_float(getattr(opts, "fx_bass_pulse_brightness", 0.04), default=0.04, minimum=0.0, maximum=0.12, precision=3),
     }
-    if not opts.fx_randomize:
-        return kwargs
-
-    # 统一的随机视觉策略，避免不同入口渲染结果过于同质。
-    kwargs.update(
-        {
-            "spectrum": "random",
-            "timeline": "random",
-            "letterbox": "random",
-            "zoom": "random",
-            "color_spectrum": "random",
-            "color_timeline": "random",
-            "spectrum_y": random.choice([470, 500, 530, 560, 590]),
-            "spectrum_x": random.choice([-1, -1, -1, 80, 120, 160]),
-            "spectrum_w": random.choice([1080, 1200, 1320, 1440, 1600]),
-            "style": "random",
-            "film_grain": "random",
-            "grain_strength": random.randint(6, 18),
-            "vignette": "random",
-            "color_tint": "random",
-            "soft_focus": "random",
-            "soft_focus_sigma": round(random.uniform(0.8, 1.8), 2),
-            "particle": "random",
-            "particle_opacity": round(random.uniform(0.35, 0.75), 2),
-            "particle_speed": round(random.uniform(0.85, 1.15), 2),
-        }
-    )
-    if opts.fx_text:
-        kwargs["text_style"] = "random"
-        kwargs["text_size"] = random.choice([48, 56, 64, 72])
+    if kwargs["visual_preset"] == "mega_bass":
+        mega_palettes = list_mega_bass_palette_names() or ["MegaBassPurple", "MegaBassGreen", "MegaBassAmber"]
+        mega_styles = list_mega_bass_style_variants() or ["mega_neon_line"]
+        mega_particles = list_mega_bass_particle_effects() or [item for item in list_particle_effects() if item not in {"none", "random"}]
+        latin_text = all(ord(ch) < 128 for ch in str(kwargs.get("text") or "")) and bool(str(kwargs.get("text") or "").strip())
+        mega_fonts = list_mega_bass_font_names() if latin_text else [item for item in list_font_names() if item in {"default", "heiti", "songti"}]
+        kwargs["style"] = rng.choice(mega_styles)
+        palette_name = rng.choice(mega_palettes)
+        kwargs["color_spectrum"] = palette_name
+        kwargs["color_timeline"] = palette_name
+        kwargs["zoom"] = rng.choice(["slow", "normal", "fast"])
+        kwargs["particle"] = rng.choice(mega_particles)
+        kwargs["particle_opacity"] = choose_float(opts.fx_particle_opacity, default=0.34, minimum=0.12, maximum=0.65)
+        kwargs["particle_speed"] = choose_float(opts.fx_particle_speed, default=1.15, minimum=0.45, maximum=1.85)
+        kwargs["text_style"] = rng.choice(["Glow", "Neon", "Bold"])
+        kwargs["text_pos"] = rng.choice(["center", "bottom_center", "top_center"])
+        kwargs["text_font"] = rng.choice(mega_fonts) if mega_fonts else kwargs["text_font"]
+        kwargs["text_size"] = choose_int(opts.fx_text_size, default=96, minimum=62, maximum=144)
+        kwargs["spectrum_w"] = rng.randint(980, 1620)
+        kwargs["spectrum_y"] = rng.randint(470, 620)
+        kwargs["color_tint"] = rng.choice(["none", "blue_night", "cool", "golden"])
     return kwargs
+
+
+@lru_cache(maxsize=64)
+def detect_audio_bpm_profile(audio_path: str) -> tuple[float, float]:
+    path = str(audio_path or "").strip()
+    if not path:
+        return 128.0, 0.0
+
+    cmd = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-i",
+        path,
+        "-t",
+        "90",
+        "-ac",
+        "1",
+        "-ar",
+        "11025",
+        "-f",
+        "s16le",
+        "-",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, check=True, timeout=120)
+        pcm = proc.stdout
+        if not pcm:
+            return 128.0, 0.0
+        samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        if samples.size < 11025:
+            return 128.0, 0.0
+
+        frame_size = 1024
+        hop = 512
+        frame_count = 1 + max(0, (samples.size - frame_size) // hop)
+        if frame_count < 32:
+            return 128.0, 0.0
+
+        env = np.empty(frame_count, dtype=np.float32)
+        for idx in range(frame_count):
+            start = idx * hop
+            frame = samples[start : start + frame_size]
+            env[idx] = float(np.sqrt(np.mean(frame * frame)))
+
+        smooth = np.convolve(env, np.ones(8, dtype=np.float32) / 8.0, mode="same")
+        onset = np.maximum(env - smooth, 0.0)
+        onset -= onset.min()
+        peak = float(onset.max())
+        if peak <= 1e-6:
+            return 128.0, 0.0
+        onset /= peak
+
+        env_rate = 11025.0 / hop
+        min_bpm = 90.0
+        max_bpm = 170.0
+        min_lag = max(1, int(env_rate * 60.0 / max_bpm))
+        max_lag = max(min_lag + 1, int(env_rate * 60.0 / min_bpm))
+
+        centered = onset - float(onset.mean())
+        best_lag = min_lag
+        best_score = -1.0
+        for lag in range(min_lag, min(max_lag, centered.size - 2)):
+            score = float(np.dot(centered[:-lag], centered[lag:]))
+            if score > best_score:
+                best_score = score
+                best_lag = lag
+
+        bpm = max(min_bpm, min(max_bpm, 60.0 * env_rate / max(best_lag, 1)))
+        first_peak_idx = int(np.argmax(onset))
+        first_peak_time = first_peak_idx / env_rate
+        phase = (math.pi / 2.0) - (2.0 * math.pi * (bpm / 60.0) * first_peak_time)
+        return round(float(bpm), 2), float(phase)
+    except Exception as e:
+        logger.warning(f"BPM 分析失败，使用默认值 128.0: {e}")
+        return 128.0, 0.0
 
 def phase2_build_master_audios(active_projects: list) -> dict:
     """Phase 2: 并行母带合成"""
@@ -1122,9 +1340,23 @@ def phase3_render_and_upload(active_projects: list, master_map: dict, opts: Rend
             
             chosen_master = random.choice(valid_masters)
             master_dur = get_audio_duration(chosen_master)
-            
-            effect_kwargs = build_effect_kwargs(opts)
-            filter_str, effect_desc, extra_inputs = get_effect(master_dur, **effect_kwargs)
+
+            effect_seed = "|".join(
+                [
+                    str(opts.target_date),
+                    str(tag),
+                    str(container if not opts.simple_mode else idx),
+                    img.stem,
+                    chosen_master.stem,
+                ]
+            )
+            effect_rng = random.Random(effect_seed)
+            effect_kwargs = build_effect_kwargs(opts, rng=effect_rng)
+            if effect_kwargs.get("bass_pulse"):
+                bpm_value, phase_value = detect_audio_bpm_profile(str(chosen_master))
+                effect_kwargs["bass_pulse_bpm"] = bpm_value
+                effect_kwargs["bass_pulse_phase"] = phase_value
+            filter_str, effect_desc, extra_inputs = get_effect(master_dur, rng=effect_rng, **effect_kwargs)
             
             tag_video_jobs.append({
                 "tag": tag,
@@ -1133,6 +1365,7 @@ def phase3_render_and_upload(active_projects: list, master_map: dict, opts: Rend
                 "out": out_file,
                 "filter": filter_str,
                 "desc": effect_desc,
+                "effect_kwargs": effect_kwargs,
                 "extra_inputs": extra_inputs
             })
         
@@ -1179,7 +1412,13 @@ def phase3_render_and_upload(active_projects: list, master_map: dict, opts: Rend
                     if res['success']:
                         tag_success += 1
                         total_success += 1
-                        print(f"  {prefix} ✅ {tag}/{container} | {task['desc']} | {res['time']:.0f}s")
+                        fx = task.get('effect_kwargs', {})
+                        print(
+                            f"  {prefix} ✅ {tag}/{container} | {task['desc']} | "
+                            f"particle={fx.get('particle')} opacity={fx.get('particle_opacity')} "
+                            f"speed={fx.get('particle_speed')} pulse={'on' if fx.get('bass_pulse') else 'off'} "
+                            f"bpm={fx.get('bass_pulse_bpm', '-')} | {res['time']:.0f}s"
+                        )
                     else:
                         print(f"  {prefix} ❌ {tag}/{container}: {res.get('error')}")
                 progress_stop.set()
@@ -1272,7 +1511,16 @@ def save_render_history(opts: RenderOptions, active_projects: list, total_render
         history = []
         if HISTORY_FILE.exists():
             with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
-                history = json.load(f)
+                raw_text = f.read().strip()
+            if raw_text:
+                loaded = json.loads(raw_text)
+                if isinstance(loaded, list):
+                    history = loaded
+                elif isinstance(loaded, dict):
+                    maybe_history = loaded.get("history")
+                    history = maybe_history if isinstance(maybe_history, list) else []
+            else:
+                history = []
         
         history.append({
             "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1322,8 +1570,8 @@ def deep_clean_old_images():
                     if img_date < cutoff:
                         img.unlink()
                         old_count += 1
-                except:
-                    pass
+                except Exception as e:
+                    logger.warning(f"清理旧图片失败 {img.name}: {e}")
     if old_count:
         print(f"  🧹 清理了 {old_count} 张旧图片")
     else:
@@ -1508,12 +1756,10 @@ def main():
     
     # 显示当前设置
     print(f"🎛️  效果设置:")
-    if opts.fx_randomize:
-        print("   视觉策略: 🎲 全随机（频谱 / 时间轴 / 黑边 / 缩放 / 颜色 / 粒子 / 增强效果按视频随机）")
-    else:
-        print(f"   频谱: {'✅ 开' if opts.fx_spectrum else '❌ 关'}  |  时间轴: {'✅ 开' if opts.fx_timeline else '❌ 关'}  |  黑边: {'✅ 开' if opts.fx_letterbox else '❌ 关'}")
-        print(f"   缩放: {opts.fx_zoom}  |  频谱色: {opts.fx_color_spectrum}  |  时间轴色: {opts.fx_color_timeline}")
-        print(f"   样式: {opts.fx_style}  |  频谱Y: {opts.fx_spectrum_y}")
+    print("   视觉策略: 🎛️ 高级视觉配置（只有选成 random 的字段会按每个视频单独随机）")
+    print(f"   频谱: {'✅ 开' if opts.fx_spectrum else '❌ 关'}  |  时间轴: {'✅ 开' if opts.fx_timeline else '❌ 关'}  |  黑边: {'✅ 开' if opts.fx_letterbox else '❌ 关'}")
+    print(f"   缩放: {opts.fx_zoom}  |  频谱色: {opts.fx_color_spectrum}  |  时间轴色: {opts.fx_color_timeline}")
+    print(f"   样式: {opts.fx_style}  |  频谱Y: {opts.fx_spectrum_y}")
     print(f"   可选: --color=X (同时设置两种颜色)  --color-spectrum=X  --color-timeline=X  --style=bar/wave/circular  --spectrum-y=530")
     if opts.selected_tags:
         print(f"🏷️  指定标签: {', '.join(all_tags)}")

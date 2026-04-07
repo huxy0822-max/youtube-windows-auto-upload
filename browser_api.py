@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Browser local API adapter.
 
@@ -10,6 +11,7 @@ window, and closing it.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import platform
 import subprocess
@@ -20,11 +22,68 @@ from urllib.parse import urlparse
 
 import requests
 
-from path_helpers import resolve_config_file
+from path_helpers import detect_browser_api, resolve_config_file
+
+logger = logging.getLogger(__name__)
+
+# 浏览器默认端口
+HUBSTUDIO_DEFAULT_PORT = 6873
+BITBROWSER_DEFAULT_PORT = 54345
+
+# 统一 API 请求超时（秒）
+API_TIMEOUT = 30
+
+# 运行时 provider 覆盖 — UI 选择后通过 set_runtime_provider() 设置
+_RUNTIME_PROVIDER_OVERRIDE: str | None = None
+
+
+def set_runtime_provider(provider: str | None) -> None:
+    """设置运行时浏览器提供者覆盖（由 UI 调用）。
+
+    传入 "auto" 或 None 表示恢复自动检测。
+    传入 "hubstudio" 或 "bitbrowser" 强制使用指定提供者。
+    """
+    global _RUNTIME_PROVIDER_OVERRIDE
+    if provider and provider.strip().lower() not in ("", "auto"):
+        _RUNTIME_PROVIDER_OVERRIDE = provider.strip().lower()
+    else:
+        _RUNTIME_PROVIDER_OVERRIDE = None
+    logger.info("Runtime browser provider override set to: %s", _RUNTIME_PROVIDER_OVERRIDE or "auto")
+
+
+def get_runtime_provider() -> str | None:
+    """获取当前运行时 provider 覆盖值（None 表示自动检测）。"""
+    return _RUNTIME_PROVIDER_OVERRIDE
+
+
+def probe_browser_providers() -> dict[str, bool]:
+    """探测本地运行的浏览器管理器，返回各 provider 是否可达。
+
+    用于 UI 自动检测提示。
+    """
+    import socket
+    results: dict[str, bool] = {}
+    for provider_name, port in [("hubstudio", HUBSTUDIO_DEFAULT_PORT), ("bitbrowser", BITBROWSER_DEFAULT_PORT)]:
+        alive = False
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=2):
+                alive = True
+        except OSError:
+            pass
+        if alive:
+            defaults = DEFAULT_BROWSER_SETTINGS[provider_name]
+            url = f"http://127.0.0.1:{port}{defaults['list_endpoint']}"
+            try:
+                resp = requests.post(url, json=defaults["list_payload"], timeout=15)
+                alive = resp.status_code < 500
+            except Exception:
+                alive = False
+        results[provider_name] = alive
+    return results
 
 DEFAULT_BROWSER_SETTINGS = {
     "hubstudio": {
-        "base_url": "http://127.0.0.1:6873",
+        "base_url": f"http://127.0.0.1:{HUBSTUDIO_DEFAULT_PORT}",
         "list_endpoint": "/api/v1/env/list",
         "open_endpoint": "/api/v1/browser/start",
         "stop_endpoint": "/api/v1/browser/stop",
@@ -35,7 +94,7 @@ DEFAULT_BROWSER_SETTINGS = {
         "stop_payload_id_key": "containerCode",
     },
     "bitbrowser": {
-        "base_url": "http://127.0.0.1:54345",
+        "base_url": f"http://127.0.0.1:{BITBROWSER_DEFAULT_PORT}",
         "list_endpoint": "/browser/list",
         "open_endpoint": "/browser/open",
         "stop_endpoint": "/browser/close",
@@ -55,6 +114,19 @@ BITBROWSER_OPEN_RECOVERY_ERROR_MARKERS = (
 )
 BITBROWSER_ALREADY_OPEN_MARKERS = ("正在打开中",)
 BITBROWSER_RELAUNCH_MARKERS = ("打开窗口失败", "Failed to launch the browser process")
+
+
+def _autodetect_browser_api() -> dict[str, Any] | None:
+    try:
+        return detect_browser_api()
+    except Exception as exc:
+        logger.info("Auto-detect browser API failed: %s", exc)
+        return None
+
+
+AUTO_DETECTED_BROWSER_API = _autodetect_browser_api()
+if AUTO_DETECTED_BROWSER_API is None:
+    logger.info("No active browser local API detected on startup; browser features will wait for manual launch.")
 
 
 def _config_path(upload_config_path: str | Path | None) -> Path:
@@ -77,23 +149,28 @@ def _load_upload_config(upload_config_path: str | Path | None = None) -> dict[st
 
 def load_browser_settings(upload_config_path: str | Path | None = None) -> dict[str, Any]:
     config = _load_upload_config(upload_config_path)
-    browser_cfg = config.get("browser_api", {})
+    browser_cfg = config.get("browser_api", {}) if isinstance(config.get("browser_api"), dict) else {}
 
-    cfg_provider = (browser_cfg.get("provider") or config.get("browser_provider") or "").lower()
-    provider = (
-        os.environ.get("BROWSER_PROVIDER")
-        or browser_cfg.get("provider")
-        or config.get("browser_provider")
-        or "hubstudio"
-    ).lower()
+    runtime_provider = _RUNTIME_PROVIDER_OVERRIDE or ""
+    env_provider = str(os.environ.get("BROWSER_PROVIDER") or "").strip().lower()
+    env_base_url = str(os.environ.get("BROWSER_BASE_URL") or "").strip()
+    cfg_provider = str(browser_cfg.get("provider") or config.get("browser_provider") or "").strip().lower()
+    cfg_base_url = str(browser_cfg.get("base_url") or "").strip()
+    cfg_port = browser_cfg.get("port") or _extract_port_from_url(cfg_base_url)
 
+    detected = None
+    if not env_base_url and not cfg_base_url and not cfg_port:
+        detected = AUTO_DETECTED_BROWSER_API or _autodetect_browser_api()
+
+    # 优先级: runtime UI 选择 > 环境变量 > 配置文件 > 自动检测 > 默认hubstudio
+    provider = runtime_provider or env_provider or cfg_provider or str((detected or {}).get("provider") or "").lower() or "hubstudio"
     defaults = DEFAULT_BROWSER_SETTINGS.get(provider, DEFAULT_BROWSER_SETTINGS["hubstudio"]).copy()
     settings = defaults.copy()
     settings["provider"] = provider
 
     use_browser_cfg = (not cfg_provider) or (cfg_provider == provider)
     if use_browser_cfg:
-        settings["base_url"] = browser_cfg.get("base_url", defaults["base_url"])
+        settings["base_url"] = cfg_base_url or defaults["base_url"]
         settings["list_endpoint"] = browser_cfg.get("list_endpoint", defaults["list_endpoint"])
         settings["open_endpoint"] = browser_cfg.get("open_endpoint", defaults["open_endpoint"])
         settings["stop_endpoint"] = browser_cfg.get("stop_endpoint", defaults["stop_endpoint"])
@@ -106,6 +183,22 @@ def load_browser_settings(upload_config_path: str | Path | None = None) -> dict[
         settings["stop_payload_id_key"] = browser_cfg.get(
             "stop_payload_id_key", defaults["stop_payload_id_key"]
         )
+
+    if detected and not env_base_url and not cfg_base_url and provider == str(detected.get("provider") or "").lower():
+        settings["base_url"] = str(detected.get("base_url") or defaults["base_url"]).strip() or defaults["base_url"]
+    elif env_base_url:
+        settings["base_url"] = env_base_url
+    elif not cfg_base_url and detected and not cfg_provider:
+        detected_provider = str(detected.get("provider") or "").lower()
+        if detected_provider in DEFAULT_BROWSER_SETTINGS:
+            provider = detected_provider
+            defaults = DEFAULT_BROWSER_SETTINGS[provider].copy()
+            settings = defaults.copy()
+            settings["provider"] = provider
+            settings["base_url"] = str(detected.get("base_url") or defaults["base_url"]).strip() or defaults["base_url"]
+
+    if not env_base_url and not cfg_base_url and not detected:
+        logger.info("No browser API port responded; continuing with provider=%s default settings.", provider)
     return settings
 
 
@@ -267,7 +360,8 @@ def _run_powershell_json(command: str) -> Any:
             timeout=20,
             check=False,
         )
-    except Exception:
+    except Exception as e:
+        logger.warning(f"PowerShell 执行失败: {e}")
         return None
     if completed.returncode != 0:
         return None
@@ -276,7 +370,8 @@ def _run_powershell_json(command: str) -> Any:
         return None
     try:
         return json.loads(stdout)
-    except Exception:
+    except Exception as e:
+        logger.warning(f"PowerShell 输出 JSON 解析失败: {e}")
         return None
 
 
@@ -291,37 +386,61 @@ def _normalize_process_rows(rows: Any) -> list[dict[str, Any]]:
 
 
 def _find_bitbrowser_processes(container_code: str | int) -> list[dict[str, Any]]:
-    if not IS_WINDOWS:
-        return []
     code = str(container_code).strip()
     if not code:
         return []
-    command = (
-        "Get-CimInstance Win32_Process | "
-        "Where-Object { $_.Name -eq 'BitBrowser.exe' -and $_.CommandLine -like '*"
-        + code
-        + "*' } | "
-        "Select-Object ProcessId,ParentProcessId,CommandLine | ConvertTo-Json -Compress"
-    )
-    return _normalize_process_rows(_run_powershell_json(command))
+    if IS_WINDOWS:
+        command = (
+            "Get-CimInstance Win32_Process | "
+            "Where-Object { $_.Name -eq 'BitBrowser.exe' -and $_.CommandLine -like '*"
+            + code
+            + "*' } | "
+            "Select-Object ProcessId,ParentProcessId,CommandLine | ConvertTo-Json -Compress"
+        )
+        return _normalize_process_rows(_run_powershell_json(command))
+    # macOS / Linux: 用 ps 查找进程
+    try:
+        completed = subprocess.run(
+            ["ps", "-eo", "pid,ppid,command"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except Exception:
+        return []
+    results: list[dict[str, Any]] = []
+    for line in (completed.stdout or "").splitlines():
+        if code not in line:
+            continue
+        # 匹配 BitBrowser 或 chromium 类进程
+        lower_line = line.lower()
+        if "bitbrowser" not in lower_line and "chromium" not in lower_line and "chrome" not in lower_line:
+            continue
+        parts = line.split(None, 2)
+        if len(parts) >= 3:
+            results.append({
+                "ProcessId": int(parts[0]),
+                "ParentProcessId": int(parts[1]),
+                "CommandLine": parts[2],
+            })
+    return results
 
 
 def _listening_ports_for_pid(pid: int) -> list[int]:
+    if IS_WINDOWS:
+        return _listening_ports_for_pid_windows(pid)
+    return _listening_ports_for_pid_unix(pid)
+
+
+def _listening_ports_for_pid_windows(pid: int) -> list[int]:
     try:
         completed = subprocess.run(
             ["netstat", "-ano", "-p", "tcp"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=15,
-            check=False,
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=15, check=False,
         )
     except Exception:
         return []
     if completed.returncode != 0:
         return []
-
     ports: set[int] = set()
     pid_text = str(pid)
     for raw_line in (completed.stdout or "").splitlines():
@@ -333,15 +452,41 @@ def _listening_ports_for_pid(pid: int) -> list[int]:
             continue
         try:
             port = int(parts[1].rsplit(":", 1)[1])
-        except Exception:
+        except (ValueError, IndexError) as e:
+            logger.debug(f"端口解析跳过: {line.strip()} | {e}")
             continue
         ports.add(port)
     return sorted(ports)
 
 
+def _listening_ports_for_pid_unix(pid: int) -> list[int]:
+    """macOS / Linux: 用 lsof 查找进程监听的端口"""
+    try:
+        completed = subprocess.run(
+            ["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-a", "-p", str(pid)],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+    except Exception:
+        return []
+    ports: set[int] = set()
+    for line in (completed.stdout or "").splitlines():
+        # lsof 输出格式: COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
+        # NAME 列类似: *:9222 (LISTEN) 或 127.0.0.1:9222
+        parts = line.split()
+        if len(parts) < 9:
+            continue
+        name_col = parts[8]
+        try:
+            port = int(name_col.rsplit(":", 1)[1])
+            ports.add(port)
+        except (ValueError, IndexError):
+            continue
+    return sorted(ports)
+
+
 def _probe_debug_port(port: int) -> bool:
     try:
-        response = requests.get(f"http://127.0.0.1:{port}/json/version", timeout=3)
+        response = requests.get(f"http://127.0.0.1:{port}/json/version", timeout=API_TIMEOUT)
         if response.status_code != 200:
             return False
         data = response.json()
@@ -383,15 +528,16 @@ def _kill_stale_bitbrowser_window(container_code: str | int) -> bool:
     killed_any = False
     for pid in sorted(set(root_pids)):
         try:
-            subprocess.run(
-                ["taskkill", "/PID", str(pid), "/T", "/F"],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=20,
-                check=False,
-            )
+            if IS_WINDOWS:
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    capture_output=True, text=True, encoding="utf-8",
+                    errors="replace", timeout=20, check=False,
+                )
+            else:
+                # macOS / Linux: kill -9 进程树
+                import signal
+                os.kill(pid, signal.SIGKILL)
             killed_any = True
         except Exception:
             continue
@@ -424,8 +570,60 @@ def list_browser_envs(upload_config_path: str | Path | None = None) -> list[dict
     return _normalize_hubstudio_envs(result)
 
 
-def start_browser_debug_port(container_code: str | int, upload_config_path: str | Path | None = None) -> int:
-    settings = load_browser_settings(upload_config_path)
+def list_browser_envs_for_provider(provider: str) -> list[dict[str, Any]]:
+    """列出指定 provider 的浏览器环境，每个 env 带 _provider 字段。"""
+    provider = provider.strip().lower()
+    if provider not in DEFAULT_BROWSER_SETTINGS:
+        raise ValueError(f"Unknown provider: {provider}")
+    defaults = DEFAULT_BROWSER_SETTINGS[provider]
+    base_url = defaults["base_url"]
+    try:
+        result = _post_json(base_url, defaults["list_endpoint"], defaults["list_payload"])
+    except Exception as exc:
+        logger.info("list_browser_envs_for_provider(%s) failed: %s", provider, exc)
+        return []
+    if not _is_success(provider, result):
+        logger.info("list_browser_envs_for_provider(%s) not success: %s", provider, _extract_error_message(result))
+        return []
+    envs = _normalize_bitbrowser_envs(result) if provider == "bitbrowser" else _normalize_hubstudio_envs(result)
+    for env in envs:
+        env["_provider"] = provider
+    return envs
+
+
+def list_all_browser_envs() -> list[dict[str, Any]]:
+    """合并列出所有可达 provider 的浏览器环境。
+
+    每个 env 都带 _provider 字段标记来源。
+    """
+    all_envs: list[dict[str, Any]] = []
+    for provider_name in DEFAULT_BROWSER_SETTINGS:
+        try:
+            envs = list_browser_envs_for_provider(provider_name)
+            all_envs.extend(envs)
+        except Exception as exc:
+            logger.info("list_all_browser_envs: %s failed: %s", provider_name, exc)
+    return all_envs
+
+
+def _settings_for_provider(provider: str | None, upload_config_path: str | Path | None = None) -> dict[str, Any]:
+    """获取指定 provider 的设置。provider 为 None/"auto" 时走默认逻辑。"""
+    if provider and provider.strip().lower() not in ("", "auto"):
+        forced = provider.strip().lower()
+        if forced in DEFAULT_BROWSER_SETTINGS:
+            settings = DEFAULT_BROWSER_SETTINGS[forced].copy()
+            settings["provider"] = forced
+            return settings
+    return load_browser_settings(upload_config_path)
+
+
+def start_browser_debug_port(
+    container_code: str | int,
+    upload_config_path: str | Path | None = None,
+    *,
+    provider: str | None = None,
+) -> int:
+    settings = _settings_for_provider(provider, upload_config_path)
     payload = dict(settings["open_payload"])
     payload[settings["open_payload_id_key"]] = container_code
 
@@ -471,8 +669,13 @@ def start_browser_debug_port(container_code: str | int, upload_config_path: str 
     raise RuntimeError("Unable to resolve debugging port from browser open result")
 
 
-def stop_browser_container(container_code: str | int, upload_config_path: str | Path | None = None) -> bool:
-    settings = load_browser_settings(upload_config_path)
+def stop_browser_container(
+    container_code: str | int,
+    upload_config_path: str | Path | None = None,
+    *,
+    provider: str | None = None,
+) -> bool:
+    settings = _settings_for_provider(provider, upload_config_path)
     payload = dict(settings["stop_payload"])
     payload[settings["stop_payload_id_key"]] = container_code
 
@@ -484,3 +687,99 @@ def stop_browser_container(container_code: str | int, upload_config_path: str | 
         # still alive. Kill the stale tree so the next open gets a clean port.
         _kill_stale_bitbrowser_window(container_code)
     return True
+
+
+def _resolve_browser_identifier(
+    identifier: str | int,
+    upload_config_path: str | Path | None = None,
+    *,
+    provider: str | None = None,
+) -> dict[str, Any]:
+    clean_identifier = str(identifier or "").strip()
+    if not clean_identifier:
+        raise ValueError("Browser identifier cannot be empty.")
+
+    # 如果指定了 provider，只在该 provider 中查找
+    if provider and provider.strip().lower() not in ("", "auto"):
+        envs = list_browser_envs_for_provider(provider.strip().lower())
+    else:
+        envs = list_browser_envs(upload_config_path)
+    for env in envs:
+        serial = str(env.get("serialNumber") or "").strip()
+        container_code = str(env.get("containerCode") or "").strip()
+        name = str(env.get("name") or "").strip()
+        if clean_identifier in {serial, container_code, name}:
+            return dict(env)
+    raise RuntimeError(f"Browser env not found: {clean_identifier}")
+
+
+def open_browser_env(
+    identifier: str | int,
+    upload_config_path: str | Path | None = None,
+    *,
+    provider: str | None = None,
+) -> dict[str, Any]:
+    env = _resolve_browser_identifier(identifier, upload_config_path, provider=provider)
+    container_code = str(env.get("containerCode") or "").strip()
+    env_provider = provider or env.get("_provider")
+    attempts = 3
+    last_error: Exception | None = None
+    port = 0
+    for attempt in range(1, attempts + 1):
+        try:
+            port = start_browser_debug_port(container_code, upload_config_path, provider=env_provider)
+            break
+        except RuntimeError as exc:
+            last_error = exc
+            message = str(exc)
+            if "正在关闭中" not in message or attempt >= attempts:
+                raise
+            time.sleep(2.0 * attempt)
+    if not port and last_error is not None:
+        raise last_error
+    return {
+        "success": True,
+        "msg": "ok",
+        "data": {
+            "id": container_code,
+            "seq": int(env.get("serialNumber") or 0),
+            "name": str(env.get("name") or ""),
+            "http": str(port),
+            "debug_port": int(port),
+        },
+    }
+
+
+def close_browser_env(
+    identifier: str | int,
+    upload_config_path: str | Path | None = None,
+    *,
+    provider: str | None = None,
+) -> dict[str, Any]:
+    env = _resolve_browser_identifier(identifier, upload_config_path, provider=provider)
+    container_code = str(env.get("containerCode") or "").strip()
+    env_provider = provider or env.get("_provider")
+    attempts = 3
+    last_error: Exception | None = None
+    closed = False
+    for attempt in range(1, attempts + 1):
+        try:
+            closed = stop_browser_container(container_code, upload_config_path, provider=env_provider)
+            break
+        except RuntimeError as exc:
+            last_error = exc
+            message = str(exc)
+            if "正在打开中" not in message or attempt >= attempts:
+                raise
+            time.sleep(2.0 * attempt)
+    if not closed and last_error is not None:
+        raise last_error
+    return {
+        "success": bool(closed),
+        "msg": "ok" if closed else "failed",
+        "data": {
+            "id": container_code,
+            "seq": int(env.get("serialNumber") or 0),
+            "name": str(env.get("name") or ""),
+        },
+    }
