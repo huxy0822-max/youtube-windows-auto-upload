@@ -76,8 +76,13 @@ def probe_browser_providers() -> dict[str, bool]:
             try:
                 resp = requests.post(url, json=defaults["list_payload"], timeout=15)
                 alive = resp.status_code < 500
+                if not alive and provider_name == "bitbrowser":
+                    alive = _post_json_with_curl(url, defaults["list_payload"], timeout=15) is not None
             except Exception:
-                alive = False
+                if provider_name == "bitbrowser":
+                    alive = _post_json_with_curl(url, defaults["list_payload"], timeout=15) is not None
+                else:
+                    alive = False
         results[provider_name] = alive
     return results
 
@@ -219,12 +224,47 @@ def _post_json(
             return response.json()
         except requests.RequestException as exc:
             last_error = exc
+            if "54345" in url:
+                curl_result = _post_json_with_curl(url, payload, timeout=timeout)
+                if curl_result is not None:
+                    return curl_result
             if attempt >= attempts:
                 break
             time.sleep(min(1.5 * attempt, 4.0))
     if last_error:
         raise last_error
     raise RuntimeError(f"Request failed: {url}")
+
+
+def _post_json_with_curl(url: str, payload: dict[str, Any], *, timeout: int = 60) -> dict[str, Any] | None:
+    """BitBrowser 在部分 macOS 环境对 requests 不稳定，curl 更稳。"""
+    payload_text = json.dumps(payload or {}, ensure_ascii=False, separators=(",", ":"))
+    try:
+        completed = subprocess.run(
+            [
+                "curl",
+                "-sS",
+                "-X",
+                "POST",
+                url,
+                "-H",
+                "Content-Type: application/json",
+                "--data-binary",
+                payload_text,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except Exception:
+        return None
+    if completed.returncode != 0:
+        return None
+    try:
+        return json.loads(completed.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
 
 
 def _extract_error_message(result: Any) -> str:

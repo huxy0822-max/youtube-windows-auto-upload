@@ -204,7 +204,7 @@ def build_reactive_spectrum_overlay(
         endfreq = _coerce_float(payload.get("endfreq"), 18000.0, minimum=10.0, maximum=100000.0)
         cscheme = str(payload.get("cscheme") or "0.06|0.80|1.00|0.00|0.62|0.98").strip()
         chains.append(
-            f"[1:a]showcqt=s={size_text}:r=30:bar_h=-1:axis_h=0:sono_h=0:fullhd=0:"
+            f"[1:a]showcqt=s={size_text}:r=30:bar_h=-1:axis_h=0:sono_h=0:"
             f"bar_v={bar_v}:sono_v={sono_v}:bar_g={bar_g:.3f}:sono_g={sono_g:.3f}:"
             f"tc={timeclamp:.3f}:attack={attack:.3f}:count={count}:basefreq={basefreq:.3f}:"
             f"endfreq={endfreq:.3f}:axis=0:text=0:csp=bt709:cscheme={cscheme},"
