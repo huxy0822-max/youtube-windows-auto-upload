@@ -2224,6 +2224,7 @@ def _generate_task_metadata_payload(
             cover_count=cover_count,
             tag=tag,
             title_text=title,
+            force_fallback=_parse_toggle((config or {}).get("force_fallback_thumbnails"), False),
             control=control,
             log=log,
         )
@@ -2316,6 +2317,7 @@ def _generate_thumbnail_covers(
     cover_count: int,
     tag: str,
     title_text: str,
+    force_fallback: bool = False,
     control: ExecutionControl | None,
     log: LogFunc,
 ) -> tuple[list[Path], str]:
@@ -2326,8 +2328,34 @@ def _generate_thumbnail_covers(
     api_enabled = bool(bundle) and str((api_preset or {}).get("autoImageEnabled") or "0") == "1"
     if not prompts:
         raise RuntimeError(f"{tag}/{serial} thumbnail prompts are missing from text API output.")
+    if force_fallback:
+        if source_image and source_image.exists():
+            log(f"[封面] {tag}/{serial}: 已按当前任务设置直接使用底图加字保底封面。")
+            fallback = _make_cover_fallbacks(
+                source_image,
+                target_dir,
+                date_mmdd,
+                serial,
+                cover_count,
+                headline=title_text,
+                genre_text=_derive_cover_genre_text(tag, bundle),
+            )
+            return fallback, "source_image_text_fallback"
+        raise RuntimeError(f"{tag}/{serial} fallback thumbnail requires a source image.")
     if not api_enabled:
-        raise RuntimeError(f"{tag}/{serial} thumbnail image API is required but not enabled.")
+        if source_image and source_image.exists():
+            log(f"[封面] {tag}/{serial}: 图片 API 未启用，使用底图加字保底封面。")
+            fallback = _make_cover_fallbacks(
+                source_image,
+                target_dir,
+                date_mmdd,
+                serial,
+                cover_count,
+                headline=title_text,
+                genre_text=_derive_cover_genre_text(tag, bundle),
+            )
+            return fallback, "source_image_text_fallback"
+        raise RuntimeError(f"{tag}/{serial} thumbnail image API is required but not enabled and no source image is available.")
 
     for cover_index, prompt in enumerate(prompts, 1):
         target = target_dir / f"{date_mmdd}_{serial}_cover_{cover_index:02d}.png"
@@ -2565,6 +2593,7 @@ def refresh_existing_output_metadata(
                         cover_count=cover_count,
                         tag=tag,
                         title_text=title,
+                        force_fallback=_parse_toggle((config or {}).get("force_fallback_thumbnails"), False),
                         control=control,
                         log=log,
                     )
@@ -3400,6 +3429,7 @@ def execute_metadata_only_workflow(
                         cover_count=cover_count,
                         tag=tag,
                         title_text=title,
+                        force_fallback=_parse_toggle((config or {}).get("force_fallback_thumbnails"), False),
                         control=control,
                         log=log,
                     )
@@ -3853,6 +3883,7 @@ def execute_direct_media_workflow(
                         cover_count=cover_count,
                         tag=tag,
                         title_text=title,
+                        force_fallback=_parse_toggle((config or {}).get("force_fallback_thumbnails"), False),
                         control=control,
                         log=log,
                     )
