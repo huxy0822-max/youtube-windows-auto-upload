@@ -1170,9 +1170,41 @@ def _save_daily_entry(
     save_generation_map(generation_map_path, generation_map)
 
 
-def _load_cover_font(size: int) -> ImageFont.ImageFont:
+def _load_cover_font(size: int, *, family: str | None = None) -> ImageFont.ImageFont:
     font_root = Path(__file__).resolve().parent / "fonts"
-    candidates = [
+    family_candidates = {
+        "sans": [
+            font_root / "noto_sans_tc.otf",
+            font_root / "honglei_banshu_ft.ttf",
+            font_root / "edu_songti.ttf",
+        ],
+        "serif": [
+            font_root / "noto_serif_tc.otf",
+            font_root / "edu_songti.ttf",
+            font_root / "noto_sans_tc.otf",
+        ],
+        "kai": [
+            font_root / "edu_kaishu.ttf",
+            font_root / "noto_serif_tc.otf",
+            font_root / "noto_sans_tc.otf",
+        ],
+        "hand": [
+            font_root / "honglei_banshu_ft.ttf",
+            font_root / "edu_kaishu.ttf",
+            font_root / "noto_sans_tc.otf",
+        ],
+        "display": [
+            font_root / "honglei_banshu_ft.ttf",
+            font_root / "noto_sans_tc.otf",
+            font_root / "edu_songti.ttf",
+        ],
+        "latin": [
+            font_root / "DINNextLTPro-Bold.ttf",
+            font_root / "BebasNeue-Regular.ttf",
+            font_root / "Anton-Regular.ttf",
+        ],
+    }
+    candidates = list(family_candidates.get(str(family or "").strip(), [])) + [
         font_root / "noto_sans_tc.otf",
         font_root / "noto_serif_tc.otf",
         font_root / "edu_songti.ttf",
@@ -1237,6 +1269,12 @@ def _normalize_cover_genre_text(text: str) -> str:
         return "純音樂"
 
     lowered = raw_value.lower()
+    if any(marker in lowered for marker in ("spy", "間諜", "间谍")):
+        return "間諜爵士"
+    if any(marker in lowered for marker in ("lounge", "酒廊")):
+        return "爵士酒廊"
+    if any(marker in lowered for marker in ("dark", "暗黑")):
+        return "暗黑爵士"
     keyword_map = [
         (("megabass", "mega bass", "bassboost", "bass boosted", "slap house", "edm"), "重低音電音"),
         (("jazz", "爵士"), "爵士純音樂"),
@@ -1289,6 +1327,12 @@ def _derive_cover_genre_text(tag: str, bundle: dict[str, Any] | None) -> str:
         str(tag or "").strip(),
     ]
     lowered_candidates = " ".join(candidates).lower()
+    if any(marker in lowered_candidates for marker in ("spy", "間諜", "间谍")):
+        return "間諜爵士"
+    if any(marker in lowered_candidates for marker in ("lounge", "酒廊")):
+        return "爵士酒廊"
+    if any(marker in lowered_candidates for marker in ("dark", "暗黑")):
+        return "暗黑爵士"
     keyword_map = [
         (("megabass", "mega bass", "bassboost", "bass boosted", "slap house", "edm"), "重低音電音"),
         (("jazz", "爵士"), "爵士純音樂"),
@@ -1311,7 +1355,64 @@ def _derive_cover_genre_text(tag: str, bundle: dict[str, Any] | None) -> str:
     return "純音樂"
 
 
-_FALLBACK_COVER_TEMPLATE_IDS = (1, 5, 7, 8, 9, 10)
+_FALLBACK_COVER_TEMPLATE_IDS = (1, 5, 7, 8, 9, 10, 11, 12, 13, 14)
+
+
+def _pick_cover_font_family(template_id: int, *, primary: bool) -> str:
+    families = {
+        1: ("sans", "serif"),
+        5: ("serif", "kai"),
+        7: ("display", "sans"),
+        8: ("serif", "sans"),
+        9: ("kai", "serif"),
+        10: ("sans", "serif"),
+        11: ("display", "serif"),
+        12: ("serif", "sans"),
+        13: ("kai", "serif"),
+        14: ("sans", "kai"),
+    }
+    fallback = random.choice(("sans", "serif", "kai", "display"))
+    pair = families.get(template_id, (fallback, "serif"))
+    return pair[0] if primary else pair[1]
+
+
+def _clean_cover_short_label(value: str) -> str:
+    raw = unicodedata.normalize("NFKC", str(value or "")).strip()
+    raw = re.sub(r"[#＃\"'“”‘’\[\]【】()（）<>《》]+", "", raw)
+    raw = re.sub(r"\s+", "", raw).replace("音乐", "音樂")
+    if any(fragment in raw for fragment in ("锛", "闊", "妯", "�", "Ã", "Â", "Ð", "Ñ", "é", "ä", "ï")):
+        return ""
+    return raw[:8].strip()
+
+
+def _pick_cover_subtitle_text(genre_text: str) -> str:
+    normalized = _normalize_cover_genre_text(genre_text or "純音樂")
+    lowered = f"{genre_text} {normalized}".lower()
+    variants = [normalized]
+    if any(marker in lowered for marker in ("spy", "間諜", "间谍")):
+        variants.extend(["間諜爵士", "爵士酒廊", "暗黑爵士", "雨夜酒廊", "東亞夜爵士"])
+    elif any(marker in lowered for marker in ("lounge", "酒廊")):
+        variants.extend(["爵士酒廊", "雨夜酒廊", "深夜酒廊", "東亞夜爵士", "暗黑爵士"])
+    elif any(marker in lowered for marker in ("dark", "暗黑")):
+        variants.extend(["暗黑爵士", "雨夜爵士", "深夜爵士", "間諜爵士", "電影爵士"])
+    elif "jazz" in lowered or "爵士" in lowered:
+        variants.extend(["爵士純音樂", "深夜爵士", "雨夜爵士", "東亞夜爵士", "電影爵士"])
+    elif any(marker in lowered for marker in ("movie", "cinematic", "電影", "电影")):
+        variants.extend(["電影音樂", "電影感純音樂", "雨夜電影感", "沉浸純音樂"])
+    elif any(marker in lowered for marker in ("piano", "鋼琴", "钢琴")):
+        variants.extend(["鋼琴純音樂", "深夜鋼琴", "沉浸鋼琴"])
+    elif any(marker in lowered for marker in ("megabass", "bass", "edm", "重低音")):
+        variants.extend(["重低音電音", "深夜低音", "BASS MUSIC"])
+    else:
+        variants.extend(["沉浸純音樂", "耳機純音樂", "深夜純音樂"])
+    clean_variants = []
+    seen = set()
+    for item in variants:
+        clean = _clean_cover_short_label(item)
+        if clean and clean not in seen:
+            seen.add(clean)
+            clean_variants.append(clean)
+    return random.choice(clean_variants or ["純音樂"])
 
 
 def _cover_draw_text_shadow(
@@ -1365,17 +1466,18 @@ def _fit_cover_text_to_width(
     initial_size: int,
     max_width: int,
     min_size: int = 34,
+    family: str | None = None,
 ) -> tuple[str, ImageFont.FreeTypeFont]:
     clean = re.sub(r"\s+", "", str(text or "").strip())
     if not clean:
         clean = "純音樂"
     for font_size in range(int(initial_size), int(min_size) - 1, -4):
-        font = _load_cover_font(font_size)
+        font = _load_cover_font(font_size, family=family)
         bbox = draw.textbbox((0, 0), clean, font=font, anchor="lt")
         width = bbox[2] - bbox[0]
         if width <= max_width:
             return clean, font
-    font = _load_cover_font(min_size)
+    font = _load_cover_font(min_size, family=family)
     cropped = clean
     while len(cropped) > 2:
         candidate = f"{cropped}…"
@@ -1400,19 +1502,21 @@ def _render_cover_fallback_variant(
     draw.rectangle((0, 0, canvas_w, canvas_h), fill=(18, 12, 10, 88))
 
     primary = "超好聽"
-    secondary = _normalize_cover_genre_text(genre_text or "純音樂")
-    primary_t1, primary_font_t1 = _fit_cover_text_to_width(draw, primary, initial_size=202, max_width=1020, min_size=72)
-    primary_t5, primary_font_t5 = _fit_cover_text_to_width(draw, primary, initial_size=184, max_width=760, min_size=68)
-    primary_t7, primary_font_t7 = _fit_cover_text_to_width(draw, primary, initial_size=166, max_width=710, min_size=58)
-    primary_t8, primary_font_t8 = _fit_cover_text_to_width(draw, primary, initial_size=188, max_width=900, min_size=68)
-    primary_t9, primary_font_t9 = _fit_cover_text_to_width(draw, primary, initial_size=170, max_width=980, min_size=62)
-    primary_t10, primary_font_t10 = _fit_cover_text_to_width(draw, primary, initial_size=198, max_width=820, min_size=68)
-    secondary_t1, secondary_font_t1 = _fit_cover_text_to_width(draw, secondary, initial_size=84, max_width=760, min_size=42)
-    secondary_t5, secondary_font_t5 = _fit_cover_text_to_width(draw, secondary, initial_size=70, max_width=620, min_size=40)
-    secondary_t7, secondary_font_t7 = _fit_cover_text_to_width(draw, secondary, initial_size=62, max_width=430, min_size=34)
-    secondary_t8, secondary_font_t8 = _fit_cover_text_to_width(draw, secondary, initial_size=68, max_width=700, min_size=38)
-    secondary_t9, secondary_font_t9 = _fit_cover_text_to_width(draw, secondary, initial_size=66, max_width=720, min_size=38)
-    secondary_t10, secondary_font_t10 = _fit_cover_text_to_width(draw, secondary, initial_size=86, max_width=600, min_size=40)
+    secondary = _pick_cover_subtitle_text(genre_text or "純音樂")
+    primary_family = _pick_cover_font_family(template_id, primary=True)
+    secondary_family = _pick_cover_font_family(template_id, primary=False)
+    primary_t1, primary_font_t1 = _fit_cover_text_to_width(draw, primary, initial_size=202, max_width=1020, min_size=72, family=primary_family)
+    primary_t5, primary_font_t5 = _fit_cover_text_to_width(draw, primary, initial_size=184, max_width=760, min_size=68, family=primary_family)
+    primary_t7, primary_font_t7 = _fit_cover_text_to_width(draw, primary, initial_size=166, max_width=710, min_size=58, family=primary_family)
+    primary_t8, primary_font_t8 = _fit_cover_text_to_width(draw, primary, initial_size=188, max_width=900, min_size=68, family=primary_family)
+    primary_t9, primary_font_t9 = _fit_cover_text_to_width(draw, primary, initial_size=170, max_width=980, min_size=62, family=primary_family)
+    primary_t10, primary_font_t10 = _fit_cover_text_to_width(draw, primary, initial_size=198, max_width=820, min_size=68, family=primary_family)
+    secondary_t1, secondary_font_t1 = _fit_cover_text_to_width(draw, secondary, initial_size=84, max_width=760, min_size=42, family=secondary_family)
+    secondary_t5, secondary_font_t5 = _fit_cover_text_to_width(draw, secondary, initial_size=70, max_width=620, min_size=40, family=secondary_family)
+    secondary_t7, secondary_font_t7 = _fit_cover_text_to_width(draw, secondary, initial_size=62, max_width=430, min_size=34, family=secondary_family)
+    secondary_t8, secondary_font_t8 = _fit_cover_text_to_width(draw, secondary, initial_size=68, max_width=700, min_size=38, family=secondary_family)
+    secondary_t9, secondary_font_t9 = _fit_cover_text_to_width(draw, secondary, initial_size=66, max_width=720, min_size=38, family=secondary_family)
+    secondary_t10, secondary_font_t10 = _fit_cover_text_to_width(draw, secondary, initial_size=86, max_width=600, min_size=40, family=secondary_family)
     warm_white = (252, 245, 236, 255)
     gold = (225, 198, 146, 255)
 
@@ -1444,6 +1548,22 @@ def _render_cover_fallback_variant(
         draw.rounded_rectangle((280, 420, 1000, 568), radius=42, fill=(255, 248, 241, 18))
         _cover_draw_text_shadow(draw, (640, 298), primary_t10, primary_font_t10, warm_white)
         draw.text((640, 495), secondary_t10, font=secondary_font_t10, fill=gold, anchor="mm")
+    elif template_id == 11:
+        draw.rounded_rectangle((64, 74, 780, 382), radius=34, fill=(18, 11, 10, 142), outline=(255, 255, 255, 30), width=2)
+        _cover_draw_text_shadow(draw, (118, 205), primary_t7, primary_font_t7, warm_white, anchor="lm")
+        _cover_draw_pill(draw, (335, 318), secondary_t7, secondary_font_t7, fill=(35, 22, 19, 190), text_fill=gold, outline=(255, 255, 255, 22))
+    elif template_id == 12:
+        draw.rounded_rectangle((500, 74, 1216, 382), radius=34, fill=(18, 11, 10, 142), outline=(255, 255, 255, 30), width=2)
+        _cover_draw_text_shadow(draw, (1162, 205), primary_t7, primary_font_t7, warm_white, anchor="rm")
+        _cover_draw_pill(draw, (945, 318), secondary_t7, secondary_font_t7, fill=(35, 22, 19, 190), text_fill=gold, outline=(255, 255, 255, 22))
+    elif template_id == 13:
+        draw.rounded_rectangle((64, 350, 790, 650), radius=34, fill=(18, 11, 10, 155), outline=(255, 255, 255, 30), width=2)
+        _cover_draw_text_shadow(draw, (118, 478), primary_t7, primary_font_t7, warm_white, anchor="lm")
+        _cover_draw_pill(draw, (335, 590), secondary_t7, secondary_font_t7, fill=(35, 22, 19, 200), text_fill=warm_white, outline=(255, 255, 255, 22))
+    elif template_id == 14:
+        draw.rounded_rectangle((490, 350, 1216, 650), radius=34, fill=(18, 11, 10, 155), outline=(255, 255, 255, 30), width=2)
+        _cover_draw_text_shadow(draw, (1162, 478), primary_t7, primary_font_t7, warm_white, anchor="rm")
+        _cover_draw_pill(draw, (945, 590), secondary_t7, secondary_font_t7, fill=(35, 22, 19, 200), text_fill=warm_white, outline=(255, 255, 255, 22))
     else:
         raise ValueError(f"Unsupported fallback cover template: {template_id}")
 
