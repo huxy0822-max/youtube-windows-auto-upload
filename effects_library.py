@@ -23,6 +23,7 @@ SPECTRUM_DIR = BASE_DIR / "spectrums"
 FONT_DIR = BASE_DIR / "fonts"
 STICKER_DIR = BASE_DIR / "stickers" / "mediterranean"
 OVERLAY_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv"}
+MIN_OVERLAY_BYTES = 4096
 
 PALETTES = {
     "WhiteGold": {"spectrum": "white|#FFD700", "timeline": "#FFD700", "text": "#FFF5D6"},
@@ -198,11 +199,20 @@ def list_effects() -> list[str]:
     return ["bar", "bar_mirror", "wave", "circular"]
 
 
+def _is_usable_overlay_file(path: Path) -> bool:
+    if not path.is_file() or path.suffix.lower() not in OVERLAY_EXTENSIONS:
+        return False
+    try:
+        return path.stat().st_size >= MIN_OVERLAY_BYTES
+    except OSError:
+        return False
+
+
 def discover_spectrum_files() -> dict[str, str]:
     mapping: dict[str, str] = {}
     if SPECTRUM_DIR.exists():
         for path in sorted(SPECTRUM_DIR.iterdir()):
-            if not path.is_file() or path.suffix.lower() not in OVERLAY_EXTENSIONS:
+            if not _is_usable_overlay_file(path):
                 continue
             mapping.setdefault(path.stem, path.name)
     return mapping
@@ -238,7 +248,7 @@ def discover_particle_files() -> dict[str, str]:
     mapping = dict(PARTICLE_FILES)
     if OVERLAY_DIR.exists():
         for path in sorted(OVERLAY_DIR.iterdir()):
-            if not path.is_file() or path.suffix.lower() not in OVERLAY_EXTENSIONS:
+            if not _is_usable_overlay_file(path):
                 continue
             mapping.setdefault(path.stem, path.name)
     return mapping
