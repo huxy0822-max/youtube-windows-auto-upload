@@ -1171,7 +1171,13 @@ def _save_daily_entry(
 
 
 def _load_cover_font(size: int) -> ImageFont.ImageFont:
+    font_root = Path(__file__).resolve().parent / "fonts"
     candidates = [
+        font_root / "noto_sans_tc.otf",
+        font_root / "noto_serif_tc.otf",
+        font_root / "edu_songti.ttf",
+        font_root / "edu_kaishu.ttf",
+        font_root / "honglei_banshu_ft.ttf",
         Path("C:/Windows/Fonts/msyhbd.ttc"),
         Path("C:/Windows/Fonts/msyh.ttc"),
         Path("C:/Windows/Fonts/simhei.ttf"),
@@ -1381,14 +1387,26 @@ def _fit_cover_text_to_width(
     return clean[:8], font
 
 
-def _render_cover_fallback_variant(source_image: Path, target: Path, genre_text: str, template_id: int) -> Path:
+def _render_cover_fallback_variant(
+    source_image: Path,
+    target: Path,
+    headline: str,
+    genre_text: str,
+    template_id: int,
+) -> Path:
     image = _fit_cover_background(source_image).filter(ImageFilter.GaussianBlur(radius=1.8))
     draw = ImageDraw.Draw(image, "RGBA")
     canvas_w, canvas_h = image.size
     draw.rectangle((0, 0, canvas_w, canvas_h), fill=(18, 12, 10, 88))
 
-    primary = "超好聽的"
+    primary = "超好聽"
     secondary = _normalize_cover_genre_text(genre_text or "純音樂")
+    primary_t1, primary_font_t1 = _fit_cover_text_to_width(draw, primary, initial_size=202, max_width=1020, min_size=72)
+    primary_t5, primary_font_t5 = _fit_cover_text_to_width(draw, primary, initial_size=184, max_width=760, min_size=68)
+    primary_t7, primary_font_t7 = _fit_cover_text_to_width(draw, primary, initial_size=166, max_width=710, min_size=58)
+    primary_t8, primary_font_t8 = _fit_cover_text_to_width(draw, primary, initial_size=188, max_width=900, min_size=68)
+    primary_t9, primary_font_t9 = _fit_cover_text_to_width(draw, primary, initial_size=170, max_width=980, min_size=62)
+    primary_t10, primary_font_t10 = _fit_cover_text_to_width(draw, primary, initial_size=198, max_width=820, min_size=68)
     secondary_t1, secondary_font_t1 = _fit_cover_text_to_width(draw, secondary, initial_size=84, max_width=760, min_size=42)
     secondary_t5, secondary_font_t5 = _fit_cover_text_to_width(draw, secondary, initial_size=70, max_width=620, min_size=40)
     secondary_t7, secondary_font_t7 = _fit_cover_text_to_width(draw, secondary, initial_size=62, max_width=430, min_size=34)
@@ -1400,31 +1418,31 @@ def _render_cover_fallback_variant(source_image: Path, target: Path, genre_text:
 
     if template_id == 1:
         draw.rounded_rectangle((70, 95, 1210, 635), radius=44, fill=(28, 19, 17, 110), outline=(255, 255, 255, 42), width=2)
-        _cover_draw_text_shadow(draw, (640, 340), primary, _load_cover_font(212), warm_white)
+        _cover_draw_text_shadow(draw, (640, 340), primary_t1, primary_font_t1, warm_white)
         _cover_draw_pill(draw, (640, 520), secondary_t1, secondary_font_t1, fill=(35, 22, 19, 180), text_fill=warm_white, outline=(255, 255, 255, 24))
     elif template_id == 5:
         draw.ellipse((245, 80, 1035, 670), fill=(28, 18, 15, 120), outline=(255, 255, 255, 28), width=3)
-        _cover_draw_text_shadow(draw, (640, 330), primary, _load_cover_font(188), warm_white)
+        _cover_draw_text_shadow(draw, (640, 330), primary_t5, primary_font_t5, warm_white)
         _cover_draw_pill(draw, (640, 500), secondary_t5, secondary_font_t5, fill=(22, 13, 11, 182), text_fill=gold)
     elif template_id == 7:
         _cover_draw_pill(draw, (245, 120), "MUSIC COVER", _load_cover_font(28), fill=(35, 23, 19, 160), text_fill=(242, 223, 198, 255), pad_x=24, pad_y=12, radius=20)
         draw.rounded_rectangle((60, 170, 920, 610), radius=36, fill=(19, 11, 10, 132), outline=(255, 255, 255, 28), width=2)
-        _cover_draw_text_shadow(draw, (152, 345), primary, _load_cover_font(176), warm_white, anchor="lm")
+        _cover_draw_text_shadow(draw, (152, 345), primary_t7, primary_font_t7, warm_white, anchor="lm")
         _cover_draw_pill(draw, (285, 505), secondary_t7, secondary_font_t7, fill=(58, 37, 28, 204), text_fill=warm_white)
     elif template_id == 8:
         draw.rounded_rectangle((140, 115, 1140, 605), radius=18, fill=(34, 21, 18, 118), outline=(215, 186, 145, 88), width=2)
         draw.rounded_rectangle((175, 150, 1105, 570), radius=10, fill=(255, 248, 241, 20))
-        _cover_draw_text_shadow(draw, (640, 332), primary, _load_cover_font(192), warm_white)
+        _cover_draw_text_shadow(draw, (640, 332), primary_t8, primary_font_t8, warm_white)
         _cover_draw_pill(draw, (640, 505), secondary_t8, secondary_font_t8, fill=(34, 24, 18, 202), text_fill=gold, outline=(210, 174, 120, 82))
     elif template_id == 9:
         draw.polygon([(0, 520), (1280, 360), (1280, 720), (0, 720)], fill=(17, 11, 9, 165))
         draw.polygon([(0, 570), (1280, 410), (1280, 720), (0, 720)], fill=(255, 255, 255, 16))
-        _cover_draw_text_shadow(draw, (640, 430), primary, _load_cover_font(176), warm_white)
+        _cover_draw_text_shadow(draw, (640, 430), primary_t9, primary_font_t9, warm_white)
         _cover_draw_pill(draw, (640, 585), secondary_t9, secondary_font_t9, fill=(30, 18, 14, 195), text_fill=warm_white)
     elif template_id == 10:
         draw.rounded_rectangle((180, 95, 1100, 625), radius=58, fill=(16, 11, 10, 142), outline=(255, 255, 255, 24), width=2)
         draw.rounded_rectangle((280, 420, 1000, 568), radius=42, fill=(255, 248, 241, 18))
-        _cover_draw_text_shadow(draw, (640, 298), primary, _load_cover_font(204), warm_white)
+        _cover_draw_text_shadow(draw, (640, 298), primary_t10, primary_font_t10, warm_white)
         draw.text((640, 495), secondary_t10, font=secondary_font_t10, fill=gold, anchor="mm")
     else:
         raise ValueError(f"Unsupported fallback cover template: {template_id}")
@@ -1443,7 +1461,7 @@ def _render_cover_fallback_variant(source_image: Path, target: Path, genre_text:
 
 def _render_cover_fallback(source_image: Path, target: Path, headline: str, genre_text: str) -> Path:
     template_id = random.choice(_FALLBACK_COVER_TEMPLATE_IDS)
-    return _render_cover_fallback_variant(source_image, target, genre_text or "純音樂", template_id)
+    return _render_cover_fallback_variant(source_image, target, headline, genre_text or "純音樂", template_id)
 
 
 def _thumbnail_error_needs_balance_hint(exc: Exception | None) -> bool:
