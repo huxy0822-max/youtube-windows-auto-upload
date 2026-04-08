@@ -1,0 +1,12 @@
+{
+  "默认路径": {
+    "description": "通用默认路径配置",
+    "source_root": "",
+    "copywriting_output": "",
+    "thumbnail_output": "",
+    "render_output": "",
+    "used_materials_dir": "",
+    "used_videos_dir": "",
+    "auto_delete_days": 7
+  }
+}

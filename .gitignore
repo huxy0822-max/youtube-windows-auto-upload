@@ -10,12 +10,19 @@ Thumbs.db
 diagnose_output/
 downloaded_projects/
 upload_records/
+logs/
+output/
+data/daily_jobs/
+data/recovery_reports/
+data/repair_reports/
+data/last_run_snapshot.json
 
 data/upload_history.json
 data/metadata_history.json
 data/window_upload_plan_*.json
 render_history.json
 dashboard_state.json
+daily_job.json
 
 workspace/AutoTask/
 workspace/base_image/

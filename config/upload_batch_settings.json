@@ -1,9 +1,10 @@
 {
   "version": 1,
-  "generation_mode": "site_api",
+  "tag": "+0120薩克斯",
   "source_video_dir": "",
   "source_thumbnail_dir": "",
   "selected_serials_text": "",
+  "generation_mode": "site_api",
   "visibility": "public",
   "category": "Music",
   "made_for_kids": false,
