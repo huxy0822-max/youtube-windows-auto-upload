@@ -379,11 +379,82 @@ def is_complete(filepath: Path) -> bool:
     marker = Path(str(filepath) + ".done")
     return marker.exists()
 
+def _find_ffmpeg_pids_for_output(filepath: Path) -> list[int]:
+    """查找仍在写入指定输出文件的 ffmpeg 进程。"""
+    if not IS_WINDOWS:
+        return []
+    target = str(filepath).strip().lower()
+    if not target:
+        return []
+    script = (
+        "$target=$env:FFMPEG_TARGET.ToLower(); "
+        "Get-CimInstance Win32_Process | "
+        "Where-Object { "
+        "$_.Name -match '^ffmpeg(\\.exe)?$' -and "
+        "$_.CommandLine -and $_.CommandLine.ToLower().Contains($target) "
+        "} | Select-Object -ExpandProperty ProcessId"
+    )
+    env = dict(os.environ)
+    env["FFMPEG_TARGET"] = target
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            env=env,
+            check=False,
+        )
+    except Exception:
+        return []
+    pids: list[int] = []
+    for line in (result.stdout or "").splitlines():
+        clean = str(line or "").strip()
+        if not clean:
+            continue
+        try:
+            pids.append(int(clean))
+        except ValueError:
+            continue
+    return pids
+
+
+def _kill_ffmpeg_processes_for_output(filepath: Path) -> int:
+    """终止仍占用指定输出文件的 ffmpeg 残留进程。"""
+    killed = 0
+    for pid in _find_ffmpeg_pids_for_output(filepath):
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/F", "/T"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                check=False,
+            )
+            killed += 1
+        except Exception:
+            continue
+    return killed
+
+
 def clean_incomplete(filepath: Path):
     """清理不完整的文件（存在但无标记）"""
     if filepath.exists() and not is_complete(filepath):
         size_mb = filepath.stat().st_size / 1024 / 1024
         print(f"  🗑️ 删除不完整文件: {filepath.name} ({size_mb:.0f}MB)")
+        try:
+            filepath.unlink(missing_ok=True)
+            return
+        except PermissionError:
+            pass
+        killed = _kill_ffmpeg_processes_for_output(filepath)
+        if killed:
+            print(f"  🔧 检测到残留 ffmpeg 占用，已终止 {killed} 个进程后重试: {filepath.name}")
+            time.sleep(1.0)
         filepath.unlink(missing_ok=True)
 
 # ============ 工具函数 ============

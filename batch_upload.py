@@ -4963,6 +4963,7 @@ def save_upload_record(
         
         # 记录文件
         record_file = tag_dir / f"channel_{serial}.json"
+        slot_record_file = tag_dir / f"channel_{serial}_{video_path.stem}.json"
         
         record = {
             "upload_time": datetime.now().isoformat(),
@@ -4996,8 +4997,14 @@ def save_upload_record(
         
         with open(record_file, "w", encoding="utf-8") as f:
             json.dump(record, f, indent=2, ensure_ascii=False)
+        with open(slot_record_file, "w", encoding="utf-8") as f:
+            json.dump(record, f, indent=2, ensure_ascii=False)
         
-        log(f"📝 上传记录已保存: {record_file.relative_to(UPLOAD_RECORDS_DIR)}", "OK")
+        log(
+            f"📝 上传记录已保存: {record_file.relative_to(UPLOAD_RECORDS_DIR)} "
+            f"+ {slot_record_file.relative_to(UPLOAD_RECORDS_DIR)}",
+            "OK",
+        )
         
         # 同时更新汇总文件
         summary_file = date_dir / "upload_summary.json"
@@ -5012,13 +5019,23 @@ def save_upload_record(
             }
         
         # 添加/更新记录
-        existing = next((u for u in summary["uploads"] if u["serial"] == serial and u["tag"] == tag), None)
+        existing = next(
+            (
+                u
+                for u in summary["uploads"]
+                if u["serial"] == serial
+                and u["tag"] == tag
+                and str(u.get("video") or "").strip() == video_path.name
+            ),
+            None,
+        )
         upload_entry = {
             "tag": tag,
             "serial": serial,
             "channel_name": channel_name,
             "title": title[:80] + "..." if len(title) > 80 else title,
             "video": video_path.name,
+            "video_stem": video_path.stem,
             "thumbnails": [t.name for t in thumbnails],
             "is_ypp": is_ypp,
             "success": success,
@@ -9070,6 +9087,37 @@ def _collect_archive_material_paths(source_dir: Path, metadata_dict: dict[str, A
     return candidates
 
 
+def _validate_manifest_payload_for_upload(
+    label: str,
+    metadata_dict: dict[str, Any],
+) -> tuple[str, str, list[str], list[str], list[str] | None, bool]:
+    failure_reason = str(
+        metadata_dict.get("_metadata_failure_reason")
+        or metadata_dict.get("metadata_failure_reason")
+        or metadata_dict.get("failure_reason")
+        or ""
+    ).strip()
+    if _coerce_yes_no_bool(metadata_dict.get("_metadata_failed"), default=False):
+        raise RuntimeError(
+            f"{label} metadata generation failed earlier; refusing fallback upload"
+            + (f": {failure_reason}" if failure_reason else "")
+        )
+
+    title = str(metadata_dict.get("title") or "").strip()
+    if not title:
+        raise RuntimeError(f"{label} missing title in upload_manifest.json")
+    description = str(metadata_dict.get("description") or "").strip()
+    tag_list = [str(item).strip() for item in metadata_dict.get("tag_list", []) if str(item).strip()]
+    thumbnail_prompts = [
+        str(item).strip()
+        for item in metadata_dict.get("thumbnail_prompts", [])
+        if str(item).strip()
+    ]
+    ab_titles = [str(item).strip() for item in metadata_dict.get("ab_titles", []) if str(item).strip()] or None
+    is_ypp = _coerce_yes_no_bool(metadata_dict.get("is_ypp", False), default=False)
+    return title, description, tag_list, thumbnail_prompts, ab_titles, is_ypp
+
+
 def _slot_upload_label(group_tag: str, serial_number: int, slot_index: int, total_slots: int) -> str:
     base = f"{group_tag}/{int(serial_number)}" if str(group_tag or "").strip() else str(int(serial_number))
     if int(total_slots or 1) <= 1:
@@ -9233,12 +9281,12 @@ async def upload_single_window(
     thumbnails: list[Path] = []
     container_code = ""
     channel_name = str(metadata_dict.get("channel_name") or "").strip()
-    title = str(metadata_dict.get("title") or "").strip()
-    description = str(metadata_dict.get("description") or "").strip()
-    tag_list = [str(item).strip() for item in metadata_dict.get("tag_list", []) if str(item).strip()]
-    thumbnail_prompts = [str(item).strip() for item in metadata_dict.get("thumbnail_prompts", []) if str(item).strip()]
-    ab_titles = [str(item).strip() for item in metadata_dict.get("ab_titles", []) if str(item).strip()] or None
-    is_ypp = _coerce_yes_no_bool(metadata_dict.get("is_ypp", False), default=False)
+    title = ""
+    description = ""
+    tag_list: list[str] = []
+    thumbnail_prompts: list[str] = []
+    ab_titles: list[str] | None = None
+    is_ypp = False
     date_key = datetime.now().strftime("%m%d")
     config = _safe_load_upload_runtime_config()
 
@@ -9256,6 +9304,14 @@ async def upload_single_window(
         )
 
     try:
+        (
+            title,
+            description,
+            tag_list,
+            thumbnail_prompts,
+            ab_titles,
+            is_ypp,
+        ) = _validate_manifest_payload_for_upload(label, metadata_dict)
         container_registry = _load_container_registry_for_serials(group_tag, [serial_number])
         container_info = dict(container_registry.get(int(serial_number)) or {})
         container_code = str(container_info.get("containerCode") or "").strip()
@@ -9263,8 +9319,6 @@ async def upload_single_window(
             raise RuntimeError(f"missing container mapping for serial {serial_number}")
         if not channel_name:
             channel_name = str(container_info.get("name") or f"频道{serial_number}").strip()
-        if not title:
-            raise RuntimeError(f"{label} missing title in upload_manifest.json")
         video_path = _resolve_job_video_path(source_path, metadata_dict, serial_number)
         date_key = _resolve_job_date_key(video_path)
         thumbnails = _resolve_job_thumbnails(source_path, metadata_dict)

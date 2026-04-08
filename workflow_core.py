@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import concurrent.futures as _cf
 from collections import deque
 from dataclasses import asdict, dataclass, field
@@ -1219,21 +1220,59 @@ def _fit_cover_background(source_image: Path) -> Image.Image:
 
 
 def _normalize_cover_genre_text(text: str) -> str:
-    value = re.sub(r"\s+", "", str(text or "").strip())
-    value = re.sub(r"^[0-9_+\-]+", "", value)
-    value = value.strip("-_+ ")
-    if not value:
+    raw_value = unicodedata.normalize("NFKC", str(text or "")).strip()
+    raw_value = re.sub(r"^[0-9_+\-\s]+", "", raw_value).strip("-_+ ")
+    raw_value = re.sub(r"[（(][^）)]*[）)]", "", raw_value).strip()
+    if not raw_value:
         return "純音樂"
-    if value.lower() == "disco":
-        return "DISCO MUSIC"
-    if any(ord(ch) > 127 for ch in value):
-        if "音樂" not in value and "音乐" not in value:
-            return f"{value}音樂"
-        return value.replace("音乐", "音樂")
-    upper_value = value.upper()
-    if "MUSIC" not in upper_value:
-        upper_value = f"{upper_value} MUSIC"
-    return upper_value
+
+    suspicious_fragments = ("锛", "闊", "妯", "�", "Ã", "Â", "Ð", "Ñ", "é", "ä", "ï")
+    if any(fragment in raw_value for fragment in suspicious_fragments):
+        return "純音樂"
+
+    lowered = raw_value.lower()
+    keyword_map = [
+        (("megabass", "mega bass", "bassboost", "bass boosted", "slap house", "edm"), "重低音電音"),
+        (("jazz", "爵士"), "爵士純音樂"),
+        (("guitar", "木吉他", "吉他"), "木吉他純音樂"),
+        (("piano", "鋼琴", "钢琴"), "鋼琴純音樂"),
+        (("sax", "薩克斯", "萨克斯"), "薩克斯純音樂"),
+        (("ghibli", "吉卜力"), "吉卜力純音樂"),
+        (("古風", "古风"), "古風純音樂"),
+        (("movie", "電影", "电影", "cinematic"), "電影音樂"),
+        (("lofi", "lo-fi", "lo fi"), "LO-FI MUSIC"),
+        (("disco", "迪斯科", "的士高"), "DISCO MUSIC"),
+    ]
+    for markers, label in keyword_map:
+        if any(marker in lowered for marker in markers):
+            return label
+
+    split_markers = ("｜", "|", "/", "／", "、", "\n", "\r", "，", ",", "。", "；", ";")
+    for marker in split_markers:
+        if marker in raw_value:
+            head = str(raw_value.split(marker, 1)[0] or "").strip()
+            if head:
+                raw_value = head
+                break
+
+    if any(fragment in raw_value for fragment in suspicious_fragments):
+        return "純音樂"
+
+    if any(ord(ch) > 127 for ch in raw_value):
+        compact = re.sub(r"\s+", "", raw_value).replace("音乐", "音樂")
+        compact = compact[:8].strip()
+        if not compact:
+            return "純音樂"
+        if "音樂" not in compact:
+            compact = f"{compact}音樂"
+        return compact
+
+    ascii_value = re.sub(r"[^A-Za-z0-9+& -]", "", raw_value).strip().upper()
+    if not ascii_value:
+        return "純音樂"
+    if len(ascii_value) > 16:
+        ascii_value = ascii_value[:16].rstrip()
+    return ascii_value
 
 
 def _derive_cover_genre_text(tag: str, bundle: dict[str, Any] | None) -> str:
@@ -1243,6 +1282,22 @@ def _derive_cover_genre_text(tag: str, bundle: dict[str, Any] | None) -> str:
         str((content_template or {}).get("name") or "").strip(),
         str(tag or "").strip(),
     ]
+    lowered_candidates = " ".join(candidates).lower()
+    keyword_map = [
+        (("megabass", "mega bass", "bassboost", "bass boosted", "slap house", "edm"), "重低音電音"),
+        (("jazz", "爵士"), "爵士純音樂"),
+        (("guitar", "木吉他", "吉他"), "木吉他純音樂"),
+        (("piano", "鋼琴", "钢琴"), "鋼琴純音樂"),
+        (("sax", "薩克斯", "萨克斯"), "薩克斯純音樂"),
+        (("ghibli", "吉卜力"), "吉卜力純音樂"),
+        (("古風", "古风"), "古風純音樂"),
+        (("movie", "電影", "电影", "cinematic"), "電影音樂"),
+        (("lofi", "lo-fi", "lo fi"), "LO-FI MUSIC"),
+        (("disco", "迪斯科", "的士高"), "DISCO MUSIC"),
+    ]
+    for markers, label in keyword_map:
+        if any(marker in lowered_candidates for marker in markers):
+            return label
     for candidate in candidates:
         normalized = _normalize_cover_genre_text(candidate)
         if normalized and normalized != "純音樂":
@@ -1297,6 +1352,35 @@ def _cover_draw_pill(
     draw.text((cx, cy), text, font=font, fill=text_fill, anchor="mm")
 
 
+def _fit_cover_text_to_width(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    *,
+    initial_size: int,
+    max_width: int,
+    min_size: int = 34,
+) -> tuple[str, ImageFont.FreeTypeFont]:
+    clean = re.sub(r"\s+", "", str(text or "").strip())
+    if not clean:
+        clean = "純音樂"
+    for font_size in range(int(initial_size), int(min_size) - 1, -4):
+        font = _load_cover_font(font_size)
+        bbox = draw.textbbox((0, 0), clean, font=font, anchor="lt")
+        width = bbox[2] - bbox[0]
+        if width <= max_width:
+            return clean, font
+    font = _load_cover_font(min_size)
+    cropped = clean
+    while len(cropped) > 2:
+        candidate = f"{cropped}…"
+        bbox = draw.textbbox((0, 0), candidate, font=font, anchor="lt")
+        width = bbox[2] - bbox[0]
+        if width <= max_width:
+            return candidate, font
+        cropped = cropped[:-1]
+    return clean[:8], font
+
+
 def _render_cover_fallback_variant(source_image: Path, target: Path, genre_text: str, template_id: int) -> Path:
     image = _fit_cover_background(source_image).filter(ImageFilter.GaussianBlur(radius=1.8))
     draw = ImageDraw.Draw(image, "RGBA")
@@ -1304,38 +1388,44 @@ def _render_cover_fallback_variant(source_image: Path, target: Path, genre_text:
     draw.rectangle((0, 0, canvas_w, canvas_h), fill=(18, 12, 10, 88))
 
     primary = "超好聽的"
-    secondary = _normalize_cover_genre_text(genre_text or source_image.stem)
+    secondary = _normalize_cover_genre_text(genre_text or "純音樂")
+    secondary_t1, secondary_font_t1 = _fit_cover_text_to_width(draw, secondary, initial_size=84, max_width=760, min_size=42)
+    secondary_t5, secondary_font_t5 = _fit_cover_text_to_width(draw, secondary, initial_size=70, max_width=620, min_size=40)
+    secondary_t7, secondary_font_t7 = _fit_cover_text_to_width(draw, secondary, initial_size=62, max_width=430, min_size=34)
+    secondary_t8, secondary_font_t8 = _fit_cover_text_to_width(draw, secondary, initial_size=68, max_width=700, min_size=38)
+    secondary_t9, secondary_font_t9 = _fit_cover_text_to_width(draw, secondary, initial_size=66, max_width=720, min_size=38)
+    secondary_t10, secondary_font_t10 = _fit_cover_text_to_width(draw, secondary, initial_size=86, max_width=600, min_size=40)
     warm_white = (252, 245, 236, 255)
     gold = (225, 198, 146, 255)
 
     if template_id == 1:
         draw.rounded_rectangle((70, 95, 1210, 635), radius=44, fill=(28, 19, 17, 110), outline=(255, 255, 255, 42), width=2)
         _cover_draw_text_shadow(draw, (640, 340), primary, _load_cover_font(212), warm_white)
-        _cover_draw_pill(draw, (640, 520), secondary, _load_cover_font(84), fill=(35, 22, 19, 180), text_fill=warm_white, outline=(255, 255, 255, 24))
+        _cover_draw_pill(draw, (640, 520), secondary_t1, secondary_font_t1, fill=(35, 22, 19, 180), text_fill=warm_white, outline=(255, 255, 255, 24))
     elif template_id == 5:
         draw.ellipse((245, 80, 1035, 670), fill=(28, 18, 15, 120), outline=(255, 255, 255, 28), width=3)
         _cover_draw_text_shadow(draw, (640, 330), primary, _load_cover_font(188), warm_white)
-        _cover_draw_pill(draw, (640, 500), secondary, _load_cover_font(70), fill=(22, 13, 11, 182), text_fill=gold)
+        _cover_draw_pill(draw, (640, 500), secondary_t5, secondary_font_t5, fill=(22, 13, 11, 182), text_fill=gold)
     elif template_id == 7:
         _cover_draw_pill(draw, (245, 120), "MUSIC COVER", _load_cover_font(28), fill=(35, 23, 19, 160), text_fill=(242, 223, 198, 255), pad_x=24, pad_y=12, radius=20)
         draw.rounded_rectangle((60, 170, 920, 610), radius=36, fill=(19, 11, 10, 132), outline=(255, 255, 255, 28), width=2)
         _cover_draw_text_shadow(draw, (152, 345), primary, _load_cover_font(176), warm_white, anchor="lm")
-        _cover_draw_pill(draw, (285, 505), secondary, _load_cover_font(62), fill=(58, 37, 28, 204), text_fill=warm_white)
+        _cover_draw_pill(draw, (285, 505), secondary_t7, secondary_font_t7, fill=(58, 37, 28, 204), text_fill=warm_white)
     elif template_id == 8:
         draw.rounded_rectangle((140, 115, 1140, 605), radius=18, fill=(34, 21, 18, 118), outline=(215, 186, 145, 88), width=2)
         draw.rounded_rectangle((175, 150, 1105, 570), radius=10, fill=(255, 248, 241, 20))
         _cover_draw_text_shadow(draw, (640, 332), primary, _load_cover_font(192), warm_white)
-        _cover_draw_pill(draw, (640, 505), secondary, _load_cover_font(68), fill=(34, 24, 18, 202), text_fill=gold, outline=(210, 174, 120, 82))
+        _cover_draw_pill(draw, (640, 505), secondary_t8, secondary_font_t8, fill=(34, 24, 18, 202), text_fill=gold, outline=(210, 174, 120, 82))
     elif template_id == 9:
         draw.polygon([(0, 520), (1280, 360), (1280, 720), (0, 720)], fill=(17, 11, 9, 165))
         draw.polygon([(0, 570), (1280, 410), (1280, 720), (0, 720)], fill=(255, 255, 255, 16))
         _cover_draw_text_shadow(draw, (640, 430), primary, _load_cover_font(176), warm_white)
-        _cover_draw_pill(draw, (640, 585), secondary, _load_cover_font(66), fill=(30, 18, 14, 195), text_fill=warm_white)
+        _cover_draw_pill(draw, (640, 585), secondary_t9, secondary_font_t9, fill=(30, 18, 14, 195), text_fill=warm_white)
     elif template_id == 10:
         draw.rounded_rectangle((180, 95, 1100, 625), radius=58, fill=(16, 11, 10, 142), outline=(255, 255, 255, 24), width=2)
         draw.rounded_rectangle((280, 420, 1000, 568), radius=42, fill=(255, 248, 241, 18))
         _cover_draw_text_shadow(draw, (640, 298), primary, _load_cover_font(204), warm_white)
-        draw.text((640, 495), secondary, font=_load_cover_font(86), fill=gold, anchor="mm")
+        draw.text((640, 495), secondary_t10, font=secondary_font_t10, fill=gold, anchor="mm")
     else:
         raise ValueError(f"Unsupported fallback cover template: {template_id}")
 
@@ -1353,7 +1443,7 @@ def _render_cover_fallback_variant(source_image: Path, target: Path, genre_text:
 
 def _render_cover_fallback(source_image: Path, target: Path, headline: str, genre_text: str) -> Path:
     template_id = random.choice(_FALLBACK_COVER_TEMPLATE_IDS)
-    return _render_cover_fallback_variant(source_image, target, genre_text or headline, template_id)
+    return _render_cover_fallback_variant(source_image, target, genre_text or "純音樂", template_id)
 
 
 def _thumbnail_error_needs_balance_hint(exc: Exception | None) -> bool:
@@ -3717,7 +3807,7 @@ def execute_direct_media_workflow(
                 log(f"[错误] {warning}")
                 if not title:
                     title = output_video.stem
-                # ── 即使文案失败也写入 manifest，确保上传流程能找到视频 ──
+                # ── 文案失败时仅写入恢复用 manifest，禁止自动加入上传队列，避免裸传默认文件名。 ──
                 try:
                     fallback_channel = {
                         "video": output_video.name,
@@ -3736,6 +3826,7 @@ def execute_direct_media_workflow(
                         "total_slots": int(task.total_slots),
                         "upload_options": _build_upload_options(task),
                         "_metadata_failed": True,
+                        "_metadata_failure_reason": metadata_error or str(exc),
                     }
                     fallback_manifest = _write_manifest(
                         output_dir=task_output_dir,
@@ -3747,9 +3838,7 @@ def execute_direct_media_workflow(
                     fallback_manifest_text = str(fallback_manifest)
                     if fallback_manifest_text not in result.manifest_paths:
                         result.manifest_paths.append(fallback_manifest_text)
-                    log(f"[清单] {state['tag']} fallback manifest 已写入（文案失败）: {fallback_manifest}")
-                    if on_item_ready:
-                        on_item_ready(task, task_output_dir, fallback_manifest)
+                    log(f"[清单] {state['tag']} fallback manifest 已写入（文案失败，仅供恢复，不自动上传）: {fallback_manifest}")
                 except Exception as manifest_exc:
                     log(f"[错误] {tag}/{task_label} fallback manifest 写入也失败: {manifest_exc}")
             if metadata_executor is not None:

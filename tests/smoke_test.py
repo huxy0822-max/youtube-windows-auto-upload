@@ -19,6 +19,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+
 _TK_RUNTIME_AVAILABLE: bool | None = None
 
 
@@ -292,6 +293,22 @@ def test_render_profile_selection() -> None:
     gpu_profile = _resolve_render_profile({"render_device_preference": "gpu"})
     assert str(gpu_profile.video_codec).strip()
     print(f"✓ 渲染设备偏好测试通过: cpu={cpu_profile.video_codec}, gpu={gpu_profile.video_codec}")
+
+
+def test_cover_fallback_genre_normalization() -> None:
+    """测试封面兜底文案会收敛到安全短标签"""
+    from workflow_core import _derive_cover_genre_text, _normalize_cover_genre_text
+
+    bundle = {
+        "content_template": {
+            "name": "MEGABASS2",
+            "musicGenre": "MegaBass重低音音乐、EDM音乐、纯正的重低音电音（Bass Boosted EDM） Vocal Slap House音乐",
+        }
+    }
+    assert _derive_cover_genre_text("Bass三测", bundle) == "重低音電音"
+    assert _normalize_cover_genre_text(bundle["content_template"]["musicGenre"]) == "重低音電音"
+    assert _normalize_cover_genre_text("Ã©Ã¤Ã¯ broken text") == "純音樂"
+    print("✓ 封面兜底短标签测试通过")
 
 
 def test_path_templates() -> None:
@@ -717,6 +734,83 @@ def test_batch_upload_bool_coercion() -> None:
     print("✓ batch_upload 布尔转换测试通过")
 
 
+def test_batch_upload_rejects_failed_metadata_manifest() -> None:
+    """metadata 失败的 fallback manifest 不应继续上传。"""
+    import batch_upload
+
+    try:
+        batch_upload._validate_manifest_payload_for_upload(
+            "全球电影/1",
+            {
+                "_metadata_failed": True,
+                "_metadata_failure_reason": "titles stage disconnected",
+                "title": "0322_1_01",
+            },
+        )
+    except RuntimeError as exc:
+        assert "refusing fallback upload" in str(exc)
+    else:
+        raise AssertionError("metadata_failed manifest 未被拒绝")
+    print("✓ batch_upload metadata_failed manifest 拒绝测试通过")
+
+
+def test_save_upload_record_keeps_multiple_slots() -> None:
+    """同一窗口多条视频上传记录不应互相覆盖。"""
+    import batch_upload
+
+    original_dir = batch_upload.UPLOAD_RECORDS_DIR
+    with tempfile.TemporaryDirectory() as temp_dir:
+        records_dir = Path(temp_dir)
+        batch_upload.UPLOAD_RECORDS_DIR = records_dir
+        try:
+            video_one = records_dir / "0322_1_01.mp4"
+            video_two = records_dir / "0322_1_02.mp4"
+            video_one.write_text("video-one", encoding="utf-8")
+            video_two.write_text("video-two", encoding="utf-8")
+
+            batch_upload.save_upload_record(
+                tag="全球电影",
+                date="0322",
+                serial=1,
+                channel_name="测试频道",
+                video_path=video_one,
+                thumbnails=[],
+                title="标题一",
+                description="简介一",
+                is_ypp=False,
+                success=True,
+                stage="processing",
+            )
+            batch_upload.save_upload_record(
+                tag="全球电影",
+                date="0322",
+                serial=1,
+                channel_name="测试频道",
+                video_path=video_two,
+                thumbnails=[],
+                title="标题二",
+                description="简介二",
+                is_ypp=False,
+                success=True,
+                stage="processing",
+            )
+
+            summary = json.loads((records_dir / "0322" / "upload_summary.json").read_text(encoding="utf-8"))
+            uploads = [
+                item
+                for item in summary.get("uploads", [])
+                if item.get("tag") == "全球电影" and int(item.get("serial") or 0) == 1
+            ]
+            assert len(uploads) == 2, uploads
+            assert sorted(item.get("video") for item in uploads) == ["0322_1_01.mp4", "0322_1_02.mp4"]
+            assert (records_dir / "0322" / "全球电影" / "channel_1.json").exists()
+            assert (records_dir / "0322" / "全球电影" / "channel_1_0322_1_01.json").exists()
+            assert (records_dir / "0322" / "全球电影" / "channel_1_0322_1_02.json").exists()
+        finally:
+            batch_upload.UPLOAD_RECORDS_DIR = original_dir
+    print("✓ save_upload_record 多槽位记录测试通过")
+
+
 def test_no_quick_start() -> None:
     """确认快捷开始 Tab 已删除"""
     if _skip_if_tk_unavailable():
@@ -1011,6 +1105,7 @@ if __name__ == "__main__":
         test_visual_asset_sources_manifest,
         test_random_effects,
         test_render_profile_selection,
+        test_cover_fallback_genre_normalization,
         test_path_templates,
         test_archive_manager,
         test_render_history_empty_file,
@@ -1027,6 +1122,8 @@ if __name__ == "__main__":
         test_workflow_core_global_media_assignment,
         test_batch_upload_nested_video_lookup,
         test_batch_upload_bool_coercion,
+        test_batch_upload_rejects_failed_metadata_manifest,
+        test_save_upload_record_keeps_multiple_slots,
         test_no_quick_start,
         test_run_plan_service_worker_counts,
         test_run_plan_service_parallel_uploads,
