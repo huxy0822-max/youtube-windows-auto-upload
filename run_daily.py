@@ -31,6 +31,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from monitor_launcher import build_monitor_payload_from_queue, launch_live_monitor
+
 # ── 保证编码 ──
 if os.name == "nt":
     try:
@@ -45,11 +47,18 @@ LOG_DIR = SCRIPT_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
 # ── 日志配置 ──
-def _setup_logging() -> logging.Logger:
+def _setup_logging() -> tuple[logging.Logger, Path]:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = LOG_DIR / f"run_{timestamp}.log"
     logger = logging.getLogger("run_daily")
     logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
     # 文件 handler —— 记录一切
     fh = logging.FileHandler(str(log_file), encoding="utf-8")
     fh.setLevel(logging.DEBUG)
@@ -61,7 +70,7 @@ def _setup_logging() -> logging.Logger:
     ch.setFormatter(logging.Formatter("%(asctime)s | %(message)s", datefmt="%H:%M:%S"))
     logger.addHandler(ch)
     logger.info(f"日志文件: {log_file}")
-    return logger
+    return logger, log_file
 
 
 def _log_func(logger: logging.Logger):
@@ -392,7 +401,7 @@ def _build_run_plan_for_job(job, log):
 # 主执行流程
 # ══════════════════════════════════════════════════════════════════
 def _run(job_file: Path) -> int:
-    logger = _setup_logging()
+    logger, log_file = _setup_logging()
     log = _log_func(logger)
 
     log("=" * 60)
@@ -419,6 +428,15 @@ def _run(job_file: Path) -> int:
     total_windows = sum(len(j.window_serials) for j in queue.jobs)
     total_videos = sum(len(j.window_serials) * max(1, j.videos_per_window) for j in queue.jobs)
     log(f"共 {len(queue.jobs)} 个分组 | {total_windows} 个窗口 | 预计 {total_videos} 个视频")
+    try:
+        monitor = launch_live_monitor(
+            log_file,
+            build_monitor_payload_from_queue(queue),
+            run_name=job_file.stem,
+        )
+        log(f"[监控] 实时看板: {monitor['html_path']}")
+    except Exception as exc:
+        log(f"[警告] 监控看板启动失败: {exc}")
 
     # 进度回调
     start_time = time.time()

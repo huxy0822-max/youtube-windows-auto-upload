@@ -69,6 +69,7 @@ from run_queue import GroupJob, RunQueue, UploadDefaults, WindowOverride
 from group_upload_workflow import normalize_mmdd
 from upload_window_planner import derive_tags_and_skip_channels
 from utils import get_tag_info
+from monitor_launcher import build_monitor_payload_from_run_plan, launch_live_monitor
 from workflow_core import (
     CHANNEL_MAPPING_FILE,
     ExecutionControl,
@@ -2285,7 +2286,23 @@ class DashboardApp(ctk.CTk):
         self.after(150, self._drain_log_queue)
 
     def _log(self, message: str) -> None:
-        self.log_queue.put(message)
+        text = str(message or "")
+        self.log_queue.put(text)
+        log_path_value = getattr(self, "_run_live_log_path", "")
+        if not str(log_path_value or "").strip():
+            return
+        log_lock = getattr(self, "_run_live_log_lock", None)
+        if log_lock is None:
+            log_lock = threading.Lock()
+            setattr(self, "_run_live_log_lock", log_lock)
+        try:
+            with log_lock:
+                log_path = Path(str(log_path_value))
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                with log_path.open("a", encoding="utf-8") as handle:
+                    handle.write(f"{time.strftime('%H:%M:%S')} | {text.rstrip()}\n")
+        except Exception:
+            return
 
     def _post_ui_action(self, action: Callable[[], None]) -> None:
         self.ui_action_queue.put(action)
@@ -6038,6 +6055,7 @@ def _patched_finish_run_tracking_v2(
     self._run_upload_done.clear()
     self._run_plan_for_summary = None
     self._run_execution_result = None
+    self._run_live_log_path = ""
     with self._state_lock:
         self._run_result_map = {}
     self._run_report_logged = False
@@ -8163,6 +8181,18 @@ def _patched_start_real_flow_v3(self: DashboardApp) -> None:
     self._persist_prompt_form_for_active_tasks()
     self._write_run_snapshot(config=runtime_config, run_plan=tracking_plan)
     self._prepare_run_result_tracking(tracking_plan)
+    monitor_log_path = SCRIPT_DIR / "logs" / f"dashboard_{time.strftime('%Y%m%d_%H%M%S')}.log"
+    self._run_live_log_path = str(monitor_log_path)
+    try:
+        monitor = launch_live_monitor(
+            monitor_log_path,
+            build_monitor_payload_from_run_plan(tracking_plan),
+            run_name=monitor_log_path.stem,
+        )
+        self._log(f"日志文件: {monitor_log_path}")
+        self._log(f"[监控] 实时看板: {monitor['html_path']}")
+    except Exception as exc:
+        self._log(f"[警告] 监控看板启动失败: {exc}")
     preheated_serials: set[int] = set()
 
     def maybe_preheat_browser(serial_value: int, group_tag: str) -> None:
