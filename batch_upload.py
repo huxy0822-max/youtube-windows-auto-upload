@@ -8376,7 +8376,114 @@ async def set_video_category_music(page, max_attempts: int = 6) -> bool:
                     texts.append(raw)
             except Exception:
                 continue
-        combined = " | ".join(texts)
+
+        try:
+            dom_state = await page.evaluate(
+                """
+                () => {
+                    const visible = (el) => !!el && (
+                        el.offsetParent !== null ||
+                        el.offsetWidth > 0 ||
+                        el.offsetHeight > 0 ||
+                        el.getClientRects().length > 0
+                    );
+                    const textOf = (el) => ((el && (el.innerText || el.textContent)) || "").trim();
+                    const attrOf = (el) => [
+                        el?.getAttribute?.("aria-label") || "",
+                        el?.getAttribute?.("label") || "",
+                        el?.getAttribute?.("title") || "",
+                        el?.getAttribute?.("name") || "",
+                        el?.id || "",
+                    ].join(" ").trim();
+                    const categoryRe = /category|分類|分类/i;
+                    const excludeRe = /recording\\s*date|錄製日期|录制日期/i;
+                    const musicRe = /(^|\\s)music(\\s|$)|音樂|音乐/i;
+                    const roots = [document];
+                    const seen = new Set([document]);
+                    const candidates = [];
+
+                    while (roots.length) {
+                        const root = roots.shift();
+                        const allNodes = root.querySelectorAll ? root.querySelectorAll("*") : [];
+                        for (const node of allNodes) {
+                            if (node && node.shadowRoot && !seen.has(node.shadowRoot)) {
+                                seen.add(node.shadowRoot);
+                                roots.push(node.shadowRoot);
+                            }
+                        }
+                        const nodes = Array.from(
+                            root.querySelectorAll
+                                ? root.querySelectorAll(
+                                    "ytcp-form-select, tp-yt-paper-dropdown-menu, ytcp-dropdown-trigger, [aria-haspopup='listbox'], [role='combobox']"
+                                )
+                                : []
+                        ).filter(visible);
+                        for (const node of nodes) {
+                            const host =
+                                node.closest?.("ytcp-form-select") ||
+                                node.closest?.("tp-yt-paper-dropdown-menu") ||
+                                node;
+                            if (!host) continue;
+                            const contextParts = [];
+                            let current = host;
+                            for (let depth = 0; current && depth < 5; depth += 1, current = current.parentElement) {
+                                contextParts.push(textOf(current));
+                                contextParts.push(attrOf(current));
+                            }
+                            const context = contextParts.join(" ").trim();
+                            if (!categoryRe.test(context) || excludeRe.test(context)) continue;
+                            const trigger =
+                                host.querySelector?.("ytcp-dropdown-trigger") ||
+                                host.querySelector?.("[aria-haspopup='listbox']") ||
+                                host.querySelector?.("[role='combobox']") ||
+                                host.querySelector?.("#trigger") ||
+                                (node.matches?.("ytcp-dropdown-trigger, [aria-haspopup='listbox'], [role='combobox']") ? node : null) ||
+                                host;
+                            if (!trigger) continue;
+                            const selectedText = [
+                                textOf(host.querySelector?.("#label")),
+                                textOf(host.querySelector?.("yt-formatted-string#label")),
+                                textOf(trigger),
+                                textOf(host),
+                                attrOf(trigger),
+                                attrOf(host),
+                            ].join(" ").trim();
+                            candidates.push({
+                                value: selectedText,
+                                selected: musicRe.test(selectedText),
+                                score:
+                                    (categoryRe.test(textOf(host.querySelector?.("label")) || "") ? 8 : 0) +
+                                    (categoryRe.test(context) ? 5 : 0) +
+                                    (visible(trigger) ? 2 : 0) +
+                                    (textOf(trigger) ? 1 : 0),
+                            });
+                        }
+                    }
+
+                    if (!candidates.length) {
+                        return { found: false, selected: false, value: "" };
+                    }
+                    candidates.sort((a, b) => b.score - a.score);
+                    return {
+                        found: true,
+                        selected: !!candidates[0].selected,
+                        value: candidates[0].value || "",
+                    };
+                }
+                """
+            )
+            if isinstance(dom_state, dict):
+                found = bool(found or dom_state.get("found"))
+                dom_value = str(dom_state.get("value") or "").strip()
+                if dom_value:
+                    texts.append(dom_value)
+                if dom_state.get("selected"):
+                    joined = " | ".join(dict.fromkeys([item for item in texts if item]))
+                    return {"found": True, "selected": True, "value": joined}
+        except Exception:
+            pass
+
+        combined = " | ".join(dict.fromkeys([item for item in texts if item]))
         lowered = combined.lower()
         return {
             "found": found,
@@ -8411,7 +8518,7 @@ async def set_video_category_music(page, max_attempts: int = 6) -> bool:
                             }
                             const items = Array.from(
                                 root.querySelectorAll
-                                    ? root.querySelectorAll("tp-yt-paper-item, [role='option'], [role='menuitem'], ytcp-menu-service-item-renderer")
+                                    ? root.querySelectorAll("tp-yt-paper-item, [role='option'], [role='menuitem'], [role='menuitemradio'], ytcp-menu-service-item-renderer")
                                     : []
                             );
                             for (const item of items) {
@@ -8564,7 +8671,7 @@ async def set_video_category_music(page, max_attempts: int = 6) -> bool:
 
                         const items = Array.from(
                             root.querySelectorAll
-                                ? root.querySelectorAll("tp-yt-paper-item, [role='option'], [role='menuitem'], ytcp-menu-service-item-renderer")
+                                ? root.querySelectorAll("tp-yt-paper-item, [role='option'], [role='menuitem'], [role='menuitemradio'], ytcp-menu-service-item-renderer")
                                 : []
                         );
                         for (const item of items) {
@@ -8572,6 +8679,7 @@ async def set_video_category_music(page, max_attempts: int = 6) -> bool:
                             const target =
                                 item.querySelector?.("[role='option']") ||
                                 item.querySelector?.("[role='menuitem']") ||
+                                item.querySelector?.("[role='menuitemradio']") ||
                                 item;
                             if (clickEl(target)) return true;
                         }
@@ -8585,17 +8693,26 @@ async def set_video_category_music(page, max_attempts: int = 6) -> bool:
         except Exception:
             pass
 
+        try:
+            await page.keyboard.press("Home")
+        except Exception:
+            pass
         for selector in (
             "tp-yt-paper-item:has-text('Music')",
             "[role='option']:has-text('Music')",
             "[role='menuitem']:has-text('Music')",
+            "[role='menuitemradio']:has-text('Music')",
             "ytcp-menu-service-item-renderer:has-text('Music')",
             "tp-yt-paper-item:has-text('音樂')",
             "[role='option']:has-text('音樂')",
+            "[role='menuitemradio']:has-text('音樂')",
+            "ytcp-menu-service-item-renderer:has-text('音樂')",
             "tp-yt-paper-item:has-text('音乐')",
             "[role='option']:has-text('音乐')",
+            "[role='menuitemradio']:has-text('音乐')",
+            "ytcp-menu-service-item-renderer:has-text('音乐')",
         ):
-            locator = page.locator(selector).first
+            locator = page.locator(selector).last
             try:
                 if await locator.count() == 0 or not await locator.is_visible():
                     continue
@@ -8644,6 +8761,19 @@ async def set_video_category_music(page, max_attempts: int = 6) -> bool:
         )
         if verify.get("selected"):
             log(f"Category set to Music ({verify.get('value', '')})", "OK")
+            return True
+        try:
+            await page.keyboard.press("Escape")
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
+        post_close = await _read_state()
+        log(
+            f"Category final post-close#{attempt}: found={post_close.get('found')} selected={post_close.get('selected')} value={post_close.get('value', '')}",
+            "INFO",
+        )
+        if post_close.get("selected"):
+            log(f"Category set to Music ({post_close.get('value', '')})", "OK")
             return True
     log("Category still failed to become Music", "WARN")
     return False

@@ -298,7 +298,11 @@ if IS_MAC:
     VIDEO_CODEC = "h264_videotoolbox"
     VIDEO_BITRATE = "8000k"
     VIDEO_SPATIAL_AQ = True
-    _CODEC_EXTRA_ARGS = ['-spatial_aq', '1']
+    _CODEC_EXTRA_ARGS = [
+        "-realtime", "1",
+        "-prio_speed", "1",
+        "-spatial_aq", "1",
+    ]
 elif IS_WINDOWS and _windows_has_nvenc_runtime():
     VIDEO_CODEC = "h264_nvenc"
     VIDEO_BITRATE = "8000k"

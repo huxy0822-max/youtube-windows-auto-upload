@@ -290,8 +290,12 @@ def test_render_profile_selection() -> None:
 
     cpu_profile = _resolve_render_profile({"render_device_preference": "cpu"})
     assert cpu_profile.video_codec == "libx264"
+    assert "veryfast" in cpu_profile.codec_extra_args
     gpu_profile = _resolve_render_profile({"render_device_preference": "gpu"})
     assert str(gpu_profile.video_codec).strip()
+    if str(gpu_profile.video_codec).strip().lower() == "h264_videotoolbox":
+        assert "-realtime" in gpu_profile.codec_extra_args
+        assert "-prio_speed" in gpu_profile.codec_extra_args
     print(f"✓ 渲染设备偏好测试通过: cpu={cpu_profile.video_codec}, gpu={gpu_profile.video_codec}")
 
 

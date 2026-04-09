@@ -4,6 +4,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
+import os
 import platform
 import sys
 from typing import Any, Callable
@@ -686,11 +687,23 @@ async def execute_run_queue(
             window_total = len(job.window_serials)
             allocated_media_by_key: dict[str, tuple[str, str]] = {}
             has_hw_encoder = str(VIDEO_CODEC or "").strip().lower() != "libx264"
-            allow_hybrid_prepare = (
+            hybrid_prepare_raw = str((job.visual_settings or {}).get("allow_hybrid_prepare") or "").strip().lower()
+            hybrid_prepare_attr = getattr(job, "allow_hybrid_prepare", None)
+            explicit_hybrid_enable = (
+                hybrid_prepare_attr is True
+                or hybrid_prepare_raw in {"1", "true", "yes", "on"}
+            )
+            explicit_hybrid_disable = (
+                hybrid_prepare_attr is False
+                or hybrid_prepare_raw in {"0", "false", "no", "off"}
+            )
+            auto_allow_hybrid_prepare = (
                 platform.system() != "Darwin"
-                or bool(getattr(job, "allow_hybrid_prepare", False))
-                or str((job.visual_settings or {}).get("allow_hybrid_prepare") or "").strip().lower()
-                in {"1", "true", "yes", "on"}
+                or int(os.cpu_count() or 1) >= 8
+            )
+            allow_hybrid_prepare = (
+                not explicit_hybrid_disable
+                and (explicit_hybrid_enable or auto_allow_hybrid_prepare)
             )
             hybrid_prepare = bool(
                 has_prepare

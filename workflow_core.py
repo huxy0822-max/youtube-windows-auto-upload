@@ -111,7 +111,7 @@ def _cpu_render_profile() -> RenderCodecProfile:
         video_bitrate=bitrate,
         codec_extra_args=[
             "-preset",
-            "medium",
+            "veryfast",
             "-crf",
             "18",
             "-profile:v",
