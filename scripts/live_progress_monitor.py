@@ -34,8 +34,20 @@ UPLOAD_FINISH_PATTERNS = [
     re.compile(r"^\[上传\] (?P<group>.+?) 窗口 (?P<serial>\d+) (?P<status>[✅❌])(?: \((?P<count>\d+)/(?P<total>\d+)\))? ?(?P<detail>.*)$"),
     re.compile(r"^\[上传\] (?P<group>.+?) .* (?P<serial>\d+) .* \((?P<count>\d+)/(?P<total>\d+)\) (?P<detail>.*)$"),
 ]
+UPLOAD_RESULT_PATTERNS = [
+    re.compile(
+        r"^\[上传\] (?P<prefix_group>.+?) (?P<group>.+?)/(?P<serial>\d+) (?P<status>OK|FAIL)(?: stage=(?P<stage>\S+))?(?: detail=(?P<detail>.*))?$"
+    ),
+    re.compile(
+        r"^\[UploadResult\] (?P<group>.+?)/(?P<serial>\d+) success=(?P<success>true|false) stage=(?P<stage>\S+)(?: detail=(?P<detail>.*))?$",
+        re.IGNORECASE,
+    ),
+]
 UPLOAD_MONITOR_RE = re.compile(
     r"^序号 (?P<serial>\d+): 监控#\d+ 状态=(?P<status>[^|]+)\s+\|\s+进度=(?P<pct>\d+)%"
+)
+METADATA_SKIP_RE = re.compile(
+    r"^\[错误\] (?P<group>.+?)/(?P<serial>\d+)\[(?P<slot>\d+)/(?P<total>\d+)\] 文案/封面阶段失败，已保留渲染成品并跳过该视频上传: (?P<detail>.*)$"
 )
 
 
@@ -83,6 +95,7 @@ def _blank_slot(
         "upload_started": False,
         "upload_finished": False,
         "upload_success": None,
+        "fatal_error": "",
         "detail": "",
         "api": api,
         "template": template,
@@ -321,6 +334,28 @@ def build_snapshot(log_path: Path, job_path: Path | None = None) -> dict[str, An
                         slot["stage"] = "文案完成，等待上传"
                 continue
 
+        metadata_skip_match = METADATA_SKIP_RE.match(body)
+        if metadata_skip_match:
+            group = _normalize_group(metadata_skip_match.group("group"))
+            serial = int(metadata_skip_match.group("serial"))
+            slot_index = int(metadata_skip_match.group("slot"))
+            slot_total = int(metadata_skip_match.group("total"))
+            detail = str(metadata_skip_match.group("detail") or "").strip()
+            key = _slot_key(group, serial, slot_index)
+            slot = slots.setdefault(
+                key,
+                _blank_slot(group=group, serial=serial, slot_index=slot_index, slot_total=slot_total),
+            )
+            slot["group"] = group
+            slot["serial"] = serial
+            slot["slot_index"] = slot_index
+            slot["slot_total"] = slot_total
+            slot["metadata_prompt_started"] = True
+            slot["fatal_error"] = detail
+            slot["detail"] = f"metadata_failed | {detail}" if detail else "metadata_failed"
+            slot["stage"] = "文案失败"
+            continue
+
         upload_start_match = None
         for pattern in UPLOAD_START_PATTERNS:
             matched = pattern.match(body)
@@ -409,6 +444,46 @@ def build_snapshot(log_path: Path, job_path: Path | None = None) -> dict[str, An
                     slot["stage"] = "上传成功" if success else "上传失败"
                 continue
 
+        upload_result_match = None
+        for pattern in UPLOAD_RESULT_PATTERNS:
+            matched = pattern.match(body)
+            if matched:
+                upload_result_match = matched
+                break
+        if upload_result_match is not None:
+            group = _normalize_group(upload_result_match.groupdict().get("group") or "")
+            serial = int(upload_result_match.group("serial"))
+            status_token = str(upload_result_match.groupdict().get("status") or "").strip().upper()
+            success_token = str(upload_result_match.groupdict().get("success") or "").strip().lower()
+            success = status_token == "OK" or success_token == "true"
+            upload_stage = str(upload_result_match.groupdict().get("stage") or "").strip()
+            detail = str(upload_result_match.groupdict().get("detail") or "").strip()
+            if upload_stage and detail:
+                detail = f"stage={upload_stage} | {detail}"
+            elif upload_stage:
+                detail = f"stage={upload_stage}"
+            slot = _pick_serial_slot(
+                slots,
+                serial,
+                lambda item: bool(item.get("upload_started")) and not bool(item.get("upload_finished")),
+                group=group,
+                fallback_to_last=False,
+            ) or _pick_serial_slot(
+                slots,
+                serial,
+                lambda item: not bool(item.get("upload_finished")),
+                group=group,
+                fallback_to_last=False,
+            )
+            if slot:
+                slot["upload_started"] = True
+                slot["upload_finished"] = True
+                slot["upload_success"] = success
+                slot["upload_progress"] = 100 if success else int(slot.get("upload_progress") or 0)
+                slot["detail"] = detail
+                slot["stage"] = "上传成功" if success else "上传失败"
+            continue
+
     slot_list = sorted(slots.values(), key=_slot_sort_key)
     summary_group = job_context.get("group") or " / ".join(
         dict.fromkeys(_normalize_group(item.get("group") or "") for item in slot_list if _normalize_group(item.get("group") or ""))
@@ -416,7 +491,9 @@ def build_snapshot(log_path: Path, job_path: Path | None = None) -> dict[str, An
     windows = job_context.get("windows") or sorted({str(item.get("serial")) for item in slot_list if item.get("serial")})
     videos_per_window = int(job_context.get("videos_per_window") or 0) or max((int(item.get("slot_total") or 0) for item in slot_list), default=0)
     for item in slot_list:
-        if item.get("upload_finished"):
+        if item.get("fatal_error"):
+            item["stage"] = "文案失败"
+        elif item.get("upload_finished"):
             item["stage"] = "上传成功" if item.get("upload_success") else "上传失败"
         elif item.get("upload_started"):
             item["stage"] = "上传中"

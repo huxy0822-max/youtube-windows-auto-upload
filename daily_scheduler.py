@@ -205,8 +205,12 @@ TAG_DIR_ALIASES = {
 UPLOAD_SCRIPT = resolve_upload_script(_SCRIPT_DIR)
 
 # ============ 渲染配置 ============
-AUDIO_WORKERS = int(os.environ.get("AUDIO_WORKERS", 16))  # 音频合成并行数
-VIDEO_WORKERS = int(os.environ.get("VIDEO_WORKERS", 10))   # 视频渲染并行数
+DEFAULT_AUDIO_WORKERS = 8 if IS_MAC else 16
+DEFAULT_VIDEO_WORKERS = 3 if IS_MAC else 10
+RENDER_COOLDOWN_SECONDS = float(os.environ.get("RENDER_COOLDOWN_SECONDS", "0" if IS_MAC else "5"))
+
+AUDIO_WORKERS = int(os.environ.get("AUDIO_WORKERS", DEFAULT_AUDIO_WORKERS))  # 音频合成并行数
+VIDEO_WORKERS = int(os.environ.get("VIDEO_WORKERS", DEFAULT_VIDEO_WORKERS))   # 视频渲染并行数
 SONG_COUNT = 20               # 每个母带默认用多少首歌
 MASTER_COUNT_PER_TAG = 5      # 每个环境默认生成多少个随机母带
 HISTORY_FILE = _SCRIPT_DIR / "render_history.json"
@@ -297,11 +301,11 @@ def _windows_has_nvenc_runtime() -> bool:
 if IS_MAC:
     VIDEO_CODEC = "h264_videotoolbox"
     VIDEO_BITRATE = "8000k"
-    VIDEO_SPATIAL_AQ = True
+    VIDEO_SPATIAL_AQ = False
     _CODEC_EXTRA_ARGS = [
         "-realtime", "1",
         "-prio_speed", "1",
-        "-spatial_aq", "1",
+        "-power_efficient", "0",
     ]
 elif IS_WINDOWS and _windows_has_nvenc_runtime():
     VIDEO_CODEC = "h264_nvenc"
@@ -757,9 +761,8 @@ def render_video_task(tag: str, image_path, audio_path, output_path, filter_comp
                 except Exception as e:
                     logger.warning(f"清理临时文件失败: {e}")
         
-        # 冷却: 让 CPU 短暂喘息，防止持续满载导致热功耗过高
-        # 特别是在多并行时，这能给电池充电的机会
-        time.sleep(5) 
+        if RENDER_COOLDOWN_SECONDS > 0:
+            time.sleep(RENDER_COOLDOWN_SECONDS)
         
         elapsed = time.time() - start
         mark_complete(output_path)  # 写入完成标记

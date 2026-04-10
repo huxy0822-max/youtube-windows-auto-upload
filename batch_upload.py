@@ -89,6 +89,9 @@ RETRYABLE_NETWORK_ERROR_MARKERS = (
     "ERR_CONNECTION_RESET",
     "ERR_NETWORK_CHANGED",
 )
+RETRYABLE_BROWSER_RECOVERY_STAGES = (
+    "start_browser_failed",
+)
 SUPPORTED_VIDEO_EXTENSIONS = (".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm")
 
 # ── 超时常量（毫秒） ──
@@ -2617,6 +2620,33 @@ async def apply_visibility_settings(
     return True
 
 
+async def is_visibility_step_ready(page) -> bool:
+    """识别上传弹窗是否已经进入 Visibility 页面。"""
+    try:
+        return await page.evaluate(
+            """
+            () => {
+                const visible = (el) => !!el && (
+                    el.offsetParent !== null ||
+                    el.offsetWidth > 0 ||
+                    el.offsetHeight > 0
+                );
+                const radios = Array.from(
+                    document.querySelectorAll(
+                        "tp-yt-paper-radio-button[name='PUBLIC'], tp-yt-paper-radio-button[name='PRIVATE'], tp-yt-paper-radio-button[name='UNLISTED'], tp-yt-paper-radio-button[name='SCHEDULE']"
+                    )
+                ).filter((node) => visible(node) || visible(node.querySelector('[role=\"radio\"]')));
+                if (radios.length > 0) return true;
+
+                const bodyText = ((document.body && document.body.innerText) || '').toLowerCase();
+                return /visibility|who can watch|public|private|unlisted|schedule|可見度|可见度|誰可以觀看|谁可以观看|私密|不公開|不公开|定時|定时|排程/.test(bodyText);
+            }
+            """
+        )
+    except Exception:
+        return False
+
+
 async def ensure_public_visibility_selected(page) -> bool:
     """尽量确认 Visibility 已切到 Public。"""
     for _ in range(3):
@@ -4003,15 +4033,19 @@ def stop_browser(container_code: str):
 
 
 def is_retryable_browser_network_failure(upload_result: Dict[str, Any]) -> bool:
-    """识别可通过重启浏览器恢复的代理/网络断线。"""
+    """识别可通过重启浏览器恢复的失败，包括启动失败与代理/网络断线。"""
     if upload_result.get("success"):
         return False
     if not bool(upload_result.get("close_browser", True)):
         return False
 
+    stage = str(upload_result.get("stage", "") or "").strip()
+    if stage in RETRYABLE_BROWSER_RECOVERY_STAGES:
+        return True
+
     combined = "\n".join(
         [
-            str(upload_result.get("stage", "") or ""),
+            stage,
             str(upload_result.get("reason", "") or ""),
         ]
     )
@@ -6915,12 +6949,15 @@ async def upload_single(
             # 点击 Next 进入 Visibility
             visibility_clicked = await click_next_button(page, "Next (Visibility)", timeout_ms=30000)
             if not visibility_clicked:
-                return make_upload_result(
-                    False,
-                    True,
-                    "点击 Next 失败（Visibility）",
-                    "next_click_failed_visibility",
-                )
+                if await is_visibility_step_ready(page):
+                    log("未点击到 Next (Visibility)，但已检测到 Visibility 页面，继续后续设置。", "WARN")
+                else:
+                    return make_upload_result(
+                        False,
+                        True,
+                        "点击 Next 失败（Visibility）",
+                        "next_click_failed_visibility",
+                    )
             await random_delay(2, 3)
             
             log(f"设置可见性 = {visibility}...")
