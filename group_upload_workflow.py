@@ -23,7 +23,7 @@ from content_generation import (
     generate_content_bundle,
     save_data_url_image,
 )
-from path_helpers import default_scheduler_config, normalize_scheduler_config
+from path_helpers import load_json_with_local_override, normalize_scheduler_config
 from prompt_studio import load_generation_map, save_generation_map
 from utils import get_tag_info
 
@@ -120,14 +120,7 @@ def load_channel_name_map(path: Path) -> dict[int, str]:
 
 
 def load_runtime_paths(script_dir: Path, scheduler_config_path: Path) -> dict[str, Path]:
-    if scheduler_config_path.exists():
-        try:
-            raw = json.loads(scheduler_config_path.read_text(encoding="utf-8"))
-            cfg = normalize_scheduler_config(raw, script_dir)
-        except Exception:
-            cfg = default_scheduler_config(script_dir)
-    else:
-        cfg = default_scheduler_config(script_dir)
+    cfg = normalize_scheduler_config(load_json_with_local_override(scheduler_config_path, {}), script_dir)
     return {
         "output_root": Path(cfg.get("output_root") or (script_dir / "workspace" / "AutoTask")),
         "base_image_dir": Path(cfg.get("base_image_dir") or (script_dir / "workspace" / "base_image")),

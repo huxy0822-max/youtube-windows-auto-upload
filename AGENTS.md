@@ -53,6 +53,7 @@ If the task is mainly about prompt generation, inspect:
 - Files under `config/` are templates, not production secrets.
 - Real browser IDs, real mappings, local assets, and local API keys must not be committed.
 - Runtime state should stay untracked.
+- Per-machine overrides belong in `scheduler_config.local.json` and `config/prompt_studio.local.json`.
 
 Expected local folders for real usage:
 

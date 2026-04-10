@@ -34,7 +34,9 @@ import platform
 import numpy as np
 from group_upload_workflow import prepare_window_task_upload_batch
 from path_helpers import (
+    companion_local_config,
     default_scheduler_config,
+    load_json_with_local_override,
     normalize_scheduler_config,
     open_path_in_file_manager,
     resolve_upload_script,
@@ -77,9 +79,8 @@ def _default_platform_config() -> dict:
 def _load_platform_config():
     """加载平台配置。优先读取 scheduler_config.json，否则使用平台默认值。"""
     config_file = _SCRIPT_DIR / "scheduler_config.json"
-    if config_file.exists():
-        with open(config_file, 'r', encoding='utf-8') as f:
-            return normalize_scheduler_config(json.load(f), _SCRIPT_DIR)
+    if config_file.exists() or companion_local_config(config_file).exists():
+        return normalize_scheduler_config(load_json_with_local_override(config_file, {}), _SCRIPT_DIR)
     if IS_MAC:
         return normalize_scheduler_config(_default_platform_config(), _SCRIPT_DIR)
     # Windows/Linux 首次运行: GUI 向导让用户选择文件夹
@@ -159,12 +160,13 @@ def _run_setup_wizard(config_file: Path) -> dict:
     }
 
     # 保存配置
-    with open(config_file, 'w', encoding='utf-8') as f:
+    target_config = companion_local_config(config_file)
+    with open(target_config, 'w', encoding='utf-8') as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
 
     messagebox.showinfo(
         "✅ 配置完成",
-        f"配置已保存到:\n{config_file}\n\n"
+        f"配置已保存到:\n{target_config}\n\n"
         f"底图文件夹: {base_image_dir}\n"
         f"音乐文件夹: {music_dir}\n"
         f"输出文件夹: {output_root}\n"

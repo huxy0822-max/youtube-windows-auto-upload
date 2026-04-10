@@ -1,8 +1,12 @@
 {
   "music_dir": "workspace/music",
   "base_image_dir": "workspace/base_image",
+  "metadata_root": "workspace/metadata",
   "output_root": "workspace/AutoTask",
   "upload_config": "config/upload_config.json",
   "ffmpeg_bin": "ffmpeg",
-  "ffmpeg_path": "ffmpeg"
+  "ffmpeg_path": "ffmpeg",
+  "used_media_root": "workspace/AutoTask/_used_media",
+  "render_cleanup_days": 0,
+  "group_source_bindings": {}
 }

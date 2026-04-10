@@ -82,6 +82,41 @@ def resolve_upload_script(base_dir: str | Path) -> Path:
     return first_existing(candidates) or candidates[0]
 
 
+def companion_local_config(path_value: str | Path) -> Path:
+    path = Path(path_value)
+    return path.with_name(f"{path.stem}.local{path.suffix}")
+
+
+def _read_json_file(path: Path, fallback: Any) -> Any:
+    if not path.exists():
+        return fallback
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return fallback
+
+
+def merge_dict_overlay(base: Any, override: Any) -> Any:
+    if isinstance(base, dict) and isinstance(override, dict):
+        merged = dict(base)
+        for key, value in override.items():
+            if key in merged:
+                merged[key] = merge_dict_overlay(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+    return override if override is not None else base
+
+
+def load_json_with_local_override(path_value: str | Path, fallback: Any) -> Any:
+    path = Path(path_value)
+    base_data = _read_json_file(path, fallback)
+    local_data = _read_json_file(companion_local_config(path), None)
+    if local_data is None:
+        return base_data
+    return merge_dict_overlay(base_data, local_data)
+
+
 def default_scheduler_config(base_dir: str | Path) -> dict[str, Any]:
     """生成适合当前仓库的默认调度配置。"""
     base = Path(base_dir).resolve(strict=False)
@@ -102,7 +137,7 @@ def default_scheduler_config(base_dir: str | Path) -> dict[str, Any]:
         "ffmpeg_bin": ffmpeg_bin,
         "ffmpeg_path": ffmpeg_bin,
         "used_media_root": str((output_root / "_used_media").resolve(strict=False)),
-        "render_cleanup_days": 5,
+        "render_cleanup_days": 0,
         "group_source_bindings": {},
     }
 
@@ -125,9 +160,9 @@ def normalize_scheduler_config(raw_cfg: dict | None, base_dir: str | Path) -> di
     cfg["ffmpeg_bin"] = ffmpeg_bin
     cfg["ffmpeg_path"] = ffmpeg_bin
     try:
-        cfg["render_cleanup_days"] = max(0, int(cfg.get("render_cleanup_days", 5)))
+        cfg["render_cleanup_days"] = max(0, int(cfg.get("render_cleanup_days", 0)))
     except Exception:
-        cfg["render_cleanup_days"] = 5
+        cfg["render_cleanup_days"] = 0
 
     raw_bindings = cfg.get("group_source_bindings") or {}
     normalized_bindings: dict[str, str] = {}

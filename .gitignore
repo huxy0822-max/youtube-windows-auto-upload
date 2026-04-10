@@ -7,3 +7,6 @@ dashboard_state.json
 *.log
 .env
 node_modules/
+config/*.local.json
+scheduler_config.local.json
+_tmp_render_smoke/

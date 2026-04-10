@@ -44,7 +44,7 @@ except ImportError:
     def load_channel_name_map(*_args, **_kwargs):  # type: ignore[misc]
         return {}
 from metadata_service import BatchDedup, get_used_metadata_scope, record_used_metadata
-from path_helpers import normalize_scheduler_config
+from path_helpers import companion_local_config, load_json_with_local_override, normalize_scheduler_config
 from prompt_studio import (
     default_api_preset,
     default_content_template,

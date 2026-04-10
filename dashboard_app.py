@@ -888,7 +888,7 @@ class DashboardApp(ctk.CTk):
         self.output_root_var = ctk.StringVar(value=str(self.scheduler_config.get("output_root", "")))
         self.ffmpeg_var = ctk.StringVar(value=str(self.scheduler_config.get("ffmpeg_bin", "ffmpeg")))
         self.used_media_root_var = ctk.StringVar(value=str(self.scheduler_config.get("used_media_root", "")))
-        self.cleanup_days_var = ctk.StringVar(value=str(self.scheduler_config.get("render_cleanup_days", 5)))
+        self.cleanup_days_var = ctk.StringVar(value=str(self.scheduler_config.get("render_cleanup_days", 0)))
         self._runtime_path_widgets: dict[str, Any] = {}
         self.binding_group_var = ctk.StringVar(value=current_group)
         self.binding_folder_var = ctk.StringVar(value=get_group_bindings(self.scheduler_config).get(current_group, ""))
@@ -3223,7 +3223,7 @@ class DashboardApp(ctk.CTk):
                 "ffmpeg_bin": self.ffmpeg_var.get().strip() or "ffmpeg",
                 "ffmpeg_path": self.ffmpeg_var.get().strip() or "ffmpeg",
                 "used_media_root": self.used_media_root_var.get().strip(),
-                "render_cleanup_days": int(self.cleanup_days_var.get().strip() or "5"),
+                "render_cleanup_days": int(self.cleanup_days_var.get().strip() or "0"),
             }
         )
         self.scheduler_config = save_scheduler_settings(config, SCHEDULER_CONFIG_FILE)
@@ -4062,7 +4062,7 @@ class DashboardApp(ctk.CTk):
                 "ffmpeg_bin": self._runtime_field_text("ffmpeg_bin", self.ffmpeg_var) or "ffmpeg",
                 "ffmpeg_path": self._runtime_field_text("ffmpeg_bin", self.ffmpeg_var) or "ffmpeg",
                 "used_media_root": self._runtime_field_text("used_media_root", self.used_media_root_var),
-                "render_cleanup_days": int(self._runtime_field_text("render_cleanup_days", self.cleanup_days_var) or "5"),
+                "render_cleanup_days": int(self._runtime_field_text("render_cleanup_days", self.cleanup_days_var) or "0"),
             }
         )
         return config
@@ -4467,7 +4467,7 @@ class DashboardApp(ctk.CTk):
                 "ffmpeg_bin": self._runtime_field_text("ffmpeg_bin", self.ffmpeg_var) or "ffmpeg",
                 "ffmpeg_path": self._runtime_field_text("ffmpeg_bin", self.ffmpeg_var) or "ffmpeg",
                 "used_media_root": self._runtime_field_text("used_media_root", self.used_media_root_var),
-                "render_cleanup_days": int(self._runtime_field_text("render_cleanup_days", self.cleanup_days_var) or "5"),
+                "render_cleanup_days": int(self._runtime_field_text("render_cleanup_days", self.cleanup_days_var) or "0"),
             }
         )
         self.scheduler_config = save_scheduler_settings(config, SCHEDULER_CONFIG_FILE)
@@ -4477,7 +4477,7 @@ class DashboardApp(ctk.CTk):
         self.output_root_var.set(str(self.scheduler_config.get("output_root", "")))
         self.ffmpeg_var.set(str(self.scheduler_config.get("ffmpeg_bin", "ffmpeg")))
         self.used_media_root_var.set(str(self.scheduler_config.get("used_media_root", "")))
-        self.cleanup_days_var.set(str(self.scheduler_config.get("render_cleanup_days", 5)))
+        self.cleanup_days_var.set(str(self.scheduler_config.get("render_cleanup_days", 0)))
         self._refresh_bindings_box()
         self._log("[Paths] Saved path config")
         return dict(self.scheduler_config)

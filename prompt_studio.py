@@ -14,6 +14,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from path_helpers import companion_local_config, load_json_with_local_override
+
 
 TAG_NORMALIZATION_MAP = str.maketrans(
     {
@@ -169,23 +171,34 @@ def normalize_prompt_studio_config(raw: Any) -> dict:
 
 
 def load_prompt_studio_config(path: Path) -> dict:
-    if path.exists():
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            raise RuntimeError(f"prompt_studio.json 读取失败: {path} | {exc}") from exc
-        config = normalize_prompt_studio_config(raw)
-        if not config.get("apiPresets"):
-            raise RuntimeError(f"prompt_studio.json 没有可用的 API 模板: {path}")
-        if not config.get("contentTemplates"):
-            raise RuntimeError(f"prompt_studio.json 没有可用的内容模板: {path}")
-        return config
-    return default_prompt_studio_config()
+    config = normalize_prompt_studio_config(load_json_with_local_override(path, {}))
+    if not config.get("apiPresets"):
+        raise RuntimeError(f"prompt_studio.json 没有可用的 API 模板: {path}")
+    if not config.get("contentTemplates"):
+        raise RuntimeError(f"prompt_studio.json 没有可用的内容模板: {path}")
+    return config
+
+
+def _config_has_secret_fields(config: dict[str, Any]) -> bool:
+    presets = config.get("apiPresets") or {}
+    if not isinstance(presets, dict):
+        return False
+    for preset in presets.values():
+        if not isinstance(preset, dict):
+            continue
+        if str(preset.get("apiKey") or "").strip():
+            return True
+        if str(preset.get("imageApiKey") or "").strip():
+            return True
+    return False
 
 
 def save_prompt_studio_config(path: Path, config: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+    normalized = normalize_prompt_studio_config(config)
+    local_path = companion_local_config(path)
+    target = local_path if local_path.exists() or _config_has_secret_fields(normalized) else path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(normalized, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def normalize_tag_key(value: Any) -> str:

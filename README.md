@@ -99,6 +99,20 @@ py -3 dashboard.py
 
 ## 多电脑接手方式
 
+### 公开模板和本机私有配置
+
+GitHub 上只保留干净模板：
+
+- `scheduler_config.json`
+- `config/prompt_studio.json`
+
+每台电脑自己的真实路径和真实 API key 一律放这里：
+
+- `scheduler_config.local.json`
+- `config/prompt_studio.local.json`
+
+这两个 `*.local.json` 不会提交到 GitHub。
+
 ### 你的 Mac 电脑
 
 建议流程：
@@ -106,7 +120,13 @@ py -3 dashboard.py
 ```bash
 git clone https://github.com/huxy0822-max/youtube-windows-auto-upload.git
 cd youtube-windows-auto-upload
-git checkout -b mac-huxy origin/windows-huxy
+git fetch --all --tags
+git checkout mac-huxy || git checkout -b mac-huxy origin/mac-huxy
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp scheduler_config.json scheduler_config.local.json
+cp config/prompt_studio.json config/prompt_studio.local.json
 ```
 
 然后让 Mac 上的 Codex 先读这些文件：
@@ -114,6 +134,14 @@ git checkout -b mac-huxy origin/windows-huxy
 - `AGENTS.md`
 - `README.md`
 - `docs/项目功能总纲-2026-03-17.md`
+- `docs/新控制台使用说明.md`
+- `docs/新Mac接手指令-2026-04-10.md`
+
+Mac 上如果磁盘小：
+
+- `上传后保留天数` 设为 `0`
+- 或命令行使用 `--retain-video-days 0`
+- 当前默认值已经改成 `0`，上传成功后会立即删本地视频，只保留 manifest / report 记录
 
 ### 朋友的 Windows 电脑
 
@@ -132,7 +160,7 @@ git checkout -b windows-朋友名 origin/windows-huxy
 ### Mac 上发给 Codex
 
 ```text
-这是一个 YouTube 自动化项目。先读 AGENTS.md、README.md、docs/项目功能总纲-2026-03-17.md。当前稳定 Windows 线是 windows-huxy，请基于它创建并维护 mac-huxy 分支。目标是在不破坏现有功能逻辑的前提下，把浏览器启动、路径、FFmpeg 编码器、系统命令改成适配我的 Mac。不要动 Windows 专属分支。
+这是一个 YouTube 自动化项目。先读 AGENTS.md、README.md、docs/项目功能总纲-2026-03-17.md、docs/新控制台使用说明.md、docs/新Mac接手指令-2026-04-10.md。当前工作分支是 mac-huxy。先检查 scheduler_config.local.json 和 config/prompt_studio.local.json 是否已经填好本机路径与 API key，再指导我如何在这台 Mac 上完成一次最小可运行的生成、上传、验收流程。注意：这台 Mac 只有 256G，上传验收成功后本地视频要立即删除，保留天数必须是 0。
 ```
 
 ### 朋友 Windows 上发给 Codex
@@ -154,3 +182,4 @@ git checkout windows-huxy-stable-v1.0
 - `docs/项目功能总纲-2026-03-17.md`
 - `docs/重构阶段1审阅-2026-03-17.md`
 - `docs/新控制台使用说明.md`
+- `docs/新Mac接手指令-2026-04-10.md`
