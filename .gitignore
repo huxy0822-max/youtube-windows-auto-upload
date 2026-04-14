@@ -31,3 +31,19 @@ workspace/projects/
 
 config/*.local.json
 _tmp_render_smoke/
+
+logs/
+upload_records/
+output/
+data/daily_jobs/
+data/recovery_reports/
+data/repair_reports/
+data/repair_manifests/
+data/last_run_snapshot.json
+dashboard_state.json
+manual_tasks_ascii*.json
+workspace/AutoTask/
+workspace/base_image/
+workspace/music/
+workspace/projects/
+config/*.local.json
