@@ -14,17 +14,23 @@
 import os
 import json
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict
 from browser_api import list_browser_envs, start_browser_debug_port
 from path_helpers import resolve_config_file
+from prompt_studio import normalize_tag_key
 
 # 兼容旧脚本里直接引用该常量的情况；新代码请走 browser_api.py。
 HUBSTUDIO_API = "http://127.0.0.1:6873"
 SCRIPT_DIR = Path(__file__).parent
 CONFIG_PATH = Path(os.environ.get("UPLOAD_CONFIG_PATH", str(resolve_config_file(SCRIPT_DIR, "upload_config.json"))))
 CHANNEL_MAPPING_PATH = Path(os.environ.get("CHANNEL_MAPPING_PATH", str(resolve_config_file(SCRIPT_DIR, "channel_mapping.json"))))
+
+# get_channel_info 的内存缓存，key=(tag, serial)，value=(timestamp, result)
+_CHANNEL_INFO_CACHE: Dict[tuple, tuple] = {}
+_CHANNEL_INFO_CACHE_TTL = 30.0  # 缓存有效期（秒）
 
 def log(msg, level="INFO"):
     timestamp = datetime.now().strftime("%H:%M:%S")
@@ -79,12 +85,25 @@ def get_all_tags() -> List[str]:
     config = load_config()
     return list(config.get("tag_to_project", {}).keys())
 
+def _resolve_tag_config(tag_to_project: Dict, tag: str):
+    direct = tag_to_project.get(tag)
+    if direct:
+        return tag, direct
+    wanted = normalize_tag_key(tag)
+    if not wanted:
+        return None, None
+    for raw_tag, raw_value in tag_to_project.items():
+        if normalize_tag_key(raw_tag) == wanted:
+            return raw_tag, raw_value
+    return None, None
+
 def get_tag_info(tag: str) -> dict:
     """获取指定标签的配置信息"""
     config = load_config()
-    tag_config = config.get("tag_to_project", {}).get(tag)
-    
+    matched_tag, tag_config = _resolve_tag_config(config.get("tag_to_project", {}), tag)
+
     if not tag_config:
+        log(f"未找到标签 '{tag}' 的配置信息，请检查 upload_config.json 中的 tag_to_project", "WARN")
         return None
     
     ypp_serials = tag_config.get("ypp_serials", [])
@@ -92,7 +111,7 @@ def get_tag_info(tag: str) -> dict:
     all_serials = ypp_serials + non_ypp_serials
     
     return {
-        "tag": tag,
+        "tag": matched_tag or tag,
         "project_name": tag_config.get("project_name"),
         "video_keyword": tag_config.get("video_keyword"),
         "ypp_serials": ypp_serials,
@@ -587,8 +606,8 @@ def get_inventory_status(project_path: Path, container_ids: List[int]) -> Dict:
 
 def get_channel_info(tag: str, serial: int) -> Optional[dict]:
     """
-    获取指定频道的完整配置信息
-    
+    获取指定频道的完整配置信息（带内存缓存，减少重复IO）
+
     返回:
     {
         "serial": 117,
@@ -603,6 +622,14 @@ def get_channel_info(tag: str, serial: int) -> Optional[dict]:
         "port": None  # 如果浏览器未启动则为 None
     }
     """
+    # 检查缓存
+    cache_key = (tag, serial)
+    cached = _CHANNEL_INFO_CACHE.get(cache_key)
+    if cached is not None:
+        cached_time, cached_result = cached
+        if time.time() - cached_time < _CHANNEL_INFO_CACHE_TTL:
+            return cached_result
+
     config = load_config()
     tag_config = config.get("tag_to_project", {}).get(tag)
     
@@ -683,7 +710,7 @@ def get_channel_info(tag: str, serial: int) -> Optional[dict]:
                 thumb_count = 3 if is_ypp else 1
                 thumbnails = all_thumbnails[prev_thumb_count:prev_thumb_count + thumb_count]
     
-    return {
+    result = {
         "serial": serial,
         "tag": tag,
         "project_name": project_name,
@@ -695,6 +722,9 @@ def get_channel_info(tag: str, serial: int) -> Optional[dict]:
         "description": description,
         "thumbnails": thumbnails,
     }
+    # 写入缓存
+    _CHANNEL_INFO_CACHE[cache_key] = (time.time(), result)
+    return result
 
 def interactive_select_tags() -> List[str]:
     """

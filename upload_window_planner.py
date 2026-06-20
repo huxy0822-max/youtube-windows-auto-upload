@@ -194,7 +194,7 @@ def parse_manual_tasks(raw: str, default_tag: str = "") -> list[dict[str, Any]]:
         if not parts:
             continue
         if not parts[0].isdigit():
-            raise ValueError(f"逐窗口模式第 {line_no} 行首列必须是窗口序号")
+            raise ValueError(f"逐窗口模式第 {line_no} 行第一列必须是数字序号: '{parts[0]}'")
         task: dict[str, Any] = {"serial": int(parts[0]), "tag": default_tag}
         cursor = 1
         if cursor < len(parts) and "=" not in parts[cursor]:

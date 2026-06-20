@@ -1,12 +1,606 @@
 {
   "version": "1.0",
-  "last_updated": "2026-03-13",
-  "description": "BitBrowser channel mapping template for public repo",
+  "last_updated": "2026-03-12",
+  "description": "供 BitBrowser 使用的频道映射配置",
   "channels": {
-    "your_browser_env_id_here": {
+    "823cb2394bba438ba207974a3e0a2555": {
+      "serial_number": 133,
+      "tag": "未分组",
+      "channel_name": "101",
+      "channel_id": ""
+    },
+    "bdd124495ea54a718abffde8594fd893": {
+      "serial_number": 132,
+      "tag": "未分组",
+      "channel_name": "gemini",
+      "channel_id": ""
+    },
+    "39bc7b627e81421ebf96ce61567e83e8": {
+      "serial_number": 131,
+      "tag": "面壁者",
+      "channel_name": "0124-222",
+      "channel_id": ""
+    },
+    "0dee8012e2054aa49eb783f097e37e5d": {
+      "serial_number": 130,
+      "tag": "嘎了懒得管的",
+      "channel_name": "0221",
+      "channel_id": ""
+    },
+    "0bc1efe366694b91bb99d5670ef857e0": {
+      "serial_number": 129,
+      "tag": "嘎了懒得管的",
+      "channel_name": "0220",
+      "channel_id": ""
+    },
+    "dbd68ef6e17b44d9946c0de7bf1b9fcc": {
+      "serial_number": 128,
+      "tag": "我不想上班",
+      "channel_name": "0115-11111",
+      "channel_id": ""
+    },
+    "985ce21da3cb4426bcbcd07764718d1c": {
+      "serial_number": 127,
+      "tag": "0113咖啡館爵士",
+      "channel_name": "0115-11111--杀",
+      "channel_id": ""
+    },
+    "f35e724835b34b87a583183d16ea1788": {
+      "serial_number": 126,
+      "tag": "1216长期冷静",
+      "channel_name": "0115-11111 木吉他自閉",
+      "channel_id": ""
+    },
+    "066d1a56c682414ea7eafaa1570e7e33": {
+      "serial_number": 125,
+      "tag": "0124城市灵魂乐",
+      "channel_name": "0115-11111-R&B冷靜0130",
+      "channel_id": ""
+    },
+    "cee7665fa9be48e19a51c6c3bb9d57ca": {
+      "serial_number": 124,
+      "tag": "1216长期冷静",
+      "channel_name": "0115-11111-0130R&B",
+      "channel_id": ""
+    },
+    "3b91d8a829084872adc430bd4e556771": {
+      "serial_number": 123,
+      "tag": "1216长期冷静",
+      "channel_name": "0115-11111  木吉他 自閉",
+      "channel_id": ""
+    },
+    "e612a276a1b74912a6154d81421de304": {
+      "serial_number": 122,
+      "tag": "0129古風純音樂",
+      "channel_name": "0119-2222-3",
+      "channel_id": ""
+    },
+    "8ca29c1991804edd915548c0a31a4892": {
+      "serial_number": 120,
+      "tag": "吉卜力古風",
+      "channel_name": "022011",
+      "channel_id": ""
+    },
+    "6b6d0d5b81384b4b94190037ac7b32c1": {
+      "serial_number": 119,
+      "tag": "嘎了懒得管的",
+      "channel_name": "0221",
+      "channel_id": ""
+    },
+    "189fc658d3584d1798131c14702ad819": {
+      "serial_number": 118,
+      "tag": "面壁者",
+      "channel_name": "0119-2222",
+      "channel_id": ""
+    },
+    "64ffed3242e745db947de169f15ed6c7": {
+      "serial_number": 117,
+      "tag": "面壁者",
+      "channel_name": "0119-2222",
+      "channel_id": ""
+    },
+    "4cb30cd3385642e4a1f2b181cfa40629": {
+      "serial_number": 116,
+      "tag": "面壁者",
+      "channel_name": "0122-2222",
+      "channel_id": ""
+    },
+    "23b351c9bc4149aea3d54d715cadeaaf": {
+      "serial_number": 115,
+      "tag": "古风2",
+      "channel_name": "0122-2222",
+      "channel_id": ""
+    },
+    "ea088665cb3340809ed8b4c0ee603f56": {
+      "serial_number": 114,
+      "tag": "0118  闽南语",
+      "channel_name": "114闽南---正常",
+      "channel_id": ""
+    },
+    "2d135924b68640dfaf72f04fac3ddecb": {
+      "serial_number": 113,
+      "tag": "0129古風純音樂",
+      "channel_name": "113-1-alive",
+      "channel_id": ""
+    },
+    "b5ef8cd7fd224b02a82a83526d74a61a": {
+      "serial_number": 112,
+      "tag": "0127木吉他老号",
+      "channel_name": "112  木吉他唯一的新号cafe",
+      "channel_id": ""
+    },
+    "db245e4952bc4c85b0e0370fc47acea8": {
+      "serial_number": 110,
+      "tag": "0129古風純音樂",
+      "channel_name": "0119-222-3",
+      "channel_id": ""
+    },
+    "a5dea68575864847861a24082f46f75a": {
+      "serial_number": 109,
+      "tag": "1216长期冷静",
+      "channel_name": "109-閩南靜置",
+      "channel_id": ""
+    },
+    "8147a87372f84fbb9df6a52c5de583ff": {
+      "serial_number": 108,
+      "tag": "面壁者",
+      "channel_name": "0121-333",
+      "channel_id": ""
+    },
+    "30ba6f385c754faca4d80132924b77c2": {
+      "serial_number": 107,
+      "tag": "0129古風純音樂",
+      "channel_name": "0119-555-2",
+      "channel_id": ""
+    },
+    "8ea6e41490e64372a155d2705c648997": {
+      "serial_number": 106,
+      "tag": "嘎了懒得管的",
+      "channel_name": "0220",
+      "channel_id": ""
+    },
+    "07cb8c996ea040879098c5a6f5271729": {
+      "serial_number": 105,
+      "tag": "面壁者",
+      "channel_name": "0121-333",
+      "channel_id": ""
+    },
+    "a8af355451b74b70a7df9adef579ede2": {
+      "serial_number": 104,
+      "tag": "未分组",
+      "channel_name": "01062",
+      "channel_id": ""
+    },
+    "ac734b0e2ce64d97bce90c2a19c0135c": {
+      "serial_number": 103,
+      "tag": "未分组",
+      "channel_name": "01061",
+      "channel_id": ""
+    },
+    "77b2db9c59444f159cdda42a57a2952f": {
+      "serial_number": 102,
+      "tag": "面壁者",
+      "channel_name": "0127-222",
+      "channel_id": ""
+    },
+    "078cfbc302e04202ad439068b6248637": {
+      "serial_number": 100,
+      "tag": "古风2",
+      "channel_name": "0124-222",
+      "channel_id": ""
+    },
+    "8f8060775de24dabb07d8eb2af3e2508": {
+      "serial_number": 99,
+      "tag": "+0120薩克斯",
+      "channel_name": "0115-2",
+      "channel_id": ""
+    },
+    "758e04156bff4dba908a094f7c9502b7": {
+      "serial_number": 98,
+      "tag": "+0120薩克斯",
+      "channel_name": "0115-2",
+      "channel_id": ""
+    },
+    "1aba04b21ccc43deb9bc7e29bbcda4fc": {
+      "serial_number": 97,
+      "tag": "面壁者",
+      "channel_name": "0114-444444444---1021-8-1",
+      "channel_id": ""
+    },
+    "e26f18e3559b416e9e7b3dd6244827ee": {
+      "serial_number": 96,
+      "tag": "0124滚",
+      "channel_name": "1021-7-1",
+      "channel_id": ""
+    },
+    "d834860e0f754bb883ee8ea18cebd7b1": {
+      "serial_number": 95,
+      "tag": "面壁者",
+      "channel_name": "0124-4444",
+      "channel_id": ""
+    },
+    "d416d66c0018486ebcf54649756beda9": {
+      "serial_number": 94,
+      "tag": "面壁者",
+      "channel_name": "0124-4444",
+      "channel_id": ""
+    },
+    "b08d5982d05545aab09368c3c3397d2a": {
+      "serial_number": 93,
+      "tag": "0127木吉他老号",
+      "channel_name": "0114-444444444---study",
+      "channel_id": ""
+    },
+    "d13abbd3a340468a81d7c847d91d94ed": {
+      "serial_number": 92,
+      "tag": "0129古風純音樂",
+      "channel_name": "0114-444444444---1",
+      "channel_id": ""
+    },
+    "f258c06da0aa4232a6a5898c65f29553": {
+      "serial_number": 91,
+      "tag": "0128-华尔兹",
+      "channel_name": "0119-4444",
+      "channel_id": ""
+    },
+    "73de213cc7f945eeb08d708a8472eb27": {
       "serial_number": 90,
-      "tag": "示例分组",
-      "channel_name": "your-channel-name",
+      "tag": "面壁者",
+      "channel_name": "0119-4444",
+      "channel_id": ""
+    },
+    "01f207ba2ebc4b4a920aa473bb90bbe6": {
+      "serial_number": 88,
+      "tag": "0127木吉他老号",
+      "channel_name": "浮声绘本1016-study",
+      "channel_id": ""
+    },
+    "a516431b0d644f06918ba68b0d6bd98e": {
+      "serial_number": 87,
+      "tag": "+0120薩克斯",
+      "channel_name": "0115-44444-1016-25",
+      "channel_id": ""
+    },
+    "ef08cc87596e43408cae62ece18ecb7f": {
+      "serial_number": 86,
+      "tag": "0127木吉他老号",
+      "channel_name": "0117-444---cafe噶",
+      "channel_id": ""
+    },
+    "c6a5e1abd4b14f48af71fc9c0e6c3455": {
+      "serial_number": 85,
+      "tag": "0127木吉他老号",
+      "channel_name": "雾间旋律1016-23----直播--sleep",
+      "channel_id": ""
+    },
+    "cbf0eae2f0d741db8fa2f144ffbda61d": {
+      "serial_number": 84,
+      "tag": "0127木吉他老号",
+      "channel_name": "0113-44444444-sleep",
+      "channel_id": ""
+    },
+    "61f007b731324fceae2a3219bbd5c454": {
+      "serial_number": 83,
+      "tag": "+0120薩克斯",
+      "channel_name": "白日梦调频1016-21",
+      "channel_id": ""
+    },
+    "b324129d48ee495986e8bf4e5eac27ae": {
+      "serial_number": 82,
+      "tag": "嘎了懒得管的",
+      "channel_name": "0115-33333333-1016-20",
+      "channel_id": ""
+    },
+    "a0bcc7fa8f0c4abf87fa78f700004f95": {
+      "serial_number": 80,
+      "tag": "0120  迪斯科",
+      "channel_name": "0115-4-光影乐廊1016-18",
+      "channel_id": ""
+    },
+    "d4795ff07ea14a9b8ebb22415e072b7d": {
+      "serial_number": 77,
+      "tag": "0120  迪斯科",
+      "channel_name": "1016-15",
+      "channel_id": ""
+    },
+    "7ad2470802dd480caad4ad87b568ede8": {
+      "serial_number": 76,
+      "tag": "1216长期冷静",
+      "channel_name": "1016-14  闽南 冷静",
+      "channel_id": ""
+    },
+    "bca5c5e8007e4ad5947b01c3328fb7e1": {
+      "serial_number": 75,
+      "tag": "1216长期冷静",
+      "channel_name": "1016-13闽南冷静",
+      "channel_id": ""
+    },
+    "4e1dfa6103f64a2ab151219a341a7894": {
+      "serial_number": 73,
+      "tag": "0120  迪斯科",
+      "channel_name": "1016-12",
+      "channel_id": ""
+    },
+    "fbf02010acf4480a833b9a206db2845e": {
+      "serial_number": 72,
+      "tag": "0118  闽南语",
+      "channel_name": "1016-11   會員",
+      "channel_id": ""
+    },
+    "11544074073746ffae27d7349fe1528c": {
+      "serial_number": 71,
+      "tag": "烟嗓女生",
+      "channel_name": "1016-10",
+      "channel_id": ""
+    },
+    "bb7c05d3d6b844b68077ee1588b03cc2": {
+      "serial_number": 70,
+      "tag": "0120  迪斯科",
+      "channel_name": "1016-9",
+      "channel_id": ""
+    },
+    "635ba436067f490fb25bb41d7996b3e9": {
+      "serial_number": 69,
+      "tag": "0118  闽南语",
+      "channel_name": "1016-8-内个",
+      "channel_id": ""
+    },
+    "9183f8e3377743e5b420c52558e8345a": {
+      "serial_number": 68,
+      "tag": "烟嗓女生",
+      "channel_name": "1016-7",
+      "channel_id": ""
+    },
+    "838ad6e747d94cbe8e27cd0228d7ffe7": {
+      "serial_number": 67,
+      "tag": "0113咖啡館爵士",
+      "channel_name": "0115-4444----杀",
+      "channel_id": ""
+    },
+    "4c22dbdd58014316bb39b8103e8c1963": {
+      "serial_number": 66,
+      "tag": "未分组",
+      "channel_name": "好歌單1016-5-1",
+      "channel_id": ""
+    },
+    "35b6ca1e0a394b998b6c680e9a18f2ca": {
+      "serial_number": 63,
+      "tag": "烟嗓女生",
+      "channel_name": "每日一曲1016-2-1",
+      "channel_id": ""
+    },
+    "6868659f9bf746f4852999339b81c2e9": {
+      "serial_number": 61,
+      "tag": "Hisenine",
+      "channel_name": "Hisenine-美",
+      "channel_id": ""
+    },
+    "b83774da60674400ad977a7235f2d125": {
+      "serial_number": 60,
+      "tag": "张",
+      "channel_name": "张1-美",
+      "channel_id": ""
+    },
+    "518d4b088d65462c9b5ca46661a5a18f": {
+      "serial_number": 59,
+      "tag": "0128-华尔兹",
+      "channel_name": "0114-4-共鳴室1015-17-1",
+      "channel_id": ""
+    },
+    "48212f6e717b4c388fd83c7d0de2351c": {
+      "serial_number": 58,
+      "tag": "0113咖啡館爵士",
+      "channel_name": "雲端旋律1015-16-1-ip炸了",
+      "channel_id": ""
+    },
+    "512bc5f949eb40ba8ece05567d222ef8": {
+      "serial_number": 57,
+      "tag": "+0120薩克斯",
+      "channel_name": "靈魂節拍1015-15-1",
+      "channel_id": ""
+    },
+    "534b5e8ab8c849108684b36f40966b32": {
+      "serial_number": 56,
+      "tag": "0113咖啡館爵士",
+      "channel_name": "音樂時區1015-14-1-ip炸了",
+      "channel_id": ""
+    },
+    "6a86167a7dd544048e38ca14440f78c6": {
+      "serial_number": 55,
+      "tag": "0113咖啡館爵士",
+      "channel_name": "旋律島嶼1015-13-1",
+      "channel_id": ""
+    },
+    "90999332f32d458794d7de3fd58e1dd3": {
+      "serial_number": 54,
+      "tag": "0113咖啡館爵士",
+      "channel_name": "節拍方塊1015-12-1",
+      "channel_id": ""
+    },
+    "36cf0df93d764f35a8d6fa68ec736d06": {
+      "serial_number": 53,
+      "tag": "龙",
+      "channel_name": "龙5-美",
+      "channel_id": ""
+    },
+    "f0483112645445a7a4cac9fdf326aa33": {
+      "serial_number": 52,
+      "tag": "Hisenine",
+      "channel_name": "Hisenine-直连",
+      "channel_id": ""
+    },
+    "259d262dfa274e4dbec62fbb78f83fe1": {
+      "serial_number": 51,
+      "tag": "1216长期冷静",
+      "channel_name": "0109开始冷静",
+      "channel_id": ""
+    },
+    "dd9b97bcdac749aba53d7f2b27a9875e": {
+      "serial_number": 50,
+      "tag": "张",
+      "channel_name": "张1-直连",
+      "channel_id": ""
+    },
+    "e2cf825a6e794b89b6b43f1f20664349": {
+      "serial_number": 49,
+      "tag": "龙",
+      "channel_name": "龙4-直连",
+      "channel_id": ""
+    },
+    "5fcacc1e65a54e18a645d79b5b025ec9": {
+      "serial_number": 48,
+      "tag": "0124滚",
+      "channel_name": "1015-6-1",
+      "channel_id": ""
+    },
+    "ecf5e8dccacd4e1292894c09d5e3507e": {
+      "serial_number": 47,
+      "tag": "0128-华尔兹",
+      "channel_name": "0117-444---舞",
+      "channel_id": ""
+    },
+    "1b5d9b6ad6ee4be48b4ade9c187e5df0": {
+      "serial_number": 46,
+      "tag": "0124滚",
+      "channel_name": "1015-4-1",
+      "channel_id": ""
+    },
+    "773b0cd7a1a74d2381d62863c17613fd": {
+      "serial_number": 45,
+      "tag": "我不想上班",
+      "channel_name": "0115-444-1015-3-1",
+      "channel_id": ""
+    },
+    "81b5508c5abd4640ada01beb0b1e3322": {
+      "serial_number": 44,
+      "tag": "0106健身",
+      "channel_name": "慢生活",
+      "channel_id": ""
+    },
+    "ad2d508adc9045ce8a30fa1336648214": {
+      "serial_number": 42,
+      "tag": "0106健身",
+      "channel_name": "XXX",
+      "channel_id": ""
+    },
+    "36f97c58d23344ad8c009736698afa77": {
+      "serial_number": 38,
+      "tag": "Hisenine",
+      "channel_name": "Hisenine-德",
+      "channel_id": ""
+    },
+    "a4fbd3d3f9734eed9ac29c764bf084af": {
+      "serial_number": 37,
+      "tag": "张",
+      "channel_name": "张3-德",
+      "channel_id": ""
+    },
+    "f1942c7e34e843fba9fd87dba3d3c521": {
+      "serial_number": 32,
+      "tag": "1216长期冷静",
+      "channel_name": "日本citypop靜置  0130",
+      "channel_id": ""
+    },
+    "a8dc7f95770e47d1bd38028fa21125d6": {
+      "serial_number": 30,
+      "tag": "1216长期冷静",
+      "channel_name": "日本citypop靜置  0130",
+      "channel_id": ""
+    },
+    "d9b9f19694ad4de0acdbb2d66f84c513": {
+      "serial_number": 29,
+      "tag": "1216长期冷静",
+      "channel_name": "日本citypop靜置  0130",
+      "channel_id": ""
+    },
+    "08337cbee91041519ecb279fd8f155f1": {
+      "serial_number": 28,
+      "tag": "我不想上班",
+      "channel_name": "0115-4444-罗中文0903-4---直播",
+      "channel_id": ""
+    },
+    "1ad002b8e915470c9a727501f90ca33f": {
+      "serial_number": 24,
+      "tag": "未分组",
+      "channel_name": "ai stdio",
+      "channel_id": ""
+    },
+    "0840f2b6625a4cdf97557b0f84a3fa8d": {
+      "serial_number": 22,
+      "tag": "0128-华尔兹",
+      "channel_name": "0119-444--舞",
+      "channel_id": ""
+    },
+    "572fb5cead5044129d9ff1a6909d29d9": {
+      "serial_number": 21,
+      "tag": "龙",
+      "channel_name": "龙3-德",
+      "channel_id": ""
+    },
+    "bcd5419730f74cca8bc59e078b4271d4": {
+      "serial_number": 19,
+      "tag": "Hisenine",
+      "channel_name": "Hisenine-新加坡",
+      "channel_id": ""
+    },
+    "7de04f42cd464161a4321104aa5f1915": {
+      "serial_number": 18,
+      "tag": "0129古風純音樂",
+      "channel_name": "0119-444-2",
+      "channel_id": ""
+    },
+    "9f263d2fc8534f4bb463c6bb7756ea5d": {
+      "serial_number": 17,
+      "tag": "张",
+      "channel_name": "张2-新加坡",
+      "channel_id": ""
+    },
+    "486d5d3389c54467825dc1d36411d9e2": {
+      "serial_number": 15,
+      "tag": "龙",
+      "channel_name": "龙2-新加坡",
+      "channel_id": ""
+    },
+    "e0c66dbd1927410dbd68bf31d3508098": {
+      "serial_number": 14,
+      "tag": "Hisenine",
+      "channel_name": "Hisenine-日本",
+      "channel_id": ""
+    },
+    "899ddb9ec6144948bd09784cd69d3b78": {
+      "serial_number": 13,
+      "tag": "张",
+      "channel_name": "张1-日本",
+      "channel_id": ""
+    },
+    "5731506abe4d4da1b2d90ac44ac5056a": {
+      "serial_number": 12,
+      "tag": "1216长期冷静",
+      "channel_name": "1025-闽南冷静",
+      "channel_id": ""
+    },
+    "10dfe8d1718a4677b9465873a6d33a36": {
+      "serial_number": 11,
+      "tag": "龙",
+      "channel_name": "龙1-日本",
+      "channel_id": ""
+    },
+    "b71eb32b43ca487fb53781811a14d56a": {
+      "serial_number": 6,
+      "tag": "试音碟",
+      "channel_name": "0117-444",
+      "channel_id": ""
+    },
+    "0527476dd4be4f6eaaa157599a69ce26": {
+      "serial_number": 2,
+      "tag": "芝加哥蓝调",
+      "channel_name": "星空之下",
+      "channel_id": ""
+    },
+    "5af1574f86d149ddb0c512520be4a25b": {
+      "serial_number": 1,
+      "tag": "我不想上班",
+      "channel_name": "0113-44444--直播",
       "channel_id": ""
     }
   }

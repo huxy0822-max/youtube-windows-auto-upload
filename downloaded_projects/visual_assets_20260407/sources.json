@@ -1,0 +1,315 @@
+{
+  "created_at": "2026-04-07",
+  "notes": "Additional stickers, spectrum-adjacent loops, timeline and HUD overlays for the visual library.",
+  "sources": [
+    {
+      "name": "Miirriin Sound Waves 01",
+      "source_page": "https://miirriin.com/en/sound-waves01-en/",
+      "license": "Free stock footage (per source page)",
+      "downloaded_assets": [
+        "downloads/sound-waves01-bk.mp4.zip",
+        "downloads/sound-waves01-w.mp4.zip"
+      ],
+      "extracted_dirs": [
+        "extracted/sound-waves01-bk",
+        "extracted/sound-waves01-w"
+      ],
+      "selected_outputs": [
+        "spectrums/mirin_soundwaves_black_timeline.mp4",
+        "spectrums/mirin_soundwaves_white_timeline.mp4"
+      ]
+    },
+    {
+      "name": "Miirriin Wi-Fi Network Signal Icon Animation",
+      "source_page": "https://miirriin.com/en/wifi01-en/",
+      "license": "Free stock footage (per source page)",
+      "downloaded_assets": [
+        "downloads/wifi01-w.mov.zip",
+        "downloads/wifi01-bk.mov.zip"
+      ],
+      "extracted_dirs": [
+        "extracted/wifi01-w",
+        "extracted/wifi01-bk"
+      ],
+      "selected_outputs": [
+        "overlays/mirin_wifi_black_overlay.mov",
+        "overlays/mirin_wifi_white_overlay.mov"
+      ]
+    },
+    {
+      "name": "Miirriin Count Up Timer",
+      "source_page": "https://miirriin.com/en/countup-digital02-en/",
+      "license": "Free stock footage (per source page)",
+      "downloaded_assets": [
+        "downloads/countup-digital02-bk.mp4.zip",
+        "downloads/countup-digital02-w.mp4.zip"
+      ],
+      "extracted_dirs": [
+        "extracted/countup-digital02-bk",
+        "extracted/countup-digital02-w"
+      ],
+      "selected_outputs": [
+        "overlays/mirin_countup_black_timeline.mp4",
+        "overlays/mirin_countup_white_timeline.mp4"
+      ]
+    },
+    {
+      "name": "Miirriin Countdown Circle Timer",
+      "source_page": "https://miirriin.com/en/countdown-circle02-en/",
+      "license": "Free stock footage (per source page)",
+      "downloaded_assets": [
+        "downloads/countdown-circle02-b.mp4.zip",
+        "downloads/countdown-circle02-r.mp4.zip"
+      ],
+      "extracted_dirs": [
+        "extracted/countdown-circle02-b",
+        "extracted/countdown-circle02-r"
+      ],
+      "selected_outputs": [
+        "overlays/mirin_countdown_blue_ring.mp4",
+        "overlays/mirin_countdown_red_ring.mp4"
+      ]
+    },
+    {
+      "name": "Miirriin Seekbar Timeline",
+      "source_page": "https://miirriin.com/en/seekbar02-en/",
+      "license": "Free stock footage (per source page)",
+      "downloaded_assets": [
+        "downloads/seekbar02-10.mov.zip",
+        "downloads/seekbar02-60.mp4.zip"
+      ],
+      "extracted_dirs": [
+        "extracted/seekbar02-10",
+        "extracted/seekbar02-60"
+      ],
+      "selected_outputs": [
+        "overlays/mirin_seekbar_10s_alpha.mov",
+        "overlays/mirin_seekbar_60s_timeline.mp4"
+      ]
+    },
+    {
+      "name": "Miirriin Sparkle 02",
+      "source_page": "https://miirriin.com/en/sparkle02-en/",
+      "license": "Free stock footage (per source page)",
+      "downloaded_assets": [
+        "downloads/sparkle02-w.mov.zip",
+        "downloads/sparkle02-y.mov.zip"
+      ],
+      "extracted_dirs": [
+        "extracted/sparkle02-w",
+        "extracted/sparkle02-y"
+      ],
+      "selected_outputs": [
+        "overlays/mirin_sparkle_gold_alpha.mov",
+        "overlays/mirin_sparkle_white_alpha.mov"
+      ]
+    },
+    {
+      "name": "OpenGameArt CC0 Music Icons",
+      "source_page": "https://opengameart.org/content/cc0-music-icons",
+      "license": "CC0",
+      "downloaded_assets": [
+        "downloads/music-ocal_20201227.zip",
+        "downloads/music-dcss_20201227.zip",
+        "downloads/music-fleurman_20201227.zip"
+      ],
+      "extracted_dirs": [
+        "extracted/music-ocal_20201227",
+        "extracted/music-dcss_20201227",
+        "extracted/music-fleurman_20201227"
+      ],
+      "selected_outputs": [
+        "stickers/mediterranean/oga_music-dcss_music-dcss.png",
+        "stickers/mediterranean/oga_music-fleurman_music-fleurman.png",
+        "stickers/mediterranean/oga_music-fleurman_saxophone.png",
+        "stickers/mediterranean/oga_music-ocal_drums.png",
+        "stickers/mediterranean/oga_music-ocal_guitar.png",
+        "stickers/mediterranean/oga_music-ocal_guitar_electric.png",
+        "stickers/mediterranean/oga_music-ocal_music-ocal.png",
+        "stickers/mediterranean/oga_music-ocal_piano.png",
+        "stickers/mediterranean/oga_music-ocal_saxophone.png",
+        "stickers/mediterranean/oga_music-ocal_trumpet.png"
+      ]
+    },
+    {
+      "name": "Kenney Splat Pack",
+      "source_page": "https://opengameart.org/content/splat-pack",
+      "license": "CC0",
+      "downloaded_assets": [
+        "downloads/kenney_splatpack.zip"
+      ],
+      "extracted_dirs": [
+        "extracted/kenney_splatpack"
+      ],
+      "selected_outputs": [
+        "stickers/mediterranean/oga_splat00.png",
+        "stickers/mediterranean/oga_splat01.png",
+        "stickers/mediterranean/oga_splat02.png",
+        "stickers/mediterranean/oga_splat03.png",
+        "stickers/mediterranean/oga_splat04.png",
+        "stickers/mediterranean/oga_splat05.png",
+        "stickers/mediterranean/oga_splat06.png",
+        "stickers/mediterranean/oga_splat07.png",
+        "stickers/mediterranean/oga_splat08.png",
+        "stickers/mediterranean/oga_splat09.png",
+        "stickers/mediterranean/oga_splat10.png",
+        "stickers/mediterranean/oga_splat11.png",
+        "stickers/mediterranean/oga_splat12.png",
+        "stickers/mediterranean/oga_splat13.png",
+        "stickers/mediterranean/oga_splat14.png",
+        "stickers/mediterranean/oga_splat15.png",
+        "stickers/mediterranean/oga_splat16.png",
+        "stickers/mediterranean/oga_splat17.png",
+        "stickers/mediterranean/oga_splat18.png",
+        "stickers/mediterranean/oga_splat19.png",
+        "stickers/mediterranean/oga_splat20.png",
+        "stickers/mediterranean/oga_splat21.png",
+        "stickers/mediterranean/oga_splat22.png",
+        "stickers/mediterranean/oga_splat23.png",
+        "stickers/mediterranean/oga_splat24.png",
+        "stickers/mediterranean/oga_splat25.png",
+        "stickers/mediterranean/oga_splat26.png",
+        "stickers/mediterranean/oga_splat27.png",
+        "stickers/mediterranean/oga_splat28.png",
+        "stickers/mediterranean/oga_splat29.png",
+        "stickers/mediterranean/oga_splat30.png",
+        "stickers/mediterranean/oga_splat31.png",
+        "stickers/mediterranean/oga_splat32.png",
+        "stickers/mediterranean/oga_splat33.png",
+        "stickers/mediterranean/oga_splat34.png",
+        "stickers/mediterranean/oga_splat35.png"
+      ]
+    },
+    {
+      "name": "Miirriin REC Indicator",
+      "source_page": "https://miirriin.com/en/red-flashing02-en/",
+      "license": "Free stock footage (per source page)",
+      "downloaded_assets": [
+        "downloads/red-flashing02.mp4.zip"
+      ],
+      "extracted_dirs": [
+        "extracted/red-flashing02"
+      ],
+      "selected_outputs": [
+        "overlays/mirin_rec_indicator_red.mp4"
+      ]
+    },
+    {
+      "name": "Miirriin ECG Heartbeat",
+      "source_page": "https://miirriin.com/en/ecg01-en/",
+      "license": "Free stock footage (per source page)",
+      "downloaded_assets": [
+        "downloads/ecg01.mp4.zip"
+      ],
+      "extracted_dirs": [
+        "extracted/ecg01"
+      ],
+      "selected_outputs": [
+        "overlays/mirin_ecg_heartbeat_green.mp4"
+      ]
+    },
+    {
+      "name": "Miirriin Silence Ellipsis",
+      "source_page": "https://miirriin.com/en/silence01-en/",
+      "license": "Free stock footage (per source page)",
+      "downloaded_assets": [
+        "downloads/silence01-bk.mp4.zip",
+        "downloads/silence01-w.mp4.zip"
+      ],
+      "extracted_dirs": [
+        "extracted/silence01-bk",
+        "extracted/silence01-w"
+      ],
+      "selected_outputs": [
+        "overlays/mirin_ellipsis_black_timeline.mp4",
+        "overlays/mirin_ellipsis_white_timeline.mp4"
+      ]
+    },
+    {
+      "name": "Miirriin Bell Indicator",
+      "source_page": "https://miirriin.com/en/bell01-en/",
+      "license": "Free stock footage (per source page)",
+      "downloaded_assets": [
+        "downloads/bell01-y.mov.zip",
+        "downloads/bell01-g.mov.zip"
+      ],
+      "extracted_dirs": [
+        "extracted/bell01-y",
+        "extracted/bell01-g"
+      ],
+      "selected_outputs": [
+        "overlays/mirin_bell_gold_alpha.mov",
+        "overlays/mirin_bell_green_alpha.mov"
+      ]
+    },
+    {
+      "name": "Kenney Particle Pack",
+      "source_page": "https://opengameart.org/content/particle-pack-80-sprites",
+      "license": "CC0",
+      "downloaded_assets": [
+        "downloads/kenney_particlePack.zip"
+      ],
+      "extracted_dirs": [
+        "extracted/kenney_particlePack"
+      ],
+      "selected_outputs": [
+        "stickers/mediterranean/oga_particle_circle_01.png",
+        "stickers/mediterranean/oga_particle_circle_02.png",
+        "stickers/mediterranean/oga_particle_circle_03.png",
+        "stickers/mediterranean/oga_particle_circle_04.png",
+        "stickers/mediterranean/oga_particle_circle_05.png",
+        "stickers/mediterranean/oga_particle_flare_01.png",
+        "stickers/mediterranean/oga_particle_light_01.png",
+        "stickers/mediterranean/oga_particle_light_02.png",
+        "stickers/mediterranean/oga_particle_light_03.png",
+        "stickers/mediterranean/oga_particle_magic_01.png",
+        "stickers/mediterranean/oga_particle_magic_02.png",
+        "stickers/mediterranean/oga_particle_magic_03.png",
+        "stickers/mediterranean/oga_particle_magic_04.png",
+        "stickers/mediterranean/oga_particle_magic_05.png",
+        "stickers/mediterranean/oga_particle_smoke_01.png",
+        "stickers/mediterranean/oga_particle_smoke_02.png",
+        "stickers/mediterranean/oga_particle_smoke_03.png",
+        "stickers/mediterranean/oga_particle_smoke_04.png",
+        "stickers/mediterranean/oga_particle_smoke_05.png",
+        "stickers/mediterranean/oga_particle_smoke_06.png",
+        "stickers/mediterranean/oga_particle_smoke_07.png",
+        "stickers/mediterranean/oga_particle_smoke_08.png",
+        "stickers/mediterranean/oga_particle_smoke_09.png",
+        "stickers/mediterranean/oga_particle_smoke_10.png",
+        "stickers/mediterranean/oga_particle_spark_01.png",
+        "stickers/mediterranean/oga_particle_spark_02.png",
+        "stickers/mediterranean/oga_particle_spark_03.png",
+        "stickers/mediterranean/oga_particle_spark_04.png",
+        "stickers/mediterranean/oga_particle_spark_05.png",
+        "stickers/mediterranean/oga_particle_spark_05_rotated.png",
+        "stickers/mediterranean/oga_particle_spark_06.png",
+        "stickers/mediterranean/oga_particle_spark_06_rotated.png",
+        "stickers/mediterranean/oga_particle_spark_07.png",
+        "stickers/mediterranean/oga_particle_star_01.png",
+        "stickers/mediterranean/oga_particle_star_02.png",
+        "stickers/mediterranean/oga_particle_star_03.png",
+        "stickers/mediterranean/oga_particle_star_04.png",
+        "stickers/mediterranean/oga_particle_star_05.png",
+        "stickers/mediterranean/oga_particle_star_06.png",
+        "stickers/mediterranean/oga_particle_star_07.png",
+        "stickers/mediterranean/oga_particle_star_08.png",
+        "stickers/mediterranean/oga_particle_star_09.png",
+        "stickers/mediterranean/oga_particle_trace_01.png",
+        "stickers/mediterranean/oga_particle_trace_01_rotated.png",
+        "stickers/mediterranean/oga_particle_trace_02.png",
+        "stickers/mediterranean/oga_particle_trace_02_rotated.png",
+        "stickers/mediterranean/oga_particle_trace_03.png",
+        "stickers/mediterranean/oga_particle_trace_03_rotated.png",
+        "stickers/mediterranean/oga_particle_trace_04.png",
+        "stickers/mediterranean/oga_particle_trace_04_rotated.png",
+        "stickers/mediterranean/oga_particle_trace_05.png",
+        "stickers/mediterranean/oga_particle_trace_05_rotated.png",
+        "stickers/mediterranean/oga_particle_trace_06.png",
+        "stickers/mediterranean/oga_particle_trace_06_rotated.png",
+        "stickers/mediterranean/oga_particle_trace_07.png",
+        "stickers/mediterranean/oga_particle_trace_07_rotated.png"
+      ]
+    }
+  ]
+}

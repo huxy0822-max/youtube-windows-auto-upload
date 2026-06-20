@@ -1,0 +1,133 @@
+{
+  "created_at": "2026-04-06",
+  "notes": "新增视觉素材来源清单。运行时实际读取 overlays/、spectrums/、stickers/mediterranean/。",
+  "sources": [
+    {
+      "name": "Kenney Game Icons",
+      "source_page": "https://kenney.nl/assets/game-icons",
+      "license": "CC0",
+      "downloaded_archive": "downloads/kenney_game-icons.zip",
+      "extracted_dir": "extracted/kenney_game-icons",
+      "selected_outputs": [
+        "stickers/mediterranean/kenney_audio_off_01.png",
+        "stickers/mediterranean/kenney_audio_on_01.png",
+        "stickers/mediterranean/kenney_equalizer_h_01.png",
+        "stickers/mediterranean/kenney_equalizer_v_01.png",
+        "stickers/mediterranean/kenney_fast_forward_01.png",
+        "stickers/mediterranean/kenney_movie_01.png",
+        "stickers/mediterranean/kenney_music_off_01.png",
+        "stickers/mediterranean/kenney_music_on_01.png",
+        "stickers/mediterranean/kenney_pause_01.png",
+        "stickers/mediterranean/kenney_rewind_01.png",
+        "stickers/mediterranean/kenney_signal_02.png",
+        "stickers/mediterranean/kenney_signal_03.png",
+        "stickers/mediterranean/kenney_star_01.png",
+        "stickers/mediterranean/kenney_start_01.png",
+        "stickers/mediterranean/kenney_trophy_01.png",
+        "stickers/mediterranean/kenney_video_01.png"
+      ]
+    },
+    {
+      "name": "Animated particle effects #1",
+      "source_page": "https://opengameart.org/content/animated-particle-effects-1",
+      "license": "CC0",
+      "downloaded_archive": "downloads/para_CC0_particlefx-1.zip",
+      "extracted_dir": "extracted/opengameart_particlefx",
+      "selected_outputs": [
+        "overlays/oga_cosmic_ring_loop.mp4",
+        "overlays/oga_fire_ring_loop.mp4",
+        "overlays/oga_smoke_ring_loop.mp4",
+        "overlays/oga_violet_ring_loop.mp4"
+      ]
+    },
+    {
+      "name": "Miirriin Audio Spectrum 01",
+      "source_page": "https://miirriin.com/en/audio-spectrum01-en/",
+      "license": "Free stock footage (per source page)",
+      "downloaded_archives": [
+        "downloads/mirin_horizontal_alpha.zip",
+        "downloads/mirin_horizontal_black.zip"
+      ],
+      "extracted_dirs": [
+        "extracted/mirin_horizontal_alpha",
+        "extracted/mirin_horizontal_black"
+      ],
+      "selected_outputs": [
+        "spectrums/mirin_horizon_white_flow.mp4",
+        "spectrums/mirin_horizon_cyan_flow.mp4",
+        "spectrums/mirin_horizon_gold_flow.mp4",
+        "spectrums/mirin_horizon_magenta_flow.mp4",
+        "spectrums/mirin_horizon_emerald_bloom.mp4",
+        "spectrums/mirin_horizon_crimson_glow.mp4",
+        "spectrums/mirin_horizon_ice_glitter.mp4",
+        "spectrums/mirin_horizon_white_blackstage.mp4"
+      ]
+    },
+    {
+      "name": "Miirriin Audio Spectrum 02",
+      "source_page": "https://miirriin.com/en/audio-spectrum02-en/",
+      "license": "Free stock footage (per source page)",
+      "downloaded_archives": [
+        "downloads/mirin_circular_blue.zip",
+        "downloads/mirin_circular_green.zip"
+      ],
+      "extracted_dirs": [
+        "extracted/mirin_circular_blue",
+        "extracted/mirin_circular_green"
+      ],
+      "selected_outputs": [
+        "spectrums/mirin_radial_white_orbit.mp4",
+        "spectrums/mirin_radial_cyan_orbit.mp4",
+        "spectrums/mirin_radial_amber_orbit.mp4",
+        "spectrums/mirin_radial_violet_orbit.mp4",
+        "spectrums/mirin_radial_emerald_cosmic.mp4",
+        "spectrums/mirin_radial_crimson_fire.mp4",
+        "spectrums/mirin_radial_ice_violet.mp4"
+      ]
+    },
+    {
+      "name": "Mixkit Visualizer Clips",
+      "source_pages": [
+        "https://mixkit.co/free-stock-video/green-abstract-visualizer-101429/",
+        "https://mixkit.co/free-stock-video/purple-light-forming-glowing-shapes-101439/",
+        "https://mixkit.co/free-stock-video/abstract-lights-shifting-from-blue-to-green-101699/",
+        "https://mixkit.co/free-stock-video/vertical-blue-lights-visualizer-101428/",
+        "https://mixkit.co/free-stock-video/acrylic-light-spectrum-101696/",
+        "https://mixkit.co/free-stock-video/light-blue-glowing-figures-101423/",
+        "https://mixkit.co/free-stock-video/red-glowing-figures-101433/",
+        "https://mixkit.co/free-stock-video/abstract-magenta-lights-101430/",
+        "https://mixkit.co/free-stock-video/abstract-turquoise-glow-101427/",
+        "https://mixkit.co/free-stock-video/flowing-blue-lights-in-motion-101442/"
+      ],
+      "license": "Mixkit Stock Video Free License",
+      "downloaded_assets": [
+        "downloads/mixkit_green_abstract_visualizer.mp4",
+        "downloads/mixkit_purple_glowing_shapes.mp4",
+        "downloads/mixkit_blue_green_shifting_lights.mp4",
+        "downloads/mixkit_vertical_blue_lights_visualizer.mp4",
+        "downloads/mixkit_acrylic_light_spectrum.mp4",
+        "downloads/mixkit_light_blue_glowing_figures.mp4",
+        "downloads/mixkit_red_glowing_figures.mp4",
+        "downloads/mixkit_abstract_magenta_lights.mp4",
+        "downloads/mixkit_abstract_turquoise_glow.mp4",
+        "downloads/mixkit_flowing_blue_lights_in_motion.mp4"
+      ],
+      "selected_outputs": [
+        "overlays/mixkit_green_abstract_visualizer.mp4",
+        "overlays/mixkit_purple_glowing_shapes.mp4",
+        "overlays/mixkit_blue_green_shifting_lights.mp4",
+        "spectrums/mixkit_purple_horizon_goldpulse.mp4",
+        "spectrums/mixkit_green_horizon_emeraldpulse.mp4",
+        "spectrums/mixkit_purple_radial_violethalo.mp4",
+        "spectrums/mixkit_bluegreen_radial_cyanhalo.mp4",
+        "spectrums/mixkit_vertical_blue_lights_visualizer.mp4",
+        "spectrums/mixkit_acrylic_light_spectrum.mp4",
+        "spectrums/mixkit_light_blue_glowing_figures.mp4",
+        "spectrums/mixkit_red_glowing_figures.mp4",
+        "spectrums/mixkit_abstract_magenta_lights.mp4",
+        "spectrums/mixkit_abstract_turquoise_glow.mp4",
+        "spectrums/mixkit_flowing_blue_lights_in_motion.mp4"
+      ]
+    }
+  ]
+}

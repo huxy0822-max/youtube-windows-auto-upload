@@ -135,18 +135,23 @@ def load_runtime_paths(script_dir: Path, scheduler_config_path: Path) -> dict[st
 
 
 def _link_or_copy(source: Path, target: Path) -> Path:
+    """原子操作：先写入临时文件，成功后再 rename 到目标路径，避免中途失败产生损坏文件。"""
     target.parent.mkdir(parents=True, exist_ok=True)
+    if source.resolve(strict=False) == target.resolve(strict=False):
+        return target
+    temp_target = target.with_name(target.name + ".tmp")
     try:
-        if source.resolve(strict=False) == target.resolve(strict=False):
-            return target
+        try:
+            os.link(source, temp_target)
+        except Exception:
+            shutil.copy2(source, temp_target)
+        if target.exists():
+            target.unlink()
+        temp_target.rename(target)
     except Exception:
-        pass
-    if target.exists():
-        target.unlink()
-    try:
-        os.link(source, target)
-    except Exception:
-        shutil.copy2(source, target)
+        if temp_target.exists():
+            temp_target.unlink()
+        raise
     return target
 
 
@@ -167,7 +172,7 @@ def _build_schedule_time(start_text: str, interval_minutes: int, index: int) -> 
             return current.strftime("%Y-%m-%d %H:%M")
         except Exception:
             continue
-    raise ValueError("定时发布时间格式应为 YYYY-MM-DD HH:MM")
+    raise ValueError(f"无法解析时间格式 '{start_text}'，支持的格式: HH:MM, YYYY-MM-DD HH:MM, YYYY-MM-DDTHH:MM")
 
 
 def _append_hashtags(description: str, seo_hashtags: list[str]) -> str:
@@ -314,12 +319,19 @@ def prepare_group_upload_batch(
             if not cover_paths and str(bundle["api_preset"].get("autoImageEnabled") or "0") == "1":
                 for thumb_index, item in enumerate(bundle.get("thumbnail_prompts", []), 1):
                     target = tag_base_image_dir / f"{date_mmdd}_{serial}_cover_{thumb_index:02d}.png"
-                    try:
-                        image_result = call_image_model(bundle["api_preset"], item.get("prompt", ""))
-                        if image_result.get("data_url"):
-                            cover_paths.append(save_data_url_image(image_result["data_url"], target))
-                    except Exception as exc:
-                        warnings.append(f"序号 {serial} 缩略图 {thumb_index} 自动生成失败: {exc}")
+                    # 图片生成最多重试2次
+                    last_exc = None
+                    for _attempt in range(3):
+                        try:
+                            image_result = call_image_model(bundle["api_preset"], item.get("prompt", ""))
+                            if image_result.get("data_url"):
+                                cover_paths.append(save_data_url_image(image_result["data_url"], target))
+                            last_exc = None
+                            break
+                        except Exception as exc:
+                            last_exc = exc
+                    if last_exc is not None:
+                        warnings.append(f"序号 {serial} 缩略图 {thumb_index} 自动生成失败(已重试2次): {last_exc}")
             elif not cover_paths:
                 warnings.append(f"序号 {serial} 未生成缩略图：未提供缩略图目录，且图片 API 未开启")
         else:
@@ -523,12 +535,19 @@ def prepare_window_task_upload_batch(
                 ):
                     for thumb_index, item in enumerate(bundle.get("thumbnail_prompts", []), 1):
                         target = tag_base_image_dir / f"{date_mmdd}_{serial}_cover_{thumb_index:02d}.png"
-                        try:
-                            image_result = call_image_model(bundle["api_preset"], item.get("prompt", ""))
-                            if image_result.get("data_url"):
-                                cover_paths.append(save_data_url_image(image_result["data_url"], target))
-                        except Exception as exc:
-                            warnings.append(f"序号 {serial} 缩略图 {thumb_index} 自动生成失败: {exc}")
+                        # 图片生成最多重试2次
+                        last_exc = None
+                        for _attempt in range(3):
+                            try:
+                                image_result = call_image_model(bundle["api_preset"], item.get("prompt", ""))
+                                if image_result.get("data_url"):
+                                    cover_paths.append(save_data_url_image(image_result["data_url"], target))
+                                last_exc = None
+                                break
+                            except Exception as exc:
+                                last_exc = exc
+                        if last_exc is not None:
+                            warnings.append(f"序号 {serial} 缩略图 {thumb_index} 自动生成失败(已重试2次): {last_exc}")
                 elif not cover_paths:
                     warnings.append(f"序号 {serial} 未生成缩略图：未提供缩略图目录，且图片 API 未开启")
         else:

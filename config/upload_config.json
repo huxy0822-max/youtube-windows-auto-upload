@@ -1,4 +1,273 @@
 {
+  "video_folder": "F:\\学习华尔兹\\zd",
+  "projects_folder": "C:\\youtube自动化\\workspace\\projects",
+  "tag_to_project": {
+    "+0120薩克斯": {
+      "project_name": "+0120薩克斯",
+      "video_keyword": "+0120薩克斯",
+      "ypp_serials": [],
+      "non_ypp_serials": [
+        57,
+        83,
+        87,
+        98,
+        99
+      ]
+    },
+    "0106健身": {
+      "project_name": "0106健身",
+      "video_keyword": "0106健身",
+      "ypp_serials": [],
+      "non_ypp_serials": [
+        42,
+        44
+      ]
+    },
+    "0113咖啡館爵士": {
+      "project_name": "0113咖啡館爵士",
+      "video_keyword": "0113咖啡館爵士",
+      "ypp_serials": [],
+      "non_ypp_serials": [
+        54,
+        55,
+        56,
+        58,
+        67,
+        127
+      ]
+    },
+    "0118  闽南语": {
+      "project_name": "0118  闽南语",
+      "video_keyword": "0118  闽南语",
+      "ypp_serials": [],
+      "non_ypp_serials": [
+        69,
+        72,
+        114
+      ]
+    },
+    "0120  迪斯科": {
+      "project_name": "0120  迪斯科",
+      "video_keyword": "0120  迪斯科",
+      "ypp_serials": [],
+      "non_ypp_serials": [
+        70,
+        73,
+        77,
+        80
+      ]
+    },
+    "0124城市灵魂乐": {
+      "project_name": "0124城市灵魂乐",
+      "video_keyword": "0124城市灵魂乐",
+      "ypp_serials": [],
+      "non_ypp_serials": [
+        125
+      ]
+    },
+    "0124滚": {
+      "project_name": "0124滚",
+      "video_keyword": "0124滚",
+      "ypp_serials": [],
+      "non_ypp_serials": [
+        46,
+        48,
+        96
+      ]
+    },
+    "0127木吉他老号": {
+      "project_name": "0127木吉他老号",
+      "video_keyword": "0127木吉他老号",
+      "ypp_serials": [],
+      "non_ypp_serials": [
+        84,
+        85,
+        86,
+        88,
+        93,
+        112
+      ]
+    },
+    "0128-华尔兹": {
+      "project_name": "0128-华尔兹",
+      "video_keyword": "0128-华尔兹",
+      "ypp_serials": [],
+      "non_ypp_serials": [
+        22,
+        47,
+        59,
+        91
+      ]
+    },
+    "0129古風純音樂": {
+      "project_name": "0129古風純音樂",
+      "video_keyword": "0129古風純音樂",
+      "ypp_serials": [],
+      "non_ypp_serials": [
+        18,
+        92,
+        107,
+        110,
+        113,
+        122
+      ]
+    },
+    "1216长期冷静": {
+      "project_name": "1216长期冷静",
+      "video_keyword": "1216长期冷静",
+      "ypp_serials": [],
+      "non_ypp_serials": [
+        12,
+        29,
+        30,
+        32,
+        51,
+        75,
+        76,
+        109,
+        123,
+        124,
+        126
+      ]
+    },
+    "Hisenine": {
+      "project_name": "Hisenine",
+      "video_keyword": "Hisenine",
+      "ypp_serials": [],
+      "non_ypp_serials": [
+        14,
+        19,
+        38,
+        52,
+        61
+      ]
+    },
+    "古风2": {
+      "project_name": "古风2",
+      "video_keyword": "古风2",
+      "ypp_serials": [],
+      "non_ypp_serials": [
+        100,
+        115
+      ]
+    },
+    "吉卜力古風": {
+      "project_name": "吉卜力古風",
+      "video_keyword": "吉卜力古風",
+      "ypp_serials": [],
+      "non_ypp_serials": [
+        120
+      ]
+    },
+    "嘎了懒得管的": {
+      "project_name": "嘎了懒得管的",
+      "video_keyword": "嘎了懒得管的",
+      "ypp_serials": [],
+      "non_ypp_serials": [
+        82,
+        106,
+        119,
+        129,
+        130
+      ]
+    },
+    "张": {
+      "project_name": "张",
+      "video_keyword": "张",
+      "ypp_serials": [],
+      "non_ypp_serials": [
+        13,
+        17,
+        37,
+        50,
+        60
+      ]
+    },
+    "我不想上班": {
+      "project_name": "我不想上班",
+      "video_keyword": "我不想上班",
+      "ypp_serials": [],
+      "non_ypp_serials": [
+        1,
+        28,
+        45,
+        128
+      ]
+    },
+    "烟嗓女生": {
+      "project_name": "烟嗓女生",
+      "video_keyword": "烟嗓女生",
+      "ypp_serials": [],
+      "non_ypp_serials": [
+        63,
+        68,
+        71
+      ]
+    },
+    "芝加哥蓝调": {
+      "project_name": "芝加哥蓝调",
+      "video_keyword": "芝加哥蓝调",
+      "ypp_serials": [],
+      "non_ypp_serials": [
+        2
+      ]
+    },
+    "试音碟": {
+      "project_name": "试音碟",
+      "video_keyword": "试音碟",
+      "ypp_serials": [],
+      "non_ypp_serials": [
+        6
+      ]
+    },
+    "面壁者": {
+      "project_name": "面壁者",
+      "video_keyword": "面壁者",
+      "ypp_serials": [],
+      "non_ypp_serials": [
+        90,
+        94,
+        95,
+        97,
+        102,
+        105,
+        108,
+        116,
+        117,
+        118,
+        131
+      ]
+    },
+    "龙": {
+      "project_name": "龙",
+      "video_keyword": "龙",
+      "ypp_serials": [],
+      "non_ypp_serials": [
+        11,
+        15,
+        21,
+        49,
+        53
+      ]
+    },
+    "未分组": {
+      "project_name": "未分组",
+      "video_keyword": "未分组",
+      "ypp_serials": [],
+      "non_ypp_serials": [
+        24,
+        66,
+        103,
+        104,
+        132,
+        133
+      ]
+    }
+  },
+  "ypp_settings": {
+    "ab_test_titles": 3,
+    "ab_test_thumbnails": 3
+  },
   "browser_provider": "bitbrowser",
   "browser_api": {
     "provider": "bitbrowser",
@@ -14,21 +283,5 @@
     "stop_payload": {},
     "open_payload_id_key": "id",
     "stop_payload_id_key": "id"
-  },
-  "video_folder": "workspace/AutoTask",
-  "projects_folder": "workspace/projects",
-  "tag_to_project": {
-    "示例分组": {
-      "project_name": "示例分组",
-      "video_keyword": "示例分组",
-      "ypp_serials": [],
-      "non_ypp_serials": [
-        90
-      ]
-    }
-  },
-  "ypp_settings": {
-    "ab_test_titles": 3,
-    "ab_test_thumbnails": 3
   }
 }
